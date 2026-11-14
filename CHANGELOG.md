@@ -6,6 +6,7 @@ full, row-by-row status.
 
 ## Unreleased
 
+- Toolbox: clicking a group's button while a flyout is open selects the tool shown on that button and closes the flyout. Hover switching blocked the click and left the previous tool active.
 - Saving to CorelDRAW (`.cdr`): text fitted to a path, or bent by an envelope, perspective or distortion, goes out as curves that fill with the nonzero rule (Fill winding on), as the text is drawn. They went out even-odd, so CorelDRAW showed holes where letters or their strokes overlapped (#2733).
 - Page Number Settings: Begin on page chooses the page that shows the first number, so covers and title pages get none; with Begin on page 3 and Start at 1, page 3 shows 1. It works for numbers on a master layer (saved with the field) and for numbers put on each page (#2127).
 - Transparency tool: a click on a node of a gradient transparency opens a small bar under it with that node's transparency, a slider and a field, and the property bar shows the picked node's transparency too, so the opacity of a linear, radial, square or any gradient transparency is set on the object. It could be changed only in the Transparency section of the Properties docker (#2737).
