@@ -4013,12 +4013,17 @@ fn outline_editor(
 fn editor_row<R>(ui: &mut Ui, label: &str, controls: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.add_sized(
-            egui::vec2(56.0, ui.spacing().interact_size.y),
-            egui::Label::new(egui::RichText::new(label).color(Tokens::text_dim()))
-                .wrap()
-                .halign(egui::Align::LEFT),
-        );
+        let label_size = egui::vec2(56.0, ui.spacing().interact_size.y);
+        if label.is_empty() {
+            ui.allocate_space(label_size);
+        } else {
+            ui.add_sized(
+                label_size,
+                egui::Label::new(egui::RichText::new(label).color(Tokens::text_dim()))
+                    .wrap()
+                    .halign(egui::Align::LEFT),
+            );
+        }
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width().max(0.0), 0.0),
             egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
@@ -4050,9 +4055,15 @@ fn outline_icon_choice(
     on: bool,
     picture: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
 ) -> bool {
+    let title_key = format!("{key}_tip");
     let resp = ui.add_sized(size, egui::Button::new("").selected(on));
     resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, tr(key))
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            on,
+            tr(&title_key),
+        )
     });
     picture(
         ui.painter(),
@@ -4062,12 +4073,9 @@ fn outline_icon_choice(
         ),
         ui.style().interact_selectable(&resp, on).fg_stroke.color,
     );
-    resp.rich_tip(crate::ui::tips::pair(
-        &format!("{key}_tip"),
-        &format!("{key}_desc"),
-    ))
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
-    .clicked()
+    resp.rich_tip(crate::ui::tips::pair(&title_key, &format!("{key}_desc")))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 /// [`outline_editor`] for a selection whose outlines differ as `mix`
@@ -5665,88 +5673,119 @@ pub(crate) mod tests {
     /// own gradient as one undo step (#1208).
     #[test]
     fn gradient_blend_rows_show_and_patch() {
-        let ctx = crate::theme::ui_context();
-        let mut app = App::headless();
-        app.settings.autocorrect.enabled = false;
-        let mut ids = Vec::new();
-        for x in [10.0, 70.0] {
-            let id = app
-                .new_shape(ShapeKind::Rect {
-                    rect: tracedraw_core::geometry::Rect::new(x, 10.0, x + 40.0, 40.0),
-                    radius: 0.0,
-                    corners: None,
-                })
-                .expect("rect");
-            ids.push(id);
-        }
-        app.select(ids.clone());
-        let mut f = Fountain::two(
-            FountainKind::Linear,
-            tracedraw_core::Color::BLACK,
-            tracedraw_core::Color::WHITE,
-            0.0,
-        );
-        f.steps = 24;
-        f.acceleration = -37;
-        f.blend_direction = ColorBlend::CounterClockwise;
-        app.apply_fill(Fill::Fountain(f.clone()));
-        app.show_dockers = true;
-        app.docker_tab = DockerTab::Properties;
-        // The Outline section closed, so the fill's rows are in view (the
-        // docker paints only what its scroll area shows).
-        toggle_section(&mut app, "outline");
-        draw(&ctx, &mut app);
-        let texts = painted_texts(&ctx, &mut app);
-        let count = |s: &str| texts.iter().filter(|t| t.as_str() == s).count();
-        for key in [
-            "docker.blend_direction",
-            "docker.blend_direct",
-            "docker.blend_clockwise",
-            "docker.blend_counterclockwise",
-            "docker.steps",
-            "docker.smooth_transition",
-            "docker.fountain_acceleration",
-        ] {
-            assert!(count(&tr(key)) >= 1, "{key} shows: {texts:?}");
-        }
-        // The step count and the acceleration as the fill has them.
-        assert!(count("24") >= 1, "{texts:?}");
-        assert!(count("-37") >= 1, "{texts:?}");
-        // Unticked steps hide the count field.
-        let mut smooth = f.clone();
-        smooth.steps = Fountain::SMOOTH_STEPS;
-        app.apply_fill(Fill::Fountain(smooth.clone()));
-        draw(&ctx, &mut app);
-        let texts = painted_texts(&ctx, &mut app);
-        assert!(!texts.iter().any(|t| t == "24"), "{texts:?}");
-        // The second object gets its own angle; an edit of the smooth
-        // transition then changes only that on each, in one undo step.
-        let mut turned = smooth.clone();
-        turned.angle = 60.0;
-        app.run(Command::PatchFill {
-            shapes: vec![ids[1]],
-            fill: Fill::Fountain(turned),
-            fields: vec![FillField::Angle],
-        });
-        let steps = app.engine.history_labels().0.len();
-        let mut edited = smooth.clone();
-        edited.smooth = true;
-        edited.steps = 5;
-        app.patch_selection_fill(&Fill::Fountain(smooth), &Fill::Fountain(edited), &[]);
-        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
-        for (i, angle) in [(0, 0.0), (1, 60.0)] {
-            let Fill::Fountain(g) = &app.doc().find_shape(ids[i]).expect("shape").fill else {
+        crate::i18n::with_thread_language("en", || {
+            let ctx = crate::theme::ui_context();
+            let mut app = App::headless();
+            app.settings.autocorrect.enabled = false;
+            let mut ids = Vec::new();
+            for x in [10.0, 70.0] {
+                let id = app
+                    .new_shape(ShapeKind::Rect {
+                        rect: tracedraw_core::geometry::Rect::new(x, 10.0, x + 40.0, 40.0),
+                        radius: 0.0,
+                        corners: None,
+                    })
+                    .expect("rect");
+                ids.push(id);
+            }
+            app.select(ids.clone());
+            let mut f = Fountain::two(
+                FountainKind::Linear,
+                tracedraw_core::Color::BLACK,
+                tracedraw_core::Color::WHITE,
+                0.0,
+            );
+            f.steps = 24;
+            f.acceleration = -37;
+            f.blend_direction = ColorBlend::CounterClockwise;
+            app.apply_fill(Fill::Fountain(f.clone()));
+            app.show_dockers = true;
+            app.docker_tab = DockerTab::Properties;
+            // Close Outline before inspecting the Fill section.
+            toggle_section(&mut app, "outline");
+            draw(&ctx, &mut app);
+            let mut texts = painted_texts(&ctx, &mut app);
+            // Read the lower rows by scrolling the actual docker at its normal height.
+            let column = column_rects(&ctx)
+                .into_iter()
+                .find(|(place, _)| *place == DockerPlace::Right)
+                .map(|(_, rect)| rect)
+                .expect("the Properties column");
+            let over = egui::pos2(column.center().x, column.top() + TITLE_H + 10.0);
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(over),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -240.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| crate::ui::root(&mut app, ui),
+            );
+            out.textures_delta.clear();
+            for _ in 0..30 {
+                texts.extend(painted_texts(&ctx, &mut app));
+            }
+            let count = |s: &str| texts.iter().filter(|t| t.as_str() == s).count();
+            for key in [
+                "docker.blend_direction",
+                "docker.blend_direct",
+                "docker.blend_clockwise",
+                "docker.blend_counterclockwise",
+                "docker.steps",
+                "docker.smooth_transition",
+                "docker.fountain_acceleration",
+            ] {
+                assert!(count(&tr(key)) >= 1, "{key} shows: {texts:?}");
+            }
+            // The step count and the acceleration as the fill has them.
+            assert!(count("24") >= 1, "{texts:?}");
+            assert!(count("-37") >= 1, "{texts:?}");
+            // Unticked steps hide the count field.
+            let mut smooth = f.clone();
+            smooth.steps = Fountain::SMOOTH_STEPS;
+            app.apply_fill(Fill::Fountain(smooth.clone()));
+            draw(&ctx, &mut app);
+            let texts = painted_texts(&ctx, &mut app);
+            assert!(!texts.iter().any(|t| t == "24"), "{texts:?}");
+            // The second object gets its own angle; an edit of the smooth
+            // transition then changes only that on each, in one undo step.
+            let mut turned = smooth.clone();
+            turned.angle = 60.0;
+            app.run(Command::PatchFill {
+                shapes: vec![ids[1]],
+                fill: Fill::Fountain(turned),
+                fields: vec![FillField::Angle],
+            });
+            let steps = app.engine.history_labels().0.len();
+            let mut edited = smooth.clone();
+            edited.smooth = true;
+            edited.steps = 5;
+            app.patch_selection_fill(&Fill::Fountain(smooth), &Fill::Fountain(edited), &[]);
+            assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+            for (i, angle) in [(0, 0.0), (1, 60.0)] {
+                let Fill::Fountain(g) = &app.doc().find_shape(ids[i]).expect("shape").fill else {
+                    panic!("a gradient");
+                };
+                assert_eq!((g.smooth, g.steps, g.angle), (true, 5, angle));
+                assert_eq!(g.blend_direction, ColorBlend::CounterClockwise);
+                assert_eq!(g.acceleration, -37);
+            }
+            app.undo();
+            let Fill::Fountain(g) = &app.doc().find_shape(ids[1]).expect("shape").fill else {
                 panic!("a gradient");
             };
-            assert_eq!((g.smooth, g.steps, g.angle), (true, 5, angle));
-            assert_eq!(g.blend_direction, ColorBlend::CounterClockwise);
-            assert_eq!(g.acceleration, -37);
-        }
-        app.undo();
-        let Fill::Fountain(g) = &app.doc().find_shape(ids[1]).expect("shape").fill else {
-            panic!("a gradient");
-        };
-        assert_eq!((g.smooth, g.steps, g.angle), (false, 256, 60.0));
+            assert_eq!((g.smooth, g.steps, g.angle), (false, 256, 60.0));
+        });
     }
 
     /// The Fill part of a pattern fill shows the placement fields, with
@@ -6157,6 +6196,21 @@ pub(crate) mod tests {
         app.show_dockers = true;
         app.docker_tab = DockerTab::Properties;
         // Painted text and the accessible names of the pictogram choices.
+        let icon_keys = [
+            "docker.cap_butt",
+            "docker.cap_round",
+            "docker.cap_square",
+            "docker.join_miter",
+            "docker.join_round",
+            "docker.join_bevel",
+            "docker.dash_solid",
+            "docker.dash_dashed",
+            "docker.dash_dotted",
+            "docker.dash_dash_dot",
+            "docker.position_outside",
+            "docker.position_center",
+            "docker.position_inside",
+        ];
         let frame = |app: &mut App, events: Vec<egui::Event>| -> Vec<(String, egui::Rect)> {
             fn walk(s: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
                 match s {
@@ -6180,22 +6234,7 @@ pub(crate) mod tests {
             out.textures_delta.clear();
             let mut texts = Vec::new();
             out.shapes.iter().for_each(|c| walk(&c.shape, &mut texts));
-            let icon_names = [
-                "docker.cap_butt",
-                "docker.cap_round",
-                "docker.cap_square",
-                "docker.join_miter",
-                "docker.join_round",
-                "docker.join_bevel",
-                "docker.dash_solid",
-                "docker.dash_dashed",
-                "docker.dash_dotted",
-                "docker.dash_dash_dot",
-                "docker.position_outside",
-                "docker.position_center",
-                "docker.position_inside",
-            ]
-            .map(tr);
+            let icon_names = icon_keys.map(|key| tr(&format!("{key}_tip")));
             if let Some(update) = out.platform_output.accesskit_update {
                 for (_, node) in update.nodes {
                     if let (Some(label), Some(b)) = (node.label(), node.bounds()) {
@@ -6246,7 +6285,11 @@ pub(crate) mod tests {
             "docker.nib_angle_lc",
         ];
         let has = |texts: &[(String, egui::Rect)], key: &str| {
-            let want = tr(key);
+            let want = if icon_keys.contains(&key) {
+                tr(&format!("{key}_tip"))
+            } else {
+                tr(key)
+            };
             texts
                 .iter()
                 .any(|(t, _)| t.replace('\n', " ") == want || t.starts_with(&want))
@@ -6385,168 +6428,200 @@ pub(crate) mod tests {
         );
     }
 
+    /// Empty label columns reserve room without creating text-selection targets.
+    #[test]
+    fn properties_empty_label_rows_only_allocate_space() {
+        let ctx = crate::theme::ui_context();
+        ctx.all_styles_mut(|style| style.debug.show_interactive_widgets = true);
+        let mut checked = false;
+        let mut control_rect = egui::Rect::NOTHING;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            control_rect = editor_row(ui, "", |ui| {
+                ui.checkbox(&mut checked, tr("docker.align_dashes"))
+            })
+            .rect;
+        });
+        out.textures_delta.clear();
+        assert!(control_rect.is_positive());
+        let empty_label = ctx.viewport(|v| {
+            let widgets = &v.prev_pass.widgets;
+            widgets.layers().any(|(_, rects)| {
+                rects.iter().any(|r| {
+                    r.sense.interactive()
+                        && widgets.info(r.id).is_some_and(|info| {
+                            info.typ == egui::WidgetType::Label
+                                && info.label.as_deref().unwrap_or_default().is_empty()
+                        })
+                })
+            })
+        });
+        assert!(!empty_label, "blank label columns must not be interactive");
+    }
+
     /// Pictogram choices keep their names and selected state, and a click
     /// changes only that outline field, including a mixed value equal to
     /// the first object's value.
     #[test]
     fn properties_outline_icons_set_only_the_chosen_field() {
-        use tracedraw_core::{LineCap, LineJoin, OutlinePosition};
+        crate::i18n::with_thread_language("en", || {
+            use tracedraw_core::{LineCap, LineJoin, OutlinePosition};
 
-        let choices: [(&str, StrokeField, fn(&mut Stroke)); 13] = [
-            ("docker.cap_butt", StrokeField::Cap, |s| {
-                s.cap = LineCap::Butt
-            }),
-            ("docker.cap_round", StrokeField::Cap, |s| {
-                s.cap = LineCap::Round
-            }),
-            ("docker.cap_square", StrokeField::Cap, |s| {
-                s.cap = LineCap::Square
-            }),
-            ("docker.join_miter", StrokeField::Join, |s| {
-                s.join = LineJoin::Miter
-            }),
-            ("docker.join_round", StrokeField::Join, |s| {
-                s.join = LineJoin::Round
-            }),
-            ("docker.join_bevel", StrokeField::Join, |s| {
-                s.join = LineJoin::Bevel
-            }),
-            ("docker.dash_solid", StrokeField::Dash, |s| s.dash.clear()),
-            ("docker.dash_dashed", StrokeField::Dash, |s| {
-                s.dash = vec![4.0, 2.0]
-            }),
-            ("docker.dash_dotted", StrokeField::Dash, |s| {
-                s.dash = vec![1.0, 1.0]
-            }),
-            ("docker.dash_dash_dot", StrokeField::Dash, |s| {
-                s.dash = vec![6.0, 2.0, 1.0, 2.0]
-            }),
-            ("docker.position_outside", StrokeField::Position, |s| {
-                s.position = OutlinePosition::Outside
-            }),
-            ("docker.position_center", StrokeField::Position, |s| {
-                s.position = OutlinePosition::Center
-            }),
-            ("docker.position_inside", StrokeField::Position, |s| {
-                s.position = OutlinePosition::Inside
-            }),
-        ];
-        for mixed in [false, true] {
-            for (key, field, set) in choices {
-                let ctx = crate::theme::ui_context();
-                ctx.enable_accesskit();
-                let mut stroke = Some(Stroke {
-                    cap: LineCap::Butt,
-                    join: LineJoin::Miter,
-                    position: OutlinePosition::Center,
-                    ..Stroke::default()
-                });
-                let mut expected = stroke.clone().expect("outline");
-                set(&mut expected);
-                let mix = StrokeMix {
-                    fields: if mixed {
-                        vec![
-                            StrokeField::Cap,
-                            StrokeField::Join,
-                            StrokeField::Dash,
-                            StrokeField::Position,
-                            StrokeField::StartArrow,
-                            StrokeField::EndArrow,
-                        ]
-                    } else {
-                        Vec::new()
-                    },
-                    ..StrokeMix::default()
-                };
-                let mut touched = Vec::new();
-                let mut frame = |events| {
-                    let mut changed = false;
-                    let mut out = ctx.run_ui(
-                        egui::RawInput {
-                            screen_rect: Some(egui::Rect::from_min_size(
-                                egui::Pos2::ZERO,
-                                egui::vec2(340.0, 1400.0),
-                            )),
-                            events,
-                            ..Default::default()
-                        },
-                        |ui| {
-                            changed = outline_editor_mixed(
-                                ui,
-                                &mut stroke,
-                                &crate::ui::line_style::OutlineLib::default(),
-                                &mix,
-                                &mut touched,
-                            );
-                        },
-                    );
-                    out.textures_delta.clear();
-                    let nodes = out
-                        .platform_output
-                        .accesskit_update
-                        .expect("accessible controls")
-                        .nodes;
-                    (changed, nodes)
-                };
-                frame(Vec::new());
-                let (changed, nodes) = frame(Vec::new());
-                assert!(!changed, "rendering {key} must not edit the outline");
-                for label in ["toolbar.start_arrow", "toolbar.end_arrow"] {
-                    let node = nodes
-                        .iter()
-                        .find(|(_, n)| n.label() == Some(tr(label).as_str()))
-                        .map(|(_, n)| n)
-                        .expect("named arrow control");
-                    assert_eq!(node.role(), egui::accesskit::Role::ComboBox);
-                    assert_eq!(
-                        node.value(),
-                        Some(if mixed { "" } else { Arrowhead::None.name() })
-                    );
-                }
-                for (name, _, _) in choices {
-                    let node = nodes
-                        .iter()
-                        .find(|(_, n)| n.label() == Some(tr(name).as_str()))
-                        .map(|(_, n)| n)
-                        .expect("named choice");
-                    assert_eq!(node.role(), egui::accesskit::Role::Button);
-                    let selected = !mixed
-                        && matches!(
-                            name,
-                            "docker.cap_butt"
-                                | "docker.join_miter"
-                                | "docker.dash_solid"
-                                | "docker.position_center"
-                        );
-                    assert_eq!(
-                        node.toggled(),
-                        Some(if selected {
-                            egui::accesskit::Toggled::True
+            let choices: [(&str, StrokeField, fn(&mut Stroke)); 13] = [
+                ("docker.cap_butt", StrokeField::Cap, |s| {
+                    s.cap = LineCap::Butt
+                }),
+                ("docker.cap_round", StrokeField::Cap, |s| {
+                    s.cap = LineCap::Round
+                }),
+                ("docker.cap_square", StrokeField::Cap, |s| {
+                    s.cap = LineCap::Square
+                }),
+                ("docker.join_miter", StrokeField::Join, |s| {
+                    s.join = LineJoin::Miter
+                }),
+                ("docker.join_round", StrokeField::Join, |s| {
+                    s.join = LineJoin::Round
+                }),
+                ("docker.join_bevel", StrokeField::Join, |s| {
+                    s.join = LineJoin::Bevel
+                }),
+                ("docker.dash_solid", StrokeField::Dash, |s| s.dash.clear()),
+                ("docker.dash_dashed", StrokeField::Dash, |s| {
+                    s.dash = vec![4.0, 2.0]
+                }),
+                ("docker.dash_dotted", StrokeField::Dash, |s| {
+                    s.dash = vec![1.0, 1.0]
+                }),
+                ("docker.dash_dash_dot", StrokeField::Dash, |s| {
+                    s.dash = vec![6.0, 2.0, 1.0, 2.0]
+                }),
+                ("docker.position_outside", StrokeField::Position, |s| {
+                    s.position = OutlinePosition::Outside
+                }),
+                ("docker.position_center", StrokeField::Position, |s| {
+                    s.position = OutlinePosition::Center
+                }),
+                ("docker.position_inside", StrokeField::Position, |s| {
+                    s.position = OutlinePosition::Inside
+                }),
+            ];
+            for mixed in [false, true] {
+                for (key, field, set) in choices {
+                    let ctx = crate::theme::ui_context();
+                    ctx.enable_accesskit();
+                    let mut stroke = Some(Stroke {
+                        cap: LineCap::Butt,
+                        join: LineJoin::Miter,
+                        position: OutlinePosition::Center,
+                        ..Stroke::default()
+                    });
+                    let mut expected = stroke.clone().expect("outline");
+                    set(&mut expected);
+                    let mix = StrokeMix {
+                        fields: if mixed {
+                            vec![
+                                StrokeField::Cap,
+                                StrokeField::Join,
+                                StrokeField::Dash,
+                                StrokeField::Position,
+                                StrokeField::StartArrow,
+                                StrokeField::EndArrow,
+                            ]
                         } else {
-                            egui::accesskit::Toggled::False
-                        }),
-                        "{name}, mixed {mixed}"
-                    );
+                            Vec::new()
+                        },
+                        ..StrokeMix::default()
+                    };
+                    let mut touched = Vec::new();
+                    let mut frame = |events| {
+                        let mut changed = false;
+                        let mut out = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(340.0, 1400.0),
+                                )),
+                                events,
+                                ..Default::default()
+                            },
+                            |ui| {
+                                changed = outline_editor_mixed(
+                                    ui,
+                                    &mut stroke,
+                                    &crate::ui::line_style::OutlineLib::default(),
+                                    &mix,
+                                    &mut touched,
+                                );
+                            },
+                        );
+                        out.textures_delta.clear();
+                        let nodes = out
+                            .platform_output
+                            .accesskit_update
+                            .expect("accessible controls")
+                            .nodes;
+                        (changed, nodes)
+                    };
+                    frame(Vec::new());
+                    let (changed, nodes) = frame(Vec::new());
+                    assert!(!changed, "rendering {key} must not edit the outline");
+                    for label in ["toolbar.start_arrow", "toolbar.end_arrow"] {
+                        let node = nodes
+                            .iter()
+                            .find(|(_, n)| n.label() == Some(tr(label).as_str()))
+                            .map(|(_, n)| n)
+                            .expect("named arrow control");
+                        assert_eq!(node.role(), egui::accesskit::Role::ComboBox);
+                        assert_eq!(
+                            node.value(),
+                            Some(if mixed { "" } else { Arrowhead::None.name() })
+                        );
+                    }
+                    for (name, _, _) in choices {
+                        let node = nodes
+                            .iter()
+                            .find(|(_, n)| n.label() == Some(tr(&format!("{name}_tip")).as_str()))
+                            .map(|(_, n)| n)
+                            .expect("named choice");
+                        assert_eq!(node.role(), egui::accesskit::Role::Button);
+                        let selected = !mixed
+                            && matches!(
+                                name,
+                                "docker.cap_butt"
+                                    | "docker.join_miter"
+                                    | "docker.dash_solid"
+                                    | "docker.position_center"
+                            );
+                        assert_eq!(
+                            node.toggled(),
+                            Some(if selected {
+                                egui::accesskit::Toggled::True
+                            } else {
+                                egui::accesskit::Toggled::False
+                            }),
+                            "{name}, mixed {mixed}"
+                        );
+                    }
+                    let b = nodes
+                        .iter()
+                        .find(|(_, n)| n.label() == Some(tr(&format!("{key}_tip")).as_str()))
+                        .and_then(|(_, n)| n.bounds())
+                        .expect("choice bounds");
+                    let at = egui::pos2((b.x0 + b.x1) as f32 * 0.5, (b.y0 + b.y1) as f32 * 0.5);
+                    let press = |pressed| egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    frame(vec![egui::Event::PointerMoved(at)]);
+                    frame(vec![press(true)]);
+                    assert!(frame(vec![press(false)]).0, "{key}, mixed {mixed}");
+                    assert_eq!(stroke, Some(expected), "{key}, mixed {mixed}");
+                    assert_eq!(touched, vec![field], "{key}, mixed {mixed}");
                 }
-                let b = nodes
-                    .iter()
-                    .find(|(_, n)| n.label() == Some(tr(key).as_str()))
-                    .and_then(|(_, n)| n.bounds())
-                    .expect("choice bounds");
-                let at = egui::pos2((b.x0 + b.x1) as f32 * 0.5, (b.y0 + b.y1) as f32 * 0.5);
-                let press = |pressed| egui::Event::PointerButton {
-                    pos: at,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: egui::Modifiers::NONE,
-                };
-                frame(vec![egui::Event::PointerMoved(at)]);
-                frame(vec![press(true)]);
-                assert!(frame(vec![press(false)]).0, "{key}, mixed {mixed}");
-                assert_eq!(stroke, Some(expected), "{key}, mixed {mixed}");
-                assert_eq!(touched, vec![field], "{key}, mixed {mixed}");
             }
-        }
+        });
     }
 
     /// The Properties docker keeps its default width with every section
