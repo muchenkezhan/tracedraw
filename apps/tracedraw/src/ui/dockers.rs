@@ -1339,16 +1339,17 @@ fn mesh_node_transparency_row(app: &mut App, ui: &mut Ui) {
         _ => return,
     };
     let mut transparency = ((1.0 - alpha) * 100.0).round() as i32;
-    ui.horizontal(|ui| {
-        ui.label(tr("toolbar.mesh_node_transparency"));
-        if ui
-            .add(crate::ui::Slider::new(&mut transparency, 0..=100).suffix(" %"))
-            .rich_tip(crate::ui::tips::keyed("toolbar.mesh_node_transparency"))
-            .changed()
-        {
-            app.set_mesh_node_alpha(1.0 - transparency as f32 / 100.0);
-        }
-    });
+    if ui
+        .add(
+            crate::ui::Slider::new(&mut transparency, 0..=100)
+                .text(tr("toolbar.mesh_node_transparency"))
+                .suffix(" %"),
+        )
+        .rich_tip(crate::ui::tips::keyed("toolbar.mesh_node_transparency"))
+        .changed()
+    {
+        app.set_mesh_node_alpha(1.0 - transparency as f32 / 100.0);
+    }
 }
 
 /// Fill winding (#1211, #1919): on, the selected curves fill with the
@@ -5644,6 +5645,24 @@ pub(crate) mod tests {
 
     /// Every text the frame painted.
     pub(crate) fn painted_texts(ctx: &egui::Context, app: &mut App) -> Vec<String> {
+        painted_texts_with_input(
+            ctx,
+            app,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 1200.0),
+                )),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn painted_texts_with_input(
+        ctx: &egui::Context,
+        app: &mut App,
+        input: egui::RawInput,
+    ) -> Vec<String> {
         fn walk(s: &egui::Shape, out: &mut Vec<String>) {
             match s {
                 egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
@@ -5651,13 +5670,6 @@ pub(crate) mod tests {
                 _ => {}
             }
         }
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1400.0, 1200.0),
-            )),
-            ..Default::default()
-        };
         let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
         out.textures_delta.clear();
         let mut texts = Vec::new();
@@ -5675,6 +5687,20 @@ pub(crate) mod tests {
     fn gradient_blend_rows_show_and_patch() {
         crate::i18n::with_thread_language("en", || {
             let ctx = crate::theme::ui_context();
+            let frame = |app: &mut App, events| {
+                painted_texts_with_input(
+                    &ctx,
+                    app,
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1400.0, 900.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                )
+            };
             let mut app = App::headless();
             app.settings.autocorrect.enabled = false;
             let mut ids = Vec::new();
@@ -5703,8 +5729,8 @@ pub(crate) mod tests {
             app.docker_tab = DockerTab::Properties;
             // Close Outline before inspecting the Fill section.
             toggle_section(&mut app, "outline");
-            draw(&ctx, &mut app);
-            let mut texts = painted_texts(&ctx, &mut app);
+            frame(&mut app, Vec::new());
+            let mut texts = frame(&mut app, Vec::new());
             // Read the lower rows by scrolling the actual docker at its normal height.
             let column = column_rects(&ctx)
                 .into_iter()
@@ -5712,28 +5738,20 @@ pub(crate) mod tests {
                 .map(|(_, rect)| rect)
                 .expect("the Properties column");
             let over = egui::pos2(column.center().x, column.top() + TITLE_H + 10.0);
-            let mut out = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1400.0, 900.0),
-                    )),
-                    events: vec![
-                        egui::Event::PointerMoved(over),
-                        egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point,
-                            delta: egui::vec2(0.0, -240.0),
-                            modifiers: egui::Modifiers::NONE,
-                            phase: egui::TouchPhase::Move,
-                        },
-                    ],
-                    ..Default::default()
-                },
-                |ui| crate::ui::root(&mut app, ui),
-            );
-            out.textures_delta.clear();
+            texts.extend(frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(over),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -240.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    },
+                ],
+            ));
             for _ in 0..30 {
-                texts.extend(painted_texts(&ctx, &mut app));
+                texts.extend(frame(&mut app, Vec::new()));
             }
             let count = |s: &str| texts.iter().filter(|t| t.as_str() == s).count();
             for key in [
@@ -5754,8 +5772,8 @@ pub(crate) mod tests {
             let mut smooth = f.clone();
             smooth.steps = Fountain::SMOOTH_STEPS;
             app.apply_fill(Fill::Fountain(smooth.clone()));
-            draw(&ctx, &mut app);
-            let texts = painted_texts(&ctx, &mut app);
+            frame(&mut app, Vec::new());
+            let texts = frame(&mut app, Vec::new());
             assert!(!texts.iter().any(|t| t == "24"), "{texts:?}");
             // The second object gets its own angle; an edit of the smooth
             // transition then changes only that on each, in one undo step.
@@ -6314,13 +6332,13 @@ pub(crate) mod tests {
             );
             // The outline's settings come in titled groups (#2573), each
             // title above its first setting and below the group before.
-            let y_of = |key: &str| {
+            let y_of = |key: &str, below: f32| {
                 let want = tr(key);
                 texts
                     .iter()
-                    .find(|(t, _)| *t == want)
-                    .or_else(|| texts.iter().find(|(t, _)| t.starts_with(&want)))
+                    .filter(|(t, r)| r.center().y > below && (*t == want || t.starts_with(&want)))
                     .map(|(_, r)| r.center().y)
+                    .min_by(f32::total_cmp)
                     .unwrap_or_else(|| panic!("{what}: {key} missing in {texts:?}"))
             };
             let mut last = f32::MIN;
@@ -6331,7 +6349,8 @@ pub(crate) mod tests {
                 ("docker.group_line_style", "docker.dash"),
                 ("docker.group_position", "docker.outline_position"),
             ] {
-                let (t, f) = (y_of(title), y_of(first));
+                let t = y_of(title, last);
+                let f = y_of(first, t);
                 assert!(
                     last < t && t < f,
                     "{what}: {title} at {t} not between {last} and {first} at {f}"
@@ -6728,6 +6747,16 @@ pub(crate) mod tests {
                     assert!((w - empty).abs() < 1.0, "{lang}, {name}: {w} after {empty}");
                 }
                 app.select(vec![rect]);
+                app.apply_mesh_fill(rect);
+                app.choose_mesh_nodes(rect, &[0]);
+                assert_eq!(app.selected_mesh_node(), Some((rect, 0)));
+                let (need, w) = overflow(&ctx, &mut app);
+                assert!(need <= 0.5, "{lang}, mesh node: {need} too wide");
+                assert!(
+                    (w - empty).abs() < 1.0,
+                    "{lang}, mesh node: {w} after {empty}"
+                );
+                app.choose_mesh_nodes(rect, &[]);
                 for (k, fill) in fills.iter().enumerate() {
                     app.apply_fill(fill.clone());
                     for kind in 0..4u8 {
