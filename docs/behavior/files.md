@@ -7,7 +7,35 @@ Drawing dialog.
 
 ## Save Drawing
 
-One window, 760 px wide, the same on every system:
+On Windows, Save Drawing uses the system's save dialog. Its folder navigation,
+search, file views and filename field belong to the desktop. TraceDraw adds
+the format version, font and colour-profile embedding, selected objects,
+package options and document properties as controls in the same window.
+Rating uses the system's five-star property editor and is stored as zero
+to five stars in the drawing. New drawings start unrated. Opening Save
+Drawing preserves an existing drawing's saved rating.
+Windows Explorer reads the saved rating of
+`.tdraw` files through the property handler installed by the all-users setup
+or the Store package (see `documents.md`, Windows file ratings).
+ZIP `.cdr` files in versions 14 through 27 also store and restore the
+rating in their package metadata. An installed Windows property handler
+for that format can display it in file properties. Rating persistence in
+RIFF versions 7 through 13 remains unsupported.
+The window opens centered on the main window, constrained to the monitor's
+work area. It can then be moved freely while browsing folders.
+The source menu closes before the system window opens.
+Changing the file type updates the extension and the applicable options;
+switching back keeps the choices made for each format. Cancel commits no
+document properties or save preferences. The system confirms replacement of
+the selected file. A package whose actual target already exists still asks
+for confirmation of that target before writing.
+
+The other platforms, and a Windows system-dialog failure, use the in-app
+Save Drawing dialog described below. A system-dialog error keeps the original
+save options and shows its reason so the save can continue. Changes made
+inside the failed system dialog need to be entered again.
+
+The in-app window is 760 px wide:
 
 - **Folder** (desktop): an Up button, the path bar (a folder typed there
   opens with Enter, and Save writes into it without Enter; one that does

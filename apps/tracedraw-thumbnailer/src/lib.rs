@@ -9,6 +9,12 @@
 
 use tracedraw_core::Document;
 
+#[cfg(any(windows, test))]
+mod properties;
+
+/// The independent property handler class in the existing shell extension.
+pub const PROPERTY_CLSID_TEXT: &str = "{A8E8D07A-71BB-4F15-BD73-2FA694E57C35}";
+
 /// The class id the installer registers (`packaging/windows/tracedraw.iss`)
 /// under `.tdraw\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}`.
 pub const CLSID_TEXT: &str = "{6B1E5D3A-2F41-4C8E-9B7A-1D2C3E4F5A60}";
@@ -55,10 +61,11 @@ mod com {
     };
 
     /// The provider's class id, the same as [`super::CLSID_TEXT`].
-    const CLSID: GUID = GUID::from_u128(0x6B1E5D3A_2F41_4C8E_9B7A_1D2C3E4F5A60);
+    pub(super) const CLSID: GUID = GUID::from_u128(0x6B1E5D3A_2F41_4C8E_9B7A_1D2C3E4F5A60);
 
     /// Objects alive, for `DllCanUnloadNow`.
-    static LIVE: AtomicI32 = AtomicI32::new(0);
+    pub(super) static LIVE: AtomicI32 = AtomicI32::new(0);
+    static SERVER_LOCKS: AtomicI32 = AtomicI32::new(0);
     static FONTS: Once = Once::new();
 
     /// Files past this size are not drawn (Explorer shows the icon).
@@ -174,7 +181,28 @@ mod com {
     }
 
     #[implement(IClassFactory)]
-    struct Factory;
+    struct Factory {
+        kind: ProviderKind,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProviderKind {
+        Thumbnail,
+        Properties,
+    }
+
+    impl Factory {
+        fn new(kind: ProviderKind) -> Self {
+            LIVE.fetch_add(1, Ordering::SeqCst);
+            Self { kind }
+        }
+    }
+
+    impl Drop for Factory {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     impl IClassFactory_Impl for Factory_Impl {
         fn CreateInstance(
@@ -190,12 +218,24 @@ mod com {
             if !punkouter.is_null() {
                 return Err(CLASS_E_NOAGGREGATION.into());
             }
-            let unknown: windows::core::IUnknown = Provider::new().into();
+            let unknown: windows::core::IUnknown = match self.kind {
+                ProviderKind::Thumbnail => Provider::new().into(),
+                ProviderKind::Properties => crate::properties::com::Provider::new().into(),
+            };
             unsafe { unknown.query(&*riid, ppvobject).ok() }
         }
 
-        fn LockServer(&self, _flock: BOOL) -> windows::core::Result<()> {
-            Ok(())
+        fn LockServer(&self, flock: BOOL) -> windows::core::Result<()> {
+            SERVER_LOCKS
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |locks| {
+                    if flock.as_bool() {
+                        locks.checked_add(1)
+                    } else {
+                        locks.checked_sub(1).filter(|value| *value >= 0)
+                    }
+                })
+                .map(|_| ())
+                .map_err(|_| E_FAIL.into())
         }
     }
 
@@ -211,16 +251,20 @@ mod com {
             return E_POINTER;
         }
         *ppv = std::ptr::null_mut();
-        if *rclsid != CLSID {
+        let kind = if *rclsid == CLSID {
+            ProviderKind::Thumbnail
+        } else if *rclsid == crate::properties::com::CLSID {
+            ProviderKind::Properties
+        } else {
             return CLASS_E_CLASSNOTAVAILABLE;
-        }
-        let factory: IClassFactory = Factory.into();
+        };
+        let factory: IClassFactory = Factory::new(kind).into();
         factory.query(&*riid, ppv)
     }
 
     #[no_mangle]
     pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-        if LIVE.load(Ordering::SeqCst) == 0 {
+        if LIVE.load(Ordering::SeqCst) == 0 && SERVER_LOCKS.load(Ordering::SeqCst) == 0 {
             S_OK
         } else {
             S_FALSE

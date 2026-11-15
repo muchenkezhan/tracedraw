@@ -105,6 +105,12 @@ pub struct SaveAsState {
     pub bookmarks: Vec<PathBuf>,
     /// The folders used lately, newest first.
     pub recent: Vec<PathBuf>,
+    /// An error or a package overwrite can continue in the in-app dialog.
+    #[cfg(windows)]
+    pub native_attempted: bool,
+    /// The frame in which this save requested the system window.
+    #[cfg(windows)]
+    native_requested_frame: Option<u64>,
 }
 
 impl SaveAsState {
@@ -207,6 +213,10 @@ impl SaveAsState {
             desktop_bookmarks: Vec::new(),
             bookmarks: app.settings.folder_bookmarks.clone(),
             recent: Vec::new(),
+            #[cfg(windows)]
+            native_attempted: false,
+            #[cfg(windows)]
+            native_requested_frame: None,
         };
         if !files::WEB && !files::ANDROID {
             st.places = files::places();
@@ -220,6 +230,19 @@ impl SaveAsState {
         st.name = format!("{stem}.{}", st.extension());
         st.open_dir(dir);
         st
+    }
+
+    /// Present a menu-free frame before entering the system's modal loop.
+    #[cfg(windows)]
+    fn prepare_native_dialog(&mut self, ctx: &Context) -> bool {
+        let frame = ctx.cumulative_frame_nr();
+        let requested = *self.native_requested_frame.get_or_insert(frame);
+        if frame.saturating_sub(requested) < 2 {
+            egui::Popup::close_all(ctx);
+            ctx.request_repaint();
+            return false;
+        }
+        true
     }
 
     /// The chosen type's extension.
@@ -793,7 +816,42 @@ pub fn size_text(bytes: u64) -> String {
     }
 }
 
+/// Apply an accepted system picker through the same validation and commands.
+#[cfg(windows)]
+fn handle_native_result(
+    app: &mut App,
+    st: &mut SaveAsState,
+    result: Result<Option<SaveAsState>, String>,
+    close: &mut bool,
+) {
+    match result {
+        Ok(Some(mut chosen)) => {
+            chosen.native_attempted = true;
+            *st = chosen;
+            *close = app.finish_save_as(st);
+        }
+        Ok(None) => *close = true,
+        Err(error) => {
+            log::warn!("the system save dialog could not finish: {error}");
+            st.native_attempted = true;
+            st.note = Some(trf("status.save_failed", &[("e", &error)]));
+        }
+    }
+}
+
 pub fn dialog(app: &mut App, ctx: &Context, st: &mut SaveAsState, close: &mut bool) {
+    #[cfg(all(windows, not(test)))]
+    if !st.native_attempted {
+        if !st.prepare_native_dialog(ctx) {
+            return;
+        }
+        st.native_attempted = true;
+        let result = files::save_drawing(st.clone());
+        handle_native_result(app, st, result, close);
+        if *close {
+            return;
+        }
+    }
     window(ctx, tr("dialog.save_drawing")).show(ctx, |ui| {
         ui.set_width(WIDTH);
         // No folders in a browser (a download) or on Android (the
@@ -1462,6 +1520,199 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_source_menu_closes_before_the_system_save_window_opens() {
+        let ctx = Context::default();
+        let mut st = SaveAsState::new(&App::headless());
+        let popup = egui::Id::new("save-source-menu");
+        egui::Popup::open_id(&ctx, popup);
+        assert!(egui::Popup::is_id_open(&ctx, popup));
+        assert!(!st.prepare_native_dialog(&ctx));
+        assert!(!egui::Popup::is_id_open(&ctx, popup));
+        for expected in [false, false, true] {
+            let mut ready = false;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| ready = st.prepare_native_dialog(ui.ctx()),
+            );
+            out.textures_delta.clear();
+            assert_eq!(ready, expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelling_the_system_save_keeps_the_drawing_and_preferences() {
+        let mut app = drawing();
+        let document = app.doc().clone();
+        let last_dir = app.settings.last_dir.clone();
+        let mut st = SaveAsState::new(&app);
+        st.title = "An uncommitted title".into();
+        st.subject = "An uncommitted subject".into();
+        st.rating = 5;
+        let mut close = false;
+        handle_native_result(&mut app, &mut st, Ok(None), &mut close);
+        assert!(close);
+        assert_eq!(app.doc(), &document);
+        assert_eq!(app.settings.last_dir, last_dir);
+        assert!(app.file.is_none());
+        // The facade remains the native entry point in production.
+        let _ = files::save_drawing as fn(SaveAsState) -> Result<Option<SaveAsState>, String>;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_accepted_system_save_uses_the_existing_writer_and_metadata_commands() {
+        let dir = temp_dir("native-save-accepted");
+        let mut app = drawing();
+        let mut original = SaveAsState::new(&app);
+        let mut chosen = original.clone();
+        chosen.open_dir(dir.clone());
+        chosen.set_cdr(false);
+        chosen.name = "Accepted.tdraw".into();
+        chosen.title = "Accepted title".into();
+        chosen.subject = "Accepted subject".into();
+        chosen.rating = 4;
+        chosen.replace = Some(chosen.target());
+        let mut close = false;
+        handle_native_result(&mut app, &mut original, Ok(Some(chosen)), &mut close);
+        assert!(close);
+        assert!(original.native_attempted);
+        let path = dir.join("Accepted.tdraw");
+        assert_eq!(app.file.as_ref(), Some(&path));
+        assert!(path.is_file());
+        assert_eq!(app.doc().title, "Accepted title");
+        assert_eq!(app.doc().metadata.subject, "Accepted subject");
+        assert_eq!(app.doc().metadata.rating, 4);
+        assert_eq!(app.settings.last_dir, Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_system_picker_error_keeps_the_draft_for_the_in_app_dialog() {
+        let mut app = drawing();
+        let document = app.doc().clone();
+        let mut st = SaveAsState::new(&app);
+        st.name = "Draft.tdraw".into();
+        let mut close = false;
+        handle_native_result(&mut app, &mut st, Err("picker error".into()), &mut close);
+        assert!(!close);
+        assert!(st.native_attempted);
+        assert_eq!(st.name, "Draft.tdraw");
+        assert!(st
+            .note
+            .as_ref()
+            .is_some_and(|note| note.contains("picker error")));
+        assert_eq!(app.doc(), &document);
+        assert!(app.file.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_overwrite_confirmation_does_not_cover_an_existing_package_target() {
+        let dir = temp_dir("native-save-package-confirmation");
+        let folder = dir.join("Package");
+        std::fs::create_dir(&folder).expect("package folder");
+        let existing = folder.join("Package.tdraw");
+        std::fs::write(&existing, b"keep this file").expect("existing file");
+        let mut app = drawing();
+        let mut st = SaveAsState::new(&app);
+        let mut chosen = st.clone();
+        chosen.open_dir(dir.clone());
+        chosen.set_cdr(false);
+        chosen.name = "Package.tdraw".into();
+        chosen.package = true;
+        chosen.replace = Some(dir.join("Package.tdraw"));
+        let mut close = false;
+        handle_native_result(&mut app, &mut st, Ok(Some(chosen)), &mut close);
+        assert!(!close);
+        assert!(st.native_attempted);
+        assert_eq!(st.replace, Some(existing.clone()));
+        assert_eq!(
+            std::fs::read(existing).expect("original file"),
+            b"keep this file"
+        );
+        assert!(app.file.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn old_cdr_save_sets_the_version_before_the_system_picker_opens() {
+        let mut app = drawing();
+        app.save_as_from_old_cdr();
+        let st = state(&mut app);
+        assert_eq!(st.version, tracedraw_cdr::write::CHECKED_SINCE);
+        assert!(!st.native_attempted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_accepted_system_save_can_write_only_the_selected_objects() {
+        let dir = temp_dir("native-save-selection");
+        let mut app = drawing();
+        let keep = app
+            .new_shape(ShapeKind::Ellipse {
+                rect: tracedraw_core::geometry::Rect::new(80.0, 10.0, 110.0, 40.0),
+                arc: None,
+            })
+            .expect("selected object");
+        app.select(vec![keep]);
+        let document = app.doc().clone();
+        let mut st = SaveAsState::new(&app);
+        let mut chosen = st.clone();
+        chosen.open_dir(dir.clone());
+        chosen.set_cdr(false);
+        chosen.name = "Selection.tdraw".into();
+        chosen.selected_only = true;
+        chosen.replace = Some(chosen.target());
+        let mut close = false;
+        handle_native_result(&mut app, &mut st, Ok(Some(chosen)), &mut close);
+        assert!(close);
+        let text = std::fs::read_to_string(dir.join("Selection.tdraw")).expect("selection file");
+        let saved = tracedraw_core::Document::from_json(&text).expect("saved document");
+        let shapes: Vec<_> = saved
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .collect();
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].id, keep);
+        assert_eq!(app.doc(), &document);
+        assert!(app.file.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_normalized_filename_still_confirms_its_actual_overwrite_target() {
+        let dir = temp_dir("native-save-normalization");
+        let existing = dir.join("Approved.tdraw");
+        std::fs::write(&existing, b"keep this file").expect("existing file");
+        let mut app = drawing();
+        let mut st = SaveAsState::new(&app);
+        let mut chosen = st.clone();
+        chosen.open_dir(dir.clone());
+        chosen.set_cdr(false);
+        chosen.name = "Approved\u{200e}.tdraw".into();
+        chosen.replace = Some(dir.join(&chosen.name));
+        let mut close = false;
+        handle_native_result(&mut app, &mut st, Ok(Some(chosen)), &mut close);
+        assert!(!close);
+        assert_eq!(st.replace, Some(existing.clone()));
+        assert_eq!(
+            std::fs::read(existing).expect("original file"),
+            b"keep this file"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Draw the open dialog for a frame, pressing Enter when `enter`.
@@ -2258,22 +2509,24 @@ mod tests {
     /// reason, and is absent when every face may be embedded (#1219).
     #[test]
     fn the_fonts_left_out_are_named_with_their_reason() {
-        use tracedraw_cdr::write::LeftOut;
-        assert_eq!(fonts_left_out_text(&[]), None);
-        let note = fonts_left_out_text(&[
-            ("Raj 50".to_string(), LeftOut::Licence),
-            ("Missing Sans".to_string(), LeftOut::NoFile),
-        ])
-        .expect("a note");
-        assert!(
-            note.contains("Raj 50 (its licence forbids embedding)"),
-            "{note}"
-        );
-        assert!(
-            note.contains("Missing Sans (no font file to embed)"),
-            "{note}"
-        );
-        assert!(note.starts_with("Not embedded: "), "{note}");
+        crate::i18n::with_thread_language("en", || {
+            use tracedraw_cdr::write::LeftOut;
+            assert_eq!(fonts_left_out_text(&[]), None);
+            let note = fonts_left_out_text(&[
+                ("Raj 50".to_string(), LeftOut::Licence),
+                ("Missing Sans".to_string(), LeftOut::NoFile),
+            ])
+            .expect("a note");
+            assert!(
+                note.contains("Raj 50 (its licence forbids embedding)"),
+                "{note}"
+            );
+            assert!(
+                note.contains("Missing Sans (no font file to embed)"),
+                "{note}"
+            );
+            assert!(note.starts_with("Not embedded: "), "{note}");
+        });
     }
 
     /// Save As with Selected only (#2195): the file holds the selected

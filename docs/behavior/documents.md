@@ -120,10 +120,38 @@ versions included.
 
 Version 0.41 had no thumbnail provider; it came in 0.42.0 (#1740).
 
+## Windows file ratings
+
+Windows Explorer's Properties > Details page and Rating column read a
+`.tdraw` drawing's saved `metadata.rating` through a property handler in
+`tracedraw_thumbnailer.dll`. The handler has its own class id,
+`{A8E8D07A-71BB-4F15-BD73-2FA694E57C35}`, and reads only the rating from
+the JSON stream. It skips drawing content without constructing or rendering
+the document and limits the stream to 256 MiB.
+
+Zero means unrated. One through five stars map to the Windows
+`System.Rating` values 1, 25, 50, 75 and 99. Older drawings with no rating
+read as unrated. Explorer displays this property read-only. Edit it in
+TraceDraw's Document Info or Save Drawing dialog and save the drawing.
+The rating travels with the `.tdraw` file.
+
+The all-users setup registers the class and the `.tdraw` property handler
+under the machine's Windows property system, with the Rating property
+listed on the Details page. The Store package declares the same class and
+file-type association in its manifest. A per-user setup or portable copy
+can save ratings in drawings. Explorer integration requires the all-users
+setup or the Store package.
+
 ## Checks
 
 - `tracedraw_thumbnailer::tests::the_setup_and_the_release_build_ship_and_register_the_provider`
   and `tracedraw_thumbnailer::tests::the_first_page_is_drawn_at_the_size_asked`.
+- `tracedraw_thumbnailer::properties::tests` covers native metadata,
+  older drawings, malformed input, nested content and the stream limit.
+  The Windows COM tests cover property enumeration, the system rating
+  key, read-only access, one-time initialization and DLL lifetimes.
+  `property_registration` checks the setup and Store declarations against
+  the handler's independent class id.
 
 - `documents::tests::each_drawing_keeps_its_objects_history_and_selection`
 - `documents::tests::closing_moves_to_a_neighbour_then_to_the_welcome_screen`

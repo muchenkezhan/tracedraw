@@ -4316,6 +4316,8 @@ dependencies = [
  "web-sys",
  "web-time",
  "webp",
+ "windows",
+ "windows-core",
  "windows-sys 0.52.0",
  "winit",
  "winresource",
@@ -4333,6 +4335,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "log",
+ "roxmltree 0.21.1",
  "serde",
  "serde_json",
  "tiny-skia",
@@ -4444,6 +4447,8 @@ dependencies = [
 name = "tracedraw-thumbnailer"
 version = "0.46.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tracedraw-core",
  "tracedraw-render",
  "tracedraw-text",

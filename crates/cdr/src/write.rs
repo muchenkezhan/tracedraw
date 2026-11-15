@@ -1181,8 +1181,9 @@ fn summary_xml(v: Ver, doc: &Document) -> String {
         .first()
         .map(|p| (p.size.width, p.size.height))
         .unwrap_or((0.0, 0.0));
+    let rating = crate::metadata::rating_xml(doc.metadata.rating, v.0);
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n    <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n        <rdf:Description rdf:about=\"\" xmlns=\"{TEXTINFO_NS}\">\n            <FontsUsed>\n{bag}            </FontsUsed>\n            <Title>{}</Title>\n            <AppVersion>{ver}</AppVersion>\n            <CoreVersion>{ver}</CoreVersion>\n            <NumPages>{}</NumPages>\n            <NumLayers>{layers}</NumLayers>\n            <PageWidth>{}</PageWidth>\n            <PageHeight>{}</PageHeight>\n        </rdf:Description>\n    </rdf:RDF>\n</x:xmpmeta>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n    <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n        <rdf:Description rdf:about=\"\" xmlns=\"{TEXTINFO_NS}\">\n            <FontsUsed>\n{bag}            </FontsUsed>\n            <Title>{}</Title>\n            <AppVersion>{ver}</AppVersion>\n            <CoreVersion>{ver}</CoreVersion>\n            <NumPages>{}</NumPages>\n            <NumLayers>{layers}</NumLayers>\n            <PageWidth>{}</PageWidth>\n            <PageHeight>{}</PageHeight>\n{rating}        </rdf:Description>\n    </rdf:RDF>\n</x:xmpmeta>\n",
         xml_escape(&doc.title),
         doc.pages.len(),
         (w * UNITS_PER_MM).round() as i64,
@@ -1322,8 +1323,10 @@ fn container_xml(doc: &Document, previews: &Previews) -> String {
 /// `META-INF/metadata.xml`: the format and the version that wrote the
 /// file (`CoreVersion`, in hundreds) and the title.
 fn metadata_xml(v: Ver, doc: &Document) -> String {
+    let rating = crate::metadata::rating_xml(doc.metadata.rating, v.0);
+    let property_ns = crate::metadata::PROPERTY_NS;
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n    <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n        <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:cdr=\"{METADATA_NS}\">\n            <dc:format>{PACKAGE_MEDIA_TYPE}</dc:format>\n            <cdr:CoreVersion>{}</cdr:CoreVersion>\n            <dc:title>\n                <rdf:Alt>\n                    <rdf:li xml:lang=\"x-default\">{}</rdf:li>\n                </rdf:Alt>\n            </dc:title>\n        </rdf:Description>\n    </rdf:RDF>\n</x:xmpmeta>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n    <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n        <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:cdr=\"{METADATA_NS}\" xmlns:crl=\"{property_ns}\">\n            <dc:format>{PACKAGE_MEDIA_TYPE}</dc:format>\n            <cdr:CoreVersion>{}</cdr:CoreVersion>\n            <dc:title>\n                <rdf:Alt>\n                    <rdf:li xml:lang=\"x-default\">{}</rdf:li>\n                </rdf:Alt>\n            </dc:title>\n{rating}        </rdf:Description>\n    </rdf:RDF>\n</x:xmpmeta>\n",
         u32::from(v.0) * 100,
         xml_escape(&doc.title)
     )

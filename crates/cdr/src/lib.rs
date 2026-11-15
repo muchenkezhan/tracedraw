@@ -29,6 +29,7 @@ pub mod cmx;
 pub mod container;
 mod kept_blends;
 mod kept_effects;
+mod metadata;
 pub mod parse;
 mod shadow_image;
 pub mod spot;
@@ -152,6 +153,9 @@ pub fn open_bytes_keeping(
         &kept_effects,
     );
     doc_report.0.title = title.to_string();
+    if let Some(rating) = metadata::read_rating(bytes, &container) {
+        doc_report.0.metadata.rating = rating;
+    }
     doc_report.0.palette = container::document_palette(bytes, &container)
         .into_iter()
         .map(|(_, c)| c)

@@ -562,6 +562,45 @@ not counted as a text left out. Not read: the four ids of argument
 the size of the letters is not known: the sample's cells are empty),
 and tables are still written as groups.
 
+## ZIP document ratings
+
+The document's rating is stored in the package metadata member. Versions
+14 and 15 use `metadata/metadata.xml` with the default namespace
+`http://namespace.corel.com/Cdr/metadata`. A `Properties` element contains
+a `Property` element with plain attributes and its value as text.
+
+```xml
+<Properties>
+    <Property array="false"
+              fmtid="{64440492-4C8B-11D1-8B70-080036B11A03}"
+              propid="9" type="uint">99</Property>
+</Properties>
+```
+
+From version 16, the member is `META-INF/metadata.xml`. Its property namespace is
+`http://namespace.corel.com/zcf/metadata/1.0/`, shown as `crl` below.
+An `OpenMetadata` element contains an RDF `Bag` of `li` elements with
+namespaced attributes. The rating entry has these attributes.
+
+```xml
+<rdf:li crl:array="false"
+        crl:fmtid="64440492-4c8b-11d1-8b70-080036b11a03"
+        crl:propid="9" crl:type="uint" crl:value="99" />
+```
+
+The format id and property id identify Windows `System.Rating`. Values
+0, 1, 25, 50, 75 and 99 represent zero through five stars. Namespace URIs
+identify the element and attributes independently of their prefixes.
+Missing, invalid or unreadable rating metadata leaves the drawing unrated.
+The XML member is limited to 1 MiB when reading this optional property.
+
+Confirmed on 2026-11-15 from contributor-owned drawings in versions 14,
+15, 16 and 27 written by TraceDraw and copies rated five stars through
+the public Windows property API. Their metadata contained these entries,
+and the Windows reader returned `System.Rating=99`. Drawing data and
+image members stayed byte-for-byte identical. See `CLEANROOM.md` for the
+source record.
+
 ## Version 8 text frames
 
 Version 8 files come in two layouts the version number does not tell apart: the usual one (800) with paragraph text frames of 32 bytes after the matrix and path flag, and the bidirectional one (801) with 34. The reader tries 32, and when the counts that follow are implausible, 34; the style table is read both without and with the set11 table, and the reading that ends where the table ends without complaint wins (2026-10-19, from version 8 samples a user attached to a bug report; 2026-10-29: the version 8 files of both variants saved by the program that reads these files hold set11, so TraceDraw writes it in version 8 and the reader no longer settles for the first reading without complaint, which a table with set11 could pass by chance).

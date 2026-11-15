@@ -21,6 +21,20 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+pub(crate) mod save_drawing_windows;
+
+/// Show the desktop's save picker with the drawing's own save options.
+#[cfg(windows)]
+pub(crate) fn save_drawing(
+    state: crate::ui::save_as::SaveAsState,
+) -> Result<Option<crate::ui::save_as::SaveAsState>, String> {
+    // SAFETY: called on the editor's window thread. A null handle is also
+    // accepted by the system when there is no active owner.
+    let owner = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow() };
+    save_drawing_windows::show(state, owner)
+}
+
 type Job = Box<dyn FnOnce(&mut App, PathBuf)>;
 
 thread_local! {

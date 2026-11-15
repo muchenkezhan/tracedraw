@@ -5,9 +5,10 @@
   xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
+  xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap3 desktop desktop2 com rescap">
+  IgnorableNamespaces="uap uap3 desktop desktop2 desktop3 com rescap">
 
   <Identity Name="{IDENTITY}" Publisher="{PUBLISHER}" Version="{VERSION}" ProcessorArchitecture="x64" />
 
@@ -58,6 +59,11 @@
                  page: the thumbnail provider below (the same class id as
                  the setup registers, packaging/windows/tracedraw.iss). -->
             <desktop2:ThumbnailHandler Clsid="6B1E5D3A-2F41-4C8E-9B7A-1D2C3E4F5A60" />
+            <desktop2:DesktopPropertyHandler Clsid="A8E8D07A-71BB-4F15-BD73-2FA694E57C35" />
+            <desktop3:PropertyLists>
+              <desktop3:PropertyList Property="fullDetails" Value="prop:System.PropGroup.Description;System.Rating;System.PropGroup.FileSystem;System.ItemNameDisplay;System.ItemTypeText;System.DateCreated;System.DateModified;System.Size;System.FileAttributes" />
+              <desktop3:PropertyList Property="previewDetails" Value="prop:System.Rating;System.ItemTypeText;System.DateModified;System.Size" />
+            </desktop3:PropertyLists>
           </uap:FileTypeAssociation>
         </uap:Extension>
         <uap:Extension Category="windows.fileTypeAssociation">
@@ -75,6 +81,9 @@
           <com:ComServer>
             <com:SurrogateServer DisplayName="TraceDraw thumbnails">
               <com:Class Id="6B1E5D3A-2F41-4C8E-9B7A-1D2C3E4F5A60" Path="tracedraw_thumbnailer.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+            <com:SurrogateServer DisplayName="TraceDraw rating">
+              <com:Class Id="A8E8D07A-71BB-4F15-BD73-2FA694E57C35" Path="tracedraw_thumbnailer.dll" ThreadingModel="Both" />
             </com:SurrogateServer>
           </com:ComServer>
         </com:Extension>
