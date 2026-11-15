@@ -3,6 +3,7 @@
 use crate::app::{App, DockerDrag, DockerPlace, DockerTab};
 use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
+use crate::ui::outline_pen::Pic;
 use crate::ui::pattern_pick::{PatternAction, PatternPickers};
 use crate::ui::slider::Settled;
 use crate::ui::tips::RichTip;
@@ -1250,8 +1251,7 @@ fn color_row(ui: &mut Ui, label: &str, c: &mut Color) -> bool {
 /// [`color_row`] for objects whose colours differ when `mixed`: no colour
 /// is shown, and the one picked goes to all of them.
 fn color_row_mixed(ui: &mut Ui, label: &str, c: &mut Color, mixed: bool) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(label);
+    editor_row(ui, label, |ui| {
         // The picker opens beside the swatch and keeps the colour's
         // model.
         let before = ui.cursor().min;
@@ -1263,13 +1263,13 @@ fn color_row_mixed(ui: &mut Ui, label: &str, c: &mut Color, mixed: bool) -> bool
         } else {
             ui.label(
                 egui::RichText::new(crate::app::color_description(*c))
-                    .color(Tokens::text_dim())
+                    .color(Tokens::text())
+                    .monospace()
                     .size(11.0),
             );
         }
         ch
     })
-    .inner
 }
 
 /// Give the selection these further fills and outlines (one undo step).
@@ -1561,87 +1561,138 @@ pub(crate) fn selection_area_mm2(s: &tracedraw_core::Shape) -> Option<f64> {
     a.is_finite().then_some(a)
 }
 
+fn properties_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Tokens::field())
+        .stroke(egui::Stroke::new(1.0, Tokens::border()))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+}
+
 fn properties(app: &mut App, ui: &mut Ui) {
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+    ui.spacing_mut().button_padding.y = ui.spacing().button_padding.y.max(3.0);
+    ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(20.0);
+    ui.visuals_mut().widgets.inactive.weak_bg_fill = Tokens::field();
+    ui.visuals_mut().selection.stroke.color = Tokens::text();
     let cc = app.current_colors;
     ui.data_mut(|d| d.insert_temp(current_colors_id(), cc));
     let shapes = app.selected_rc();
     if shapes.is_empty() {
-        ui.label(egui::RichText::new(tr("docker.no_objects_selected")).color(Tokens::text_dim()));
-        ui.add_space(6.0);
-        ui.strong(tr("docker.default_properties"));
+        properties_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().interact_size.y = 0.0;
+            ui.label(
+                egui::RichText::new(tr("docker.default_properties")).font(crate::theme::bold(13.0)),
+            );
+            ui.label(
+                egui::RichText::new(tr("docker.no_objects_selected")).color(Tokens::text_dim()),
+            );
+        });
         ui.add_space(4.0);
         // The same sections, in the same order, as with an object
         // selected, so each row of paint kinds sits under its own title
         // (#487).
-        if section_header(app, ui, "outline", &tr("docker.outline")) {
-            ui.add_space(2.0);
-            let mut stroke = app.default_stroke();
-            let custom = crate::ui::line_style::OutlineLib::of(app);
-            if outline_editor(ui, &mut stroke, &custom) {
-                app.set_default_properties(tracedraw_core::DefaultKind::Graphic, |p| {
-                    p.stroke = stroke
-                });
+        properties_frame().show(ui, |ui| {
+            if section_header(
+                app,
+                ui,
+                "outline",
+                &tr("docker.outline"),
+                SectionIcon::Tool(crate::tools::Tool::OutlinePen),
+            ) {
+                ui.add_space(2.0);
+                let mut stroke = app.default_stroke();
+                let custom = crate::ui::line_style::OutlineLib::of(app);
+                if outline_editor(ui, &mut stroke, &custom) {
+                    app.set_default_properties(tracedraw_core::DefaultKind::Graphic, |p| {
+                        p.stroke = stroke
+                    });
+                }
             }
-            ui.add_space(6.0);
-        }
-        if section_header(app, ui, "fill", &tr("docker.fill")) {
-            ui.add_space(2.0);
-            let mut fill = app.default_fill();
-            if fill_editor(ui, &mut fill) {
-                app.set_default_properties(tracedraw_core::DefaultKind::Graphic, |p| p.fill = fill);
+        });
+        ui.add_space(4.0);
+        properties_frame().show(ui, |ui| {
+            if section_header(
+                app,
+                ui,
+                "fill",
+                &tr("docker.fill"),
+                SectionIcon::Tool(crate::tools::Tool::InteractiveFill),
+            ) {
+                ui.add_space(2.0);
+                let mut fill = app.default_fill();
+                if fill_editor(ui, &mut fill) {
+                    app.set_default_properties(tracedraw_core::DefaultKind::Graphic, |p| {
+                        p.fill = fill
+                    });
+                }
             }
-        }
+        });
         return;
     }
     let first = &shapes[0];
-    ui.strong(format!(
-        "{}{}",
-        kind_name(&first.kind),
-        if shapes.len() > 1 {
-            trf(
-                "docker.and_n_more",
-                &[("n", &(shapes.len() - 1).to_string())],
-            )
-        } else {
-            String::new()
-        }
-    ));
-    let b = app.selection_bounds().unwrap_or_default();
-    let o = app.to_ruler(tracedraw_core::geometry::Point::new(b.x0, b.y0));
-    ui.label(
-        egui::RichText::new(format!(
-            "x {:.2}  y {:.2}  w {:.2}  h {:.2} {}",
+    properties_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}{}",
+                    kind_name(&first.kind),
+                    if shapes.len() > 1 {
+                        trf(
+                            "docker.and_n_more",
+                            &[("n", &(shapes.len() - 1).to_string())],
+                        )
+                    } else {
+                        String::new()
+                    }
+                ))
+                .font(crate::theme::bold(14.0)),
+            );
+            if let Some(area) = shapes
+                .first()
+                .filter(|_| shapes.len() == 1)
+                .and_then(selection_area_mm2)
+            {
+                let k = app.units.world_from_mm(1.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {:.2} {}\u{b2}",
+                            tr("docker.area"),
+                            area * k * k,
+                            app.units.short()
+                        ))
+                        .color(Tokens::text_dim())
+                        .size(11.0),
+                    )
+                    .rich_tip(crate::ui::tips::keyed("docker.area"));
+                });
+            }
+        });
+        let b = app.selection_bounds().unwrap_or_default();
+        let o = app.to_ruler(tracedraw_core::geometry::Point::new(b.x0, b.y0));
+        let position = format!(
+            "{:.2}, {:.2} {}",
             app.units.world_from_mm(o.x),
             app.units.world_from_mm(o.y),
+            app.units.short()
+        );
+        let size = format!(
+            "{:.2} × {:.2} {}",
             app.units.world_from_mm(b.width()),
             app.units.world_from_mm(b.height()),
             app.units.short()
-        ))
-        .monospace()
-        .size(11.0),
-    );
-    // One closed object: the area it covers, in the document's unit
-    // squared (#2599).
-    if let Some(area) = shapes
-        .first()
-        .filter(|_| shapes.len() == 1)
-        .and_then(selection_area_mm2)
-    {
-        let k = app.units.world_from_mm(1.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "{} {:.2} {}\u{b2}",
-                tr("docker.area"),
-                area * k * k,
-                app.units.short()
-            ))
-            .monospace()
-            .size(11.0),
-        )
-        .rich_tip(crate::ui::tips::keyed("docker.area"));
-    }
-
-    ui.separator();
+        );
+        for (label, value) in [(tr("docker.position"), position), (tr("docker.size"), size)] {
+            editor_row(ui, &label, |ui| {
+                ui.label(egui::RichText::new(value).monospace().size(12.0));
+            });
+        }
+    });
+    ui.add_space(3.0);
     // A jump from elsewhere (F11 to the fill, the outline from the status
     // bar) opens that section.
     if let Some(i) = app.properties_open.take() {
@@ -1703,17 +1754,11 @@ fn properties(app: &mut App, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.x = 2.0;
         for (id, key, icon) in &sections {
             let open = !app.settings.properties_closed.iter().any(|c| c == id);
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), egui::Sense::click());
-            let fill = if open {
-                Some(Tokens::tool_active())
-            } else if resp.hovered() {
-                Some(Tokens::tool_hover())
-            } else {
-                None
-            };
-            if let Some(c) = fill {
-                ui.painter().rect_filled(rect, 2.0, c);
-            }
+            let resp = ui.add_sized(egui::vec2(28.0, 26.0), egui::Button::new("").selected(open));
+            let rect = resp.rect;
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), open, tr(key))
+            });
             icon.paint(
                 ui.painter(),
                 egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0)),
@@ -1725,7 +1770,11 @@ fn properties(app: &mut App, ui: &mut Ui) {
             #[cfg(test)]
             ui.ctx()
                 .data_mut(|d| d.insert_temp(section_button_id(id), rect));
-            if resp.rich_tip(tip).clicked() {
+            if resp
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .rich_tip(tip)
+                .clicked()
+            {
                 let beside = ui.input(|i| i.modifiers.command || i.modifiers.shift);
                 let shown: Vec<&str> = sections.iter().map(|(id, _, _)| *id).collect();
                 pick_section(app, id, &shown, beside);
@@ -1733,8 +1782,13 @@ fn properties(app: &mut App, ui: &mut Ui) {
         }
     });
     ui.add_space(2.0);
-    for (id, key, _) in sections {
-        if !section_header(app, ui, id, &tr(key)) {
+    for (id, key, icon) in sections {
+        let parent_ui = &mut *ui;
+        let mut card = properties_frame().begin(parent_ui);
+        let ui = &mut card.content_ui;
+        if !section_header(app, ui, id, &tr(key), icon) {
+            card.end(parent_ui);
+            parent_ui.add_space(4.0);
             continue;
         }
         ui.add_space(2.0);
@@ -1947,7 +2001,8 @@ fn properties(app: &mut App, ui: &mut Ui) {
             "summary" => summary_section(app, ui, &shapes),
             _ => {}
         }
-        ui.add_space(6.0);
+        card.end(parent_ui);
+        parent_ui.add_space(4.0);
     }
 }
 
@@ -2454,14 +2509,25 @@ fn group_heading(ui: &mut Ui, key: &str) {
 
 /// A Properties section's header: a bar with the open or closed triangle
 /// and the title; a click opens or closes the section. True when open.
-fn section_header(app: &mut App, ui: &mut Ui, id: &str, title: &str) -> bool {
+fn section_header(app: &mut App, ui: &mut Ui, id: &str, title: &str, icon: SectionIcon) -> bool {
     let open = !app.settings.properties_closed.iter().any(|c| c == id);
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
+    let text = ui.painter().layout(
+        title.to_owned(),
+        crate::theme::bold(12.5),
+        Tokens::text(),
+        (ui.available_width() - 46.0).max(24.0),
+    );
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), text.size().y.max(20.0) + 8.0),
+        egui::Sense::click(),
+    );
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, ui.is_enabled(), title)
+    });
     let fill = if resp.hovered() {
         Tokens::tool_hover()
     } else {
-        crate::theme::Tokens::control_fill()
+        Tokens::field()
     };
     ui.painter().rect_filled(rect, 2.0, fill);
     if open {
@@ -2480,8 +2546,20 @@ fn section_header(app: &mut App, ui: &mut Ui, id: &str, title: &str) -> bool {
             },
             Tokens::ACCENT,
         );
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            egui::Stroke::new(1.0, Tokens::border()),
+        );
     }
-    let c = egui::pos2(rect.left() + 10.0, rect.center().y);
+    icon.paint(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 10.0, rect.center().y),
+            egui::vec2(16.0, 16.0),
+        ),
+    );
+    let c = egui::pos2(rect.right() - 8.0, rect.center().y);
     let points = if open {
         vec![
             c + egui::vec2(-4.0, -2.0),
@@ -2500,14 +2578,22 @@ fn section_header(app: &mut App, ui: &mut Ui, id: &str, title: &str) -> bool {
         Tokens::icon(),
         egui::Stroke::NONE,
     ));
-    ui.painter().text(
-        egui::pos2(rect.left() + 20.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        title,
-        crate::theme::bold(12.5),
+    ui.painter().galley(
+        egui::pos2(rect.left() + 26.0, rect.center().y - text.size().y / 2.0),
+        text,
         Tokens::text(),
     );
-    let resp = resp.rich_tip_with(|| format!("{title}\n{}", tr("docker.section_desc")));
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .rich_tip_with(|| format!("{title}\n{}", tr("docker.section_desc")));
     if resp.clicked() {
         toggle_section(app, id);
         return !open;
@@ -2768,12 +2854,20 @@ fn fill_editor_mixed(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for (i, n) in FILL_KINDS {
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), egui::Sense::click());
-            if shown_kind == Some(i) {
-                ui.painter().rect_filled(rect, 2.0, Tokens::tool_active());
-            } else if resp.hovered() {
-                ui.painter().rect_filled(rect, 2.0, Tokens::tool_hover());
-            }
+            let selected = shown_kind == Some(i);
+            let resp = ui.add_sized(
+                egui::vec2(28.0, 26.0),
+                egui::Button::new("").selected(selected),
+            );
+            let rect = resp.rect;
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    selected,
+                    tr(n),
+                )
+            });
             fill_kind_picture(
                 ui.painter(),
                 egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0)),
@@ -3825,7 +3919,13 @@ pub(crate) fn arrow_combo(
     mixed: bool,
 ) -> bool {
     let mut changed = false;
-    let shown = if mixed {
+    let shown = if label.is_empty() {
+        if mixed {
+            String::new()
+        } else {
+            a.name().to_string()
+        }
+    } else if mixed {
         format!("{label}:")
     } else {
         format!("{label}: {}", a.name())
@@ -3835,8 +3935,13 @@ pub(crate) fn arrow_combo(
     } else {
         "toolbar.start_arrow"
     };
-    crate::ui::keynav::ComboBox::from_id_salt(id)
-        .selected_text(shown)
+    let combo = crate::ui::keynav::ComboBox::from_id_salt(id).selected_text(shown.clone());
+    let combo = if label.is_empty() {
+        combo.width((ui.available_width() - 30.0).max(40.0))
+    } else {
+        combo
+    };
+    let response = combo
         .show_ui(ui, |ui| {
             for k in Arrowhead::ALL {
                 if ui.selectable_label(!mixed && *a == k, k.name()).clicked() {
@@ -3856,8 +3961,16 @@ pub(crate) fn arrow_combo(
                 }
             }
         })
-        .response
-        .rich_tip(crate::ui::tips::keyed(tip));
+        .response;
+    if label.is_empty() {
+        response.widget_info(|| {
+            let mut info =
+                egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), tr(tip));
+            info.current_text_value = Some(shown.clone());
+            info
+        });
+    }
+    response.rich_tip(crate::ui::tips::keyed(tip));
     changed
 }
 
@@ -3896,6 +4009,67 @@ fn outline_editor(
     outline_editor_mixed(ui, stroke, lib, &StrokeMix::default(), &mut Vec::new())
 }
 
+/// An editor field with a common label column and wrapping controls.
+fn editor_row<R>(ui: &mut Ui, label: &str, controls: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add_sized(
+            egui::vec2(56.0, ui.spacing().interact_size.y),
+            egui::Label::new(egui::RichText::new(label).color(Tokens::text_dim()))
+                .wrap()
+                .halign(egui::Align::LEFT),
+        );
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width().max(0.0), 0.0),
+            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                controls(ui)
+            },
+        )
+        .inner
+    })
+    .inner
+}
+
+/// Equal-sized pictogram choices in the available control column.
+fn editor_choice_size(ui: &Ui, count: usize, preferred_width: f32) -> egui::Vec2 {
+    let count = count.max(1);
+    let spacing = ui.spacing();
+    let width = ((ui.available_width() - spacing.item_spacing.x * (count - 1) as f32)
+        / count as f32)
+        .clamp(28.0, preferred_width);
+    egui::vec2(width, 26.0)
+}
+
+/// A named outline choice showing the same picture as the Outline Pen dialog.
+fn outline_icon_choice(
+    ui: &mut Ui,
+    size: egui::Vec2,
+    key: &str,
+    on: bool,
+    picture: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> bool {
+    let resp = ui.add_sized(size, egui::Button::new("").selected(on));
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, tr(key))
+    });
+    picture(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            resp.rect.center(),
+            egui::Vec2::splat(crate::ui::outline_pen::PICTURE_SIZE),
+        ),
+        ui.style().interact_selectable(&resp, on).fg_stroke.color,
+    );
+    resp.rich_tip(crate::ui::tips::pair(
+        &format!("{key}_tip"),
+        &format!("{key}_desc"),
+    ))
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .clicked()
+}
+
 /// [`outline_editor`] for a selection whose outlines differ as `mix`
 /// says: a value that differs shows empty (no colour, an empty width box,
 /// no button highlighted, a check box neither on nor off). Every control
@@ -3909,6 +4083,8 @@ fn outline_editor_mixed(
     mix: &StrokeMix,
     touched: &mut Vec<StrokeField>,
 ) -> bool {
+    use tracedraw_core::{LineCap, LineJoin};
+
     let custom = lib.arrows.as_slice();
     let mut changed = false;
     let mut has = stroke.is_some();
@@ -3962,19 +4138,24 @@ fn outline_editor_mixed(
     if let Some(s) = stroke {
         let width_mixed = mix.has(StrokeField::Width);
         let mut hair = s.width <= Stroke::HAIRLINE + 1e-9;
-        if ui
-            .add(egui::Checkbox::new(&mut hair, tr("docker.hairline")).indeterminate(width_mixed))
-            .rich_tip(crate::ui::tips::keyed("docker.hairline"))
-            .changed()
-        {
-            s.width = if hair { Stroke::HAIRLINE } else { 0.5 };
-            touched.push(StrokeField::Width);
-            changed = true;
-        }
+        editor_row(ui, &tr("docker.stroke_width"), |ui| {
+            if ui
+                .add(
+                    egui::Checkbox::new(&mut hair, tr("docker.hairline"))
+                        .indeterminate(width_mixed),
+                )
+                .rich_tip(crate::ui::tips::keyed("docker.hairline"))
+                .changed()
+            {
+                s.width = if hair { Stroke::HAIRLINE } else { 0.5 };
+                touched.push(StrokeField::Width);
+                changed = true;
+            }
+        });
         if !hair || width_mixed {
             // The slider applies when let go; the box takes any width
             // typed (Enter or leaving it applies).
-            ui.horizontal_wrapped(|ui| {
+            editor_row(ui, "", |ui| {
                 let width_tip =
                     crate::ui::tips::pair("toolbar.outline_width", "docker.outline_width_desc");
                 let r = ui
@@ -4017,44 +4198,36 @@ fn outline_editor_mixed(
             });
         }
         group_heading(ui, "docker.group_caps_corners");
-        ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.caps"));
+        editor_row(ui, &tr("docker.caps"), |ui| {
             let mixed = mix.has(StrokeField::Cap);
-            for (c, n) in [
-                (tracedraw_core::LineCap::Butt, "docker.cap_butt"),
-                (tracedraw_core::LineCap::Round, "docker.cap_round"),
-                (tracedraw_core::LineCap::Square, "docker.cap_square"),
-            ] {
-                if ui
-                    .selectable_label(!mixed && s.cap == c, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+            let choices = [
+                (LineCap::Butt, Pic::CapButt, "docker.cap_butt"),
+                (LineCap::Round, Pic::CapRound, "docker.cap_round"),
+                (LineCap::Square, Pic::CapSquare, "docker.cap_square"),
+            ];
+            let size = editor_choice_size(ui, choices.len(), 28.0);
+            for (c, pic, n) in choices {
+                if outline_icon_choice(ui, size, n, !mixed && s.cap == c, |p, r, ink| {
+                    crate::ui::outline_pen::draw_pic(p, r, pic, ink);
+                }) {
                     s.cap = c;
                     touched.push(StrokeField::Cap);
                     changed = true;
                 }
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.corners"));
+        editor_row(ui, &tr("docker.corners"), |ui| {
             let mixed = mix.has(StrokeField::Join);
-            for (j, n) in [
-                (tracedraw_core::LineJoin::Miter, "docker.join_miter"),
-                (tracedraw_core::LineJoin::Round, "docker.join_round"),
-                (tracedraw_core::LineJoin::Bevel, "docker.join_bevel"),
-            ] {
-                if ui
-                    .selectable_label(!mixed && s.join == j, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+            let choices = [
+                (LineJoin::Miter, Pic::JoinMiter, "docker.join_miter"),
+                (LineJoin::Round, Pic::JoinRound, "docker.join_round"),
+                (LineJoin::Bevel, Pic::JoinBevel, "docker.join_bevel"),
+            ];
+            let size = editor_choice_size(ui, choices.len(), 28.0);
+            for (j, pic, n) in choices {
+                if outline_icon_choice(ui, size, n, !mixed && s.join == j, |p, r, ink| {
+                    crate::ui::outline_pen::draw_pic(p, r, pic, ink);
+                }) {
                     s.join = j;
                     touched.push(StrokeField::Join);
                     changed = true;
@@ -4062,11 +4235,11 @@ fn outline_editor_mixed(
             }
         });
         group_heading(ui, "docker.group_arrowheads");
-        ui.horizontal_wrapped(|ui| {
-            for (field, id, key) in [
-                (StrokeField::StartArrow, "Start", "docker.arrow_start"),
-                (StrokeField::EndArrow, "End", "docker.arrow_end"),
-            ] {
+        for (field, id, key) in [
+            (StrokeField::StartArrow, "Start", "docker.arrow_start"),
+            (StrokeField::EndArrow, "End", "docker.arrow_end"),
+        ] {
+            editor_row(ui, &tr(key), |ui| {
                 let end = field == StrokeField::EndArrow;
                 // With Share attributes on the end follows the start.
                 let enabled = !end || !s.share_arrowheads;
@@ -4076,7 +4249,7 @@ fn outline_editor_mixed(
                     } else {
                         &mut s.start_arrow
                     };
-                    if arrow_combo(ui, id, &tr(key), a, custom, mix.has(field)) {
+                    if arrow_combo(ui, id, "", a, custom, mix.has(field)) {
                         if !end && s.share_arrowheads {
                             s.share_start_head();
                         }
@@ -4086,14 +4259,19 @@ fn outline_editor_mixed(
                     // The Arrowhead editor (#1210): size, offset, mirror,
                     // rotation of this end's head.
                     if ui
-                        .small_button("...")
+                        .add_sized(
+                            egui::vec2(24.0, ui.spacing().interact_size.y),
+                            egui::Button::new("..."),
+                        )
                         .rich_tip(crate::ui::tips::keyed("arrowhead_editor.edit"))
                         .clicked()
                     {
                         crate::ui::arrowhead_editor::request(ui, end);
                     }
                 });
-            }
+            });
+        }
+        editor_row(ui, "", |ui| {
             if ui
                 .add(
                     egui::Checkbox::new(&mut s.share_arrowheads, tr("arrowhead_editor.share"))
@@ -4110,23 +4288,23 @@ fn outline_editor_mixed(
             }
         });
         group_heading(ui, "docker.group_line_style");
-        ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.dash"));
+        editor_row(ui, &tr("docker.dash"), |ui| {
             let mixed = mix.has(StrokeField::Dash);
-            for (d, n) in [
+            let choices = [
                 (vec![], "docker.dash_solid"),
                 (vec![4.0, 2.0], "docker.dash_dashed"),
                 (vec![1.0, 1.0], "docker.dash_dotted"),
                 (vec![6.0, 2.0, 1.0, 2.0], "docker.dash_dash_dot"),
-            ] {
-                if ui
-                    .selectable_label(!mixed && s.dash == d, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+            ];
+            let size = editor_choice_size(ui, choices.len(), 44.0);
+            for (d, n) in choices {
+                if outline_icon_choice(ui, size, n, !mixed && s.dash == d, |p, r, ink| {
+                    let line = egui::Rect::from_center_size(
+                        r.center(),
+                        egui::vec2((size.x - 12.0).min(40.0), r.height()),
+                    );
+                    crate::ui::outline_pen::dash_line(p, line, &d, ink);
+                }) {
                     s.dash = d;
                     touched.push(StrokeField::Dash);
                     changed = true;
@@ -4135,8 +4313,7 @@ fn outline_editor_mixed(
         });
         if !lib.dashes.is_empty() {
             // Custom dash patterns from Edit Line Style.
-            ui.horizontal_wrapped(|ui| {
-                ui.label(tr("docker.dash_custom"));
+            editor_row(ui, &tr("docker.dash_custom"), |ui| {
                 for d in &lib.dashes {
                     let r = ui
                         .push_id(
@@ -4163,7 +4340,7 @@ fn outline_editor_mixed(
                 }
             });
         }
-        ui.horizontal(|ui| {
+        editor_row(ui, "", |ui| {
             if ui
                 .add_enabled(
                     !s.dash.is_empty(),
@@ -4184,55 +4361,56 @@ fn outline_editor_mixed(
             }
         });
         group_heading(ui, "docker.group_position");
-        ui.horizontal_wrapped(|ui| {
-            ui.label(tr("docker.outline_position"));
-            for (pos, n) in [
+        editor_row(ui, &tr("docker.outline_position"), |ui| {
+            let choices = [
                 (
                     tracedraw_core::OutlinePosition::Outside,
+                    Pic::Outside,
                     "docker.position_outside",
                 ),
                 (
                     tracedraw_core::OutlinePosition::Center,
+                    Pic::Center,
                     "docker.position_center",
                 ),
                 (
                     tracedraw_core::OutlinePosition::Inside,
+                    Pic::Inside,
                     "docker.position_inside",
                 ),
-            ] {
+            ];
+            let size = editor_choice_size(ui, choices.len(), 28.0);
+            for (pos, pic, n) in choices {
                 let shown = !mix.has(StrokeField::Position) && s.position == pos;
-                if ui
-                    .selectable_label(shown, tr(n))
-                    .rich_tip(crate::ui::tips::pair(
-                        &format!("{n}_tip"),
-                        &format!("{n}_desc"),
-                    ))
-                    .clicked()
-                {
+                if outline_icon_choice(ui, size, n, shown, |p, r, ink| {
+                    crate::ui::outline_pen::draw_pic(p, r, pic, ink);
+                }) {
                     s.position = pos;
                     touched.push(StrokeField::Position);
                     changed = true;
                 }
             }
         });
-        for (field, key) in [
-            (StrokeField::BehindFill, "docker.behind_fill"),
-            (StrokeField::ScaleWithObject, "docker.scale_with_object"),
-        ] {
-            let v = if field == StrokeField::BehindFill {
-                &mut s.behind_fill
-            } else {
-                &mut s.scale_with_object
-            };
-            if ui
-                .add(egui::Checkbox::new(v, tr(key)).indeterminate(mix.has(field)))
-                .rich_tip(crate::ui::tips::keyed(key))
-                .changed()
-            {
-                touched.push(field);
-                changed = true;
+        editor_row(ui, "", |ui| {
+            for (field, key) in [
+                (StrokeField::BehindFill, "docker.behind_fill"),
+                (StrokeField::ScaleWithObject, "docker.scale_with_object"),
+            ] {
+                let v = if field == StrokeField::BehindFill {
+                    &mut s.behind_fill
+                } else {
+                    &mut s.scale_with_object
+                };
+                if ui
+                    .add(egui::Checkbox::new(v, tr(key)).indeterminate(mix.has(field)))
+                    .rich_tip(crate::ui::tips::keyed(key))
+                    .changed()
+                {
+                    touched.push(field);
+                    changed = true;
+                }
             }
-        }
+        });
         // The settings few outlines need, under their own header so the
         // common ones are found at a glance (#487): open at first when
         // one of them is set away from its default or differs between
@@ -4252,8 +4430,7 @@ fn outline_editor_mixed(
             .default_open(advanced_set)
             .show(ui, |ui| {
                 if s.join == tracedraw_core::LineJoin::Miter {
-                    ui.horizontal(|ui| {
-                        ui.label(tr("docker.miter_limit"));
+                    editor_row(ui, &tr("docker.miter_limit"), |ui| {
                         if ui
                             .add(
                                 crate::ui::field::NumField::new(&mut s.miter_limit)
@@ -5918,6 +6095,17 @@ pub(crate) mod tests {
         let texts = painted_texts(&ctx, &mut app);
         assert_eq!(count(&texts, "docker.add_outline"), 0, "{texts:?}");
         assert_eq!(count(&texts, "docker.add_fill"), 0, "{texts:?}");
+        // Inspect the corner section on its own so every label is in view.
+        let sections = [
+            "outline",
+            "fill",
+            "transparency",
+            "corners",
+            "effects",
+            "summary",
+        ];
+        pick_section(&mut app, "corners", &sections, false);
+        let texts = painted_texts(&ctx, &mut app);
         // Every corner named in full.
         for key in [
             "toolbar.corner_top_left",
@@ -5941,10 +6129,15 @@ pub(crate) mod tests {
             shapes: vec![id],
             fill: Fill::Solid(tracedraw_core::Color::BLACK),
         });
-        draw(&ctx, &mut app);
-        let texts = painted_texts(&ctx, &mut app);
-        assert_eq!(count(&texts, "docker.add_outline"), 1, "{texts:?}");
-        assert_eq!(count(&texts, "docker.add_fill"), 1, "{texts:?}");
+        for (section, key) in [
+            ("outline", "docker.add_outline"),
+            ("fill", "docker.add_fill"),
+        ] {
+            pick_section(&mut app, section, &sections, false);
+            draw(&ctx, &mut app);
+            let texts = painted_texts(&ctx, &mut app);
+            assert_eq!(count(&texts, key), 1, "{texts:?}");
+        }
     }
 
     /// Every outline option stays in the Properties docker, with and
@@ -5954,13 +6147,16 @@ pub(crate) mod tests {
     #[test]
     fn every_outline_option_is_in_the_properties_docker() {
         let ctx = crate::theme::ui_context();
+        ctx.enable_accesskit();
+        // Presence checks observe the settled disclosure state.
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let mut app = App::headless();
         app.show_welcome = false;
         app.settings.autocorrect.enabled = false;
         app.settings.properties_closed.clear();
         app.show_dockers = true;
         app.docker_tab = DockerTab::Properties;
-        // The texts painted, with where they are.
+        // Painted text and the accessible names of the pictogram choices.
         let frame = |app: &mut App, events: Vec<egui::Event>| -> Vec<(String, egui::Rect)> {
             fn walk(s: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
                 match s {
@@ -5984,6 +6180,39 @@ pub(crate) mod tests {
             out.textures_delta.clear();
             let mut texts = Vec::new();
             out.shapes.iter().for_each(|c| walk(&c.shape, &mut texts));
+            let icon_names = [
+                "docker.cap_butt",
+                "docker.cap_round",
+                "docker.cap_square",
+                "docker.join_miter",
+                "docker.join_round",
+                "docker.join_bevel",
+                "docker.dash_solid",
+                "docker.dash_dashed",
+                "docker.dash_dotted",
+                "docker.dash_dash_dot",
+                "docker.position_outside",
+                "docker.position_center",
+                "docker.position_inside",
+            ]
+            .map(tr);
+            if let Some(update) = out.platform_output.accesskit_update {
+                for (_, node) in update.nodes {
+                    if let (Some(label), Some(b)) = (node.label(), node.bounds()) {
+                        if node.role() == egui::accesskit::Role::Button
+                            && icon_names.iter().any(|name| name == label)
+                        {
+                            texts.push((
+                                label.to_string(),
+                                egui::Rect::from_min_max(
+                                    egui::pos2(b.x0 as f32, b.y0 as f32),
+                                    egui::pos2(b.x1 as f32, b.y1 as f32),
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
             texts
         };
         let common = [
@@ -6154,6 +6383,170 @@ pub(crate) mod tests {
                 .any(|t| t.trim_end_matches(':') == tr("docker.nib_angle_lc")),
             "{texts:?}"
         );
+    }
+
+    /// Pictogram choices keep their names and selected state, and a click
+    /// changes only that outline field, including a mixed value equal to
+    /// the first object's value.
+    #[test]
+    fn properties_outline_icons_set_only_the_chosen_field() {
+        use tracedraw_core::{LineCap, LineJoin, OutlinePosition};
+
+        let choices: [(&str, StrokeField, fn(&mut Stroke)); 13] = [
+            ("docker.cap_butt", StrokeField::Cap, |s| {
+                s.cap = LineCap::Butt
+            }),
+            ("docker.cap_round", StrokeField::Cap, |s| {
+                s.cap = LineCap::Round
+            }),
+            ("docker.cap_square", StrokeField::Cap, |s| {
+                s.cap = LineCap::Square
+            }),
+            ("docker.join_miter", StrokeField::Join, |s| {
+                s.join = LineJoin::Miter
+            }),
+            ("docker.join_round", StrokeField::Join, |s| {
+                s.join = LineJoin::Round
+            }),
+            ("docker.join_bevel", StrokeField::Join, |s| {
+                s.join = LineJoin::Bevel
+            }),
+            ("docker.dash_solid", StrokeField::Dash, |s| s.dash.clear()),
+            ("docker.dash_dashed", StrokeField::Dash, |s| {
+                s.dash = vec![4.0, 2.0]
+            }),
+            ("docker.dash_dotted", StrokeField::Dash, |s| {
+                s.dash = vec![1.0, 1.0]
+            }),
+            ("docker.dash_dash_dot", StrokeField::Dash, |s| {
+                s.dash = vec![6.0, 2.0, 1.0, 2.0]
+            }),
+            ("docker.position_outside", StrokeField::Position, |s| {
+                s.position = OutlinePosition::Outside
+            }),
+            ("docker.position_center", StrokeField::Position, |s| {
+                s.position = OutlinePosition::Center
+            }),
+            ("docker.position_inside", StrokeField::Position, |s| {
+                s.position = OutlinePosition::Inside
+            }),
+        ];
+        for mixed in [false, true] {
+            for (key, field, set) in choices {
+                let ctx = crate::theme::ui_context();
+                ctx.enable_accesskit();
+                let mut stroke = Some(Stroke {
+                    cap: LineCap::Butt,
+                    join: LineJoin::Miter,
+                    position: OutlinePosition::Center,
+                    ..Stroke::default()
+                });
+                let mut expected = stroke.clone().expect("outline");
+                set(&mut expected);
+                let mix = StrokeMix {
+                    fields: if mixed {
+                        vec![
+                            StrokeField::Cap,
+                            StrokeField::Join,
+                            StrokeField::Dash,
+                            StrokeField::Position,
+                            StrokeField::StartArrow,
+                            StrokeField::EndArrow,
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                    ..StrokeMix::default()
+                };
+                let mut touched = Vec::new();
+                let mut frame = |events| {
+                    let mut changed = false;
+                    let mut out = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(340.0, 1400.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            changed = outline_editor_mixed(
+                                ui,
+                                &mut stroke,
+                                &crate::ui::line_style::OutlineLib::default(),
+                                &mix,
+                                &mut touched,
+                            );
+                        },
+                    );
+                    out.textures_delta.clear();
+                    let nodes = out
+                        .platform_output
+                        .accesskit_update
+                        .expect("accessible controls")
+                        .nodes;
+                    (changed, nodes)
+                };
+                frame(Vec::new());
+                let (changed, nodes) = frame(Vec::new());
+                assert!(!changed, "rendering {key} must not edit the outline");
+                for label in ["toolbar.start_arrow", "toolbar.end_arrow"] {
+                    let node = nodes
+                        .iter()
+                        .find(|(_, n)| n.label() == Some(tr(label).as_str()))
+                        .map(|(_, n)| n)
+                        .expect("named arrow control");
+                    assert_eq!(node.role(), egui::accesskit::Role::ComboBox);
+                    assert_eq!(
+                        node.value(),
+                        Some(if mixed { "" } else { Arrowhead::None.name() })
+                    );
+                }
+                for (name, _, _) in choices {
+                    let node = nodes
+                        .iter()
+                        .find(|(_, n)| n.label() == Some(tr(name).as_str()))
+                        .map(|(_, n)| n)
+                        .expect("named choice");
+                    assert_eq!(node.role(), egui::accesskit::Role::Button);
+                    let selected = !mixed
+                        && matches!(
+                            name,
+                            "docker.cap_butt"
+                                | "docker.join_miter"
+                                | "docker.dash_solid"
+                                | "docker.position_center"
+                        );
+                    assert_eq!(
+                        node.toggled(),
+                        Some(if selected {
+                            egui::accesskit::Toggled::True
+                        } else {
+                            egui::accesskit::Toggled::False
+                        }),
+                        "{name}, mixed {mixed}"
+                    );
+                }
+                let b = nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(tr(key).as_str()))
+                    .and_then(|(_, n)| n.bounds())
+                    .expect("choice bounds");
+                let at = egui::pos2((b.x0 + b.x1) as f32 * 0.5, (b.y0 + b.y1) as f32 * 0.5);
+                let press = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                frame(vec![egui::Event::PointerMoved(at)]);
+                frame(vec![press(true)]);
+                assert!(frame(vec![press(false)]).0, "{key}, mixed {mixed}");
+                assert_eq!(stroke, Some(expected), "{key}, mixed {mixed}");
+                assert_eq!(touched, vec![field], "{key}, mixed {mixed}");
+            }
+        }
     }
 
     /// The Properties docker keeps its default width with every section
