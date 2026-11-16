@@ -175,6 +175,7 @@ mod raster;
 mod recognize;
 mod recovery;
 mod resample;
+mod screen_pick;
 mod script_debug;
 mod script_filters;
 mod scripting;

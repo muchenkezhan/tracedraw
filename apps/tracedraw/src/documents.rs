@@ -246,6 +246,8 @@ impl App {
     /// Drop the in-progress interactions of the drawing being left: they
     /// refer to its objects.
     fn end_transient_editing(&mut self) {
+        self.cancel_palette_screen_pick();
+        self.pending_palette_sample = false;
         // Time counted for the drawing being left belongs to it.
         self.flush_tracked_time();
         if self.clip_frame_edit.is_some() {

@@ -183,6 +183,19 @@ pub(crate) fn rasterise(
     });
     let mut tex = Textures::default();
     tex.apply(&out.textures_delta);
+    // A reused context sends only atlas deltas. This canvas starts with no
+    // textures, so restore the complete atlas, including the prepared discs
+    // used to draw circles. Otherwise later cursor bitmaps get square bulbs.
+    let font_image = ctx.fonts(|fonts| fonts.image());
+    let [atlas_width, atlas_height] = font_image.size;
+    tex.0.insert(
+        TextureId::default(),
+        Texture {
+            w: atlas_width,
+            h: atlas_height,
+            px: font_image.pixels,
+        },
+    );
     out.textures_delta.clear();
     let shapes = std::mem::take(&mut out.shapes);
     let prims = ctx.tessellate(shapes, out.pixels_per_point);

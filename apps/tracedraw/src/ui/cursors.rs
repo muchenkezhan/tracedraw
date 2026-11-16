@@ -1616,18 +1616,32 @@ fn hand(painter: &Painter, c: Pos2, closed: bool) {
     }
 }
 
-/// A pipette: the tip at the hot spot, the glass tube rising to the upper
-/// right and the rubber bulb at its end.
+/// A pipette: its tapered tip is the hot spot, with an outlined glass tube,
+/// a small collar and a rubber bulb rising to the upper right.
 fn pipette(painter: &Painter, tip: Pos2) {
     let dir = Vec2::new(1.0, -1.0).normalized();
-    let tube_start = tip + dir * 1.5;
-    let tube_end = tip + dir * 11.0;
+    let side = Vec2::new(-dir.y, dir.x);
+    let at = |along: f32, across: f32| tip + dir * along + side * across;
+    let tube = vec![
+        tip,
+        at(4.0, -1.65),
+        at(11.0, -1.65),
+        at(11.0, 1.65),
+        at(4.0, 1.65),
+    ];
     let bulb = tip + dir * 14.5;
-    painter.line_segment([tube_start, tube_end], Stroke::new(5.0, HALO));
+    painter.add(Shape::convex_polygon(
+        tube.clone(),
+        HALO,
+        Stroke::new(3.2, HALO),
+    ));
     painter.circle_filled(bulb, 4.4, HALO);
-    painter.line_segment([tube_start, tube_end], Stroke::new(2.6, INK));
+    painter.add(Shape::convex_polygon(tube, HALO, Stroke::new(1.25, INK)));
+    let collar = [at(11.0, -2.8), at(11.0, 2.8)];
+    painter.line_segment(collar, Stroke::new(3.8, HALO));
+    painter.line_segment(collar, Stroke::new(1.6, INK));
     painter.circle_filled(bulb, 3.0, INK);
-    painter.circle_filled(tip, 1.4, INK);
+    painter.line_segment([at(14.0, -1.2), at(15.5, -1.2)], Stroke::new(0.9, HALO));
 }
 
 /// A tipped paint bucket pouring onto the hot spot.
@@ -2067,6 +2081,22 @@ mod tests {
                     img.save(path).expect("saved");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_pipette_keeps_its_shape_and_tip_when_display_scales_change() {
+        let reused = egui::Context::default();
+        let mut seen: Vec<(f32, egui::CustomCursorImage)> = Vec::new();
+        for scale in [1.5, 1.0, 1.5, 1.25, 2.0, 1.0] {
+            let switched = draw_bitmap(&reused, ToolCursor::Pipette, scale)
+                .expect("pipette after a monitor change");
+            if let Some((_, previous)) = seen.iter().find(|(known, _)| *known == scale) {
+                assert_eq!(switched.size, previous.size, "scale {scale}");
+                assert_eq!(switched.hotspot, previous.hotspot, "scale {scale}");
+                assert_eq!(switched.rgba, previous.rgba, "scale {scale}");
+            }
+            seen.push((scale, switched));
         }
     }
 

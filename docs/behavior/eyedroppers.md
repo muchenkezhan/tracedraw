@@ -20,10 +20,13 @@ pointer: a group's child, or a clip frame's content inside the frame (the
 frame itself where no content is under the pointer), their transforms
 composed (`App::leaf_to_read`, #403).
 
-Both eyedroppers, and the document palette's, read from any visible
-object under the pointer, a locked one or one on a locked layer too
-(reading leaves it as it is; `App::hit_test_to_read`, #365). Applying a
-sampled colour or attributes never changes a locked object.
+Both eyedroppers read from any visible object under the pointer, a locked
+one or one on a locked layer too (reading leaves it as it is;
+`App::hit_test_to_read`, #365). On platforms that use drawing sampling,
+the document palette's eyedropper follows the same rule; native Windows
+also has its separate full-screen mode, described in
+`behavior/color-palettes.md`. Applying a sampled colour or attributes
+never changes a locked object.
 
 A press let go is a click for both tools also when the pointer moved a
 little while the button was down (a pen, a shaky hand) or the button

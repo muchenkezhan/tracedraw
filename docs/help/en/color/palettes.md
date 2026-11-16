@@ -91,8 +91,7 @@ Along each side it can lie at the window's edge or beside the drawing, between t
 ## The document palette {#document-palette}
 
 Every color you apply to an object joins the document palette, which is saved
-with the drawing. Its eyedropper adds the color under the pointer, and its
-menu has **Automatically update** (to stop adding colors by themselves),
+with the drawing. Its menu has **Automatically update** (to stop adding colors by themselves),
 **Add from selection**, **Add from document**, **Delete color** and **Reset
 palette** (keeps only the colors the drawing still uses; it asks first, and
 Undo brings the others back). To take out one color, right-click it and
@@ -102,6 +101,19 @@ taken with the eyedropper that the palette already has gets the frame, so you
 see where it is, and applying a color of the palette moves the frame to it.
 To show or hide it, see
 [Customization options](../customize/customization.md#color-palette).
+
+In the Windows desktop app, click the document palette's eyedropper to take
+a color from anywhere on your screen, including another program. The screen
+freezes while you choose, across all your monitors. Click the pixel you want
+to add its color to the document palette. Each use picks one color, even
+with <kbd>Ctrl</kbd> held. Press <kbd>Esc</kbd> or right-click to cancel.
+Switching or closing the drawing cancels too. A new color can be undone in
+one step; a color already in the palette is selected without a duplicate.
+The screen image stays in memory and is never saved or uploaded.
+
+On other platforms, including the browser and Android, the eyedropper picks
+from the drawing. Hold <kbd>Ctrl</kbd> to keep adding colors; <kbd>Esc</kbd>
+or a right-click stops it.
 
 ## The Palettes panel {#palettes-docker}
 

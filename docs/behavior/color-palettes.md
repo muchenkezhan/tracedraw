@@ -314,9 +314,23 @@ it) are not moved: the same window opens as **Create Color Styles**.
   too.
 - With characters selected in a text being edited, a swatch colours
   only them (see `text.md`, Character colours).
-- The eyedropper waits for a click on the drawing and adds the colour
-  under the pointer; with Ctrl it keeps sampling. Esc or a right click
-  stops it.
+- In native Windows builds, the document palette's eyedropper reads a
+  screen pixel from anywhere on the desktop, including other applications.
+  It takes a frozen snapshot of the full virtual desktop when activated,
+  covering every monitor, including monitors at negative coordinates. The
+  pipette keeps its shape and tip across monitors with different scale
+  factors: its bitmap uses the destination monitor's pixels, without a
+  second automatic resize by Windows. A
+  click adds that pixel's RGB colour to the document palette and ends the
+  pick. Each activation takes one colour; Ctrl does not keep it sampling.
+  Esc or a right click cancels without changing the document. Switching
+  or closing the drawing cancels the pending pick, so its result cannot
+  go to another drawing. A new colour is one undo step; an existing colour
+  selects its swatch without adding a duplicate or another undo step. The
+  snapshot stays in memory only and is neither saved nor uploaded.
+- On other platforms, including the browser and Android, the same button
+  waits for a click on the drawing and adds the colour under the pointer;
+  Ctrl keeps it sampling. Esc or a right click stops it.
 - Its menu: Automatically Update, Add from Selection, Add from Document
   (every colour used in the drawing, after the ones already there), Add
   Colors from Bitmap (see below),
@@ -485,6 +499,12 @@ update the document palette (on).
 
 ## Checks
 
+- `screen_pick::windows::tests::native_cursor_creation_disables_extra_scaling_and_restores_the_thread_policy`
+- `ui::cursors::tests::the_pipette_keeps_its_shape_and_tip_when_display_scales_change`
+- `screen_pick::tests` (native Windows screen-pick integration: one undoable
+  swatch, duplicates, waiting, cancellation, errors, disconnected workers,
+  drawing identity after switching, closing or reordering tabs, worker
+  cancellation on drop; results injected without a real screen capture)
 - `ui::palette::tests::tooltips_name_the_colour_and_its_values`
 - `ui::palette::tests::the_default_palette_has_greys_process_colours_and_tints`
 - `ui::palette::tests::shades_keep_the_colour_in_the_middle`

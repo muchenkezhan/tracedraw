@@ -2034,6 +2034,8 @@ pub struct App {
     pub pending_text_path: bool,
     /// The document palette's eyedropper waits for a click on the drawing.
     pub pending_palette_sample: bool,
+    /// The document palette's asynchronous desktop screen picker.
+    pub screen_pick: crate::screen_pick::State,
     pub envelope_keep_lines: bool,
     pub media_mode: crate::media::MediaMode,
     pub media_preset: usize,
@@ -3389,6 +3391,7 @@ impl App {
             pending_blend_path: false,
             pending_text_path: false,
             pending_palette_sample: false,
+            screen_pick: Default::default(),
             envelope_keep_lines: false,
             media_mode: crate::media::MediaMode::Calligraphic,
             media_preset: 0,

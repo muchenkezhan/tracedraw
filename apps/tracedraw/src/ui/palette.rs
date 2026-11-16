@@ -749,7 +749,7 @@ fn row(app: &mut App, ui: &mut Ui, which: Row, vertical: bool) {
             Sense::hover()
         },
     );
-    let active = is_doc && app.pending_palette_sample;
+    let active = is_doc && (app.pending_palette_sample || app.screen_pick.active());
     if active || (can_sample && drop_resp.hovered()) {
         painter.rect(
             drop_rect.expand(1.0),
@@ -774,12 +774,13 @@ fn row(app: &mut App, ui: &mut Ui, which: Row, vertical: bool) {
         },
     );
     if can_sample {
-        let drop_resp = drop_resp.rich_tip(tr("palette.eyedropper_tip"));
+        let drop_resp = drop_resp.rich_tip(tr(if cfg!(windows) {
+            "palette.screen_eyedropper_tip"
+        } else {
+            "palette.eyedropper_tip"
+        }));
         if drop_resp.clicked() {
-            app.pending_palette_sample = !app.pending_palette_sample;
-            if app.pending_palette_sample {
-                app.status = tr("status.palette_sample");
-            }
+            app.start_palette_sample(ui.ctx());
         }
     }
 

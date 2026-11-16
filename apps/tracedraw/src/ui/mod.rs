@@ -311,6 +311,13 @@ fn set_window_title(ctx: &egui::Context, title: String) {
 }
 
 pub fn root(app: &mut App, ui: &mut Ui) {
+    if app.screen_pick.active()
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        app.cancel_palette_screen_pick();
+        app.status = tr("status.cancelled");
+    }
+    app.poll_palette_screen_pick(ui.ctx());
     let steps = app.step_merge_start();
     // Tab and Shift+Tab stay in the window that has the focus (#1258).
     tab_focus::begin(ui.ctx());
