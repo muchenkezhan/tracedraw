@@ -537,6 +537,17 @@ impl Tokens {
 
     pub const RULER: f32 = 18.0;
 
+    /// The ink for an icon whose action may be unavailable. A pressed
+    /// control keeps the enabled ink so its active background remains
+    /// readable, even when the command is disabled on the welcome screen.
+    pub fn icon_for(enabled: bool, on: bool) -> Color32 {
+        if enabled || on {
+            Self::icon()
+        } else {
+            Self::icon_off()
+        }
+    }
+
     /// The side of a toolbox button at the toolbox's button size (the
     /// bars' menu > Customize): 32 px at Medium.
     pub fn tool_button() -> f32 {
@@ -1376,6 +1387,19 @@ mod theme_tests {
             let gap = (luma(line.color) - luma(t.palette().panel)).abs();
             assert!(gap > 50.0, "{t:?}: {gap}");
         }
+    }
+
+    /// Pressed controls keep readable icons while their commands are unavailable.
+    #[test]
+    fn pressed_icons_keep_enabled_ink_when_commands_are_disabled() {
+        for t in Theme::ALL {
+            set_theme(t);
+            assert_eq!(Tokens::icon_for(false, true), Tokens::icon(), "{t:?}");
+            assert_eq!(Tokens::icon_for(true, false), Tokens::icon(), "{t:?}");
+            assert_eq!(Tokens::icon_for(true, true), Tokens::icon(), "{t:?}");
+            assert_eq!(Tokens::icon_for(false, false), Tokens::icon_off(), "{t:?}");
+        }
+        set_theme(Theme::Light);
     }
 }
 

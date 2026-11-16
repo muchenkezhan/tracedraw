@@ -1262,7 +1262,7 @@ pub fn pic_button(ui: &mut Ui, pic: Pic, tip: &str, enabled: bool, pressed: bool
         ui.painter(),
         Rect::from_center_size(rect.center(), Vec2::splat(Tokens::prop_icon())),
         pic,
-        icon_color(enabled),
+        Tokens::icon_for(enabled, pressed),
     );
     resp.rich_tip(tip)
 }
@@ -1300,6 +1300,9 @@ pub fn tool_button(
     frame(ui, rect, enabled && resp.hovered(), pressed);
     let color = if enabled {
         crate::ui::icons::tool_color(tool, Tokens::icon())
+    } else if pressed {
+        // Keep an active tool readable even when its command is unavailable.
+        Tokens::icon()
     } else {
         icon_color(false)
     };
@@ -3646,6 +3649,77 @@ pub fn order_part(app: &mut App, ui: &mut Ui) {
 mod tests {
     use super::*;
     use tracedraw_core::geometry::Rect as R;
+
+    /// A disabled toggle still shows its active state without accepting clicks.
+    #[test]
+    fn pressed_disabled_bar_icons_remain_readable_and_do_not_click() {
+        type DrawButton = fn(&mut Ui) -> Response;
+        let buttons: [(&str, DrawButton); 3] = [
+            ("standard", |ui| {
+                crate::ui::toolbar::std_button(
+                    ui,
+                    crate::ui::icons::Action::ShowGrid,
+                    "Grid",
+                    false,
+                    true,
+                )
+            }),
+            ("property", |ui| {
+                pic_button(ui, Pic::BreakCurve, "Break", false, true)
+            }),
+            ("tool", |ui| {
+                tool_button(ui, crate::tools::Tool::Freehand, "Freehand", false, true)
+            }),
+        ];
+        for theme in crate::theme::Theme::ALL {
+            crate::theme::set_theme(theme);
+            for (name, draw) in &buttons {
+                let ctx = crate::theme::ui_context();
+                let run = |events: Vec<egui::Event>| {
+                    let mut response = None;
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                Vec2::new(120.0, 80.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| response = Some(draw(ui)),
+                    );
+                    output.textures_delta.clear();
+                    let icon_drawn = ctx
+                        .tessellate(output.shapes, output.pixels_per_point)
+                        .iter()
+                        .any(|primitive| match &primitive.primitive {
+                            egui::epaint::Primitive::Mesh(mesh) => mesh
+                                .vertices
+                                .iter()
+                                .any(|vertex| vertex.color == Tokens::icon()),
+                            egui::epaint::Primitive::Callback(_) => false,
+                        });
+                    (response.expect("button response"), icon_drawn)
+                };
+                let (response, icon_drawn) = run(vec![egui::Event::PointerGone]);
+                assert!(icon_drawn, "{theme:?}: {name}");
+                assert!(!response.clicked(), "{theme:?}: {name}");
+                let at = response.rect.center();
+                let (response, _) = run(vec![egui::Event::PointerMoved(at)]);
+                assert!(response.hovered(), "{theme:?}: {name}");
+                for pressed in [true, false] {
+                    let (response, _) = run(vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
+                    assert!(!response.clicked(), "{theme:?}: {name}");
+                }
+            }
+        }
+        crate::theme::set_theme(crate::theme::Theme::Light);
+    }
 
     /// A horizontal line has no height and a vertical one no width: the
     /// other side typed on the bar still sizes it (#2762).

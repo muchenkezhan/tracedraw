@@ -57,11 +57,7 @@ pub(crate) fn std_button(
         ui.painter(),
         egui::Rect::from_center_size(rect.center(), Vec2::splat(std_icon())),
         action,
-        if enabled {
-            Tokens::icon()
-        } else {
-            Tokens::icon_off()
-        },
+        Tokens::icon_for(enabled, pressed),
     );
     resp
 }
