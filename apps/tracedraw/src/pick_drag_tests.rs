@@ -19538,7 +19538,12 @@ fn the_trace_dialog_rests_once_the_trace_is_in() {
         for _ in 0..20 {
             trace_frame_asks_for_another(&ctx, &mut app);
         }
-        assert!(!trace_frame_asks_for_another(&ctx, &mut app));
+        assert!(
+            !trace_frame_asks_for_another(&ctx, &mut app),
+            "defer {defer_full}, busy {}: idle repaint causes {:?}",
+            app.trace_live.busy(),
+            ctx.repaint_causes()
+        );
         assert_eq!(app.trace_live.started, started + 1);
         assert!(app.trace_live.shown.as_ref().is_some_and(|s| s.done));
     }

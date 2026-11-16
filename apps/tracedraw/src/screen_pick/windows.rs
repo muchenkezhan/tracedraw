@@ -672,7 +672,9 @@ unsafe extern "system" fn window_proc(
         // remains live until after DestroyWindow returns.
         let create = unsafe { (lparam as *const CREATESTRUCTW).as_ref() };
         if let Some(create) = create {
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
+            // `SetWindowLongPtrW` is generated as `SetWindowLongW` on 32-bit
+            // Windows, so let the call infer the platform-sized integer type.
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as usize as _) };
             return 1;
         }
         return 0;
