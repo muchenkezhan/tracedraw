@@ -6,7 +6,7 @@ checked screenshot behind it.
 "partial" names what is missing. "baked" means the result is applied once
 instead of staying live and editable. The goal is every row at "works".
 
-Counts: works 193, partial 9 (`.cdr` content coverage; `.cdr` tables; CMX import; print preview; data merge; colour styles; Find and Replace; the Android app; PMD import), missing 1 (system windows), not applicable 4.
+Counts: works 194, partial 9 (`.cdr` content coverage; `.cdr` tables; CMX import; print preview; data merge; colour styles; Find and Replace; the Android app; PMD import), missing 1 (system windows), not applicable 4.
 
 ## 1. Selection and navigation
 
@@ -34,6 +34,7 @@ Counts: works 193, partial 9 (`.cdr` content coverage; `.cdr` tables; CMX import
 | View modes: Wireframe (every object the same black hairline whatever its outline's colour, #2041, no fills, outline widths, opacity or effects, bitmaps grey boxes crossed corner to corner, clip frame contents cut to the frame, #2146), Normal, Smooth, Pixels (document pixels shown as blocks when zoomed in, see `behavior/rulers-grid-guidelines.md`); full-screen preview (F9); preview selected only | works |
 | Page Overview | works |
 | Navigator and page tabs (a tab dragged along the row moves its page, the other tabs sliding aside while it is held, #2064, #2712); scrollbars, hidden with View > Scrollbars (#1344) | works |
+| Pages panel with clickable content thumbnails, page numbers, names and sizes; opened also from the bottom page counter, current page highlighted and followed; cached pictures shared with Page Overview (#2932) | works (see `behavior/pages.md`, Page thumbnails) |
 
 ## 2. Drawing
 

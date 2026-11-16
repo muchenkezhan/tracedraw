@@ -1,5 +1,40 @@
 # Pages
 
+## Page thumbnails
+
+The Pages panel shows a picture of each page beside its number, name and
+size (#2932). Open it from Window > Panels > Pages, or click the page
+counter in the bottom navigator. Click anywhere on a page row, except its
+move controls, to make that page current without leaving the drawing.
+The current page has one highlighted row with an accent marker. Keyboard
+focus has a separate dashed outline. The list follows the current page when it
+changes, and scrolls independently while browsing other pages. Pictures
+are focusable and can also be activated with the keyboard.
+
+The panel keeps Insert Page, Duplicate Page, Delete Page and Page Overview
+in a compact icon toolbar. The move controls stay in the same place on
+every row, including disabled controls on the first and last pages.
+Icon controls have translated tooltips and accessible names. Long names
+and dimensions truncate within the panel; the full text is in the tooltip.
+Page Overview opens from Multipage View by returning to the single-page view.
+These edits use the same document commands and
+undo steps as before. Choosing a page changes only the view.
+
+Page Overview uses the same cached pictures. Page proportions fit inside
+the picture box without stretching. Only visible pictures are requested;
+new pictures are spread across frames and the cache has a fixed memory
+limit. A changed document revision, including undo and redo, refreshes
+the pictures. Page backgrounds, visible layers and master layers are
+rendered with the page.
+
+Tests: `ui::page_thumbnails::tests::page_thumbnails_navigate_without_changing_the_drawing`,
+`ui::page_thumbnails::tests::page_thumbnails_render_only_the_visible_rows_of_a_long_drawing`,
+`ui::page_thumbnails::tests::page_thumbnails_are_reachable_from_the_page_counter`,
+`ui::page_thumbnails::tests::page_thumbnails_rows_keep_controls_inside_a_narrow_panel`,
+`ui::page_thumbnails::tests::page_thumbnails_move_buttons_do_not_select_their_row`,
+`ui::page_thumbnails::tests::page_thumbnails_overview_opens_from_multipage_view`,
+and `page_thumbs::tests`.
+
 ## Duplicate Page
 
 Page > Duplicate Page..., the page tab menu's Duplicate Page... and the

@@ -85,6 +85,7 @@ pub mod options_global;
 pub mod outline_pen;
 pub mod overflow;
 pub mod package_dialog;
+pub mod page_thumbnails;
 pub mod palette;
 pub mod palette_bars;
 pub mod palette_editor;
@@ -311,6 +312,7 @@ fn set_window_title(ctx: &egui::Context, title: String) {
 }
 
 pub fn root(app: &mut App, ui: &mut Ui) {
+    app.page_thumbs.begin_frame();
     let steps = app.step_merge_start();
     // Tab and Shift+Tab stay in the window that has the focus (#1258).
     tab_focus::begin(ui.ctx());

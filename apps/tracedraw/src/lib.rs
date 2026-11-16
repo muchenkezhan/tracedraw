@@ -153,6 +153,7 @@ mod opening;
 mod package;
 mod page_drop;
 mod page_names;
+mod page_thumbs;
 mod painterly_tool;
 mod palette;
 mod palm;

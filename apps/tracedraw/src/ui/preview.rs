@@ -121,89 +121,91 @@ pub fn fullscreen(app: &mut App, ui: &mut Ui) {
 }
 
 pub fn page_sorter(app: &mut App, ui: &mut Ui) {
-    ui.horizontal(|ui| {
+    use crate::ui::page_thumbnails::{button, Action};
+    ui.horizontal_wrapped(|ui| {
         ui.heading(tr("menu.view.page_sorter"));
         if ui.button(tr("preview.back_to_page")).clicked() {
             app.page_sorter = false;
         }
-        if ui.button(tr("menu.layout.insert_page")).clicked() {
+        if button(ui, Action::Insert, true, false).clicked() {
             app.add_page();
         }
     });
     ui.separator();
-    let pages: Vec<(tracedraw_core::PageId, String, tracedraw_core::Size)> = app
+    let pages: Vec<(tracedraw_core::PageId, String)> = app
         .doc()
         .pages
         .iter()
-        .map(|p| (p.id, p.name.clone(), p.size))
+        .map(|p| (p.id, p.name.clone()))
         .collect();
     let n = pages.len();
-    let doc = app.engine.document().clone();
     let mut goto: Option<usize> = None;
     let mut mv: Option<(tracedraw_core::PageId, usize)> = None;
     let mut del: Option<tracedraw_core::PageId> = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
+        let card_w = ui.available_width().clamp(56.0, 196.0);
+        let thumb_w = card_w - 16.0;
+        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
         ui.horizontal_wrapped(|ui| {
-            for (i, (id, name, size)) in pages.iter().enumerate() {
-                let thumb_h = 150.0f32;
-                let thumb_w = (thumb_h as f64 * size.width / size.height.max(1e-6)) as f32;
-                ui.vertical(|ui| {
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(thumb_w.max(40.0), thumb_h),
-                        egui::Sense::click(),
-                    );
-                    let active = *id == app.page;
-                    ui.painter().rect_filled(
-                        rect.expand(3.0),
-                        3.0,
-                        if active {
-                            Tokens::tool_active()
+            for (i, (id, name)) in pages.iter().enumerate() {
+                let selected = *id == app.page;
+                egui::Frame::new()
+                    .inner_margin(8.0)
+                    .corner_radius(5.0)
+                    .fill(if selected {
+                        Tokens::selected_row()
+                    } else {
+                        Tokens::field()
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if selected {
+                            Tokens::selected_row_line()
                         } else {
-                            Tokens::panel_dark()
+                            Tokens::border()
                         },
-                    );
-                    let dpi = thumb_h as f64 / (size.height / 25.4);
-                    if let Some(pm) = tracedraw_render::render_page_image(&doc, *id, dpi.max(4.0)) {
-                        let image = egui::ColorImage::from_rgba_premultiplied(
-                            [pm.width() as usize, pm.height() as usize],
-                            pm.data(),
-                        );
-                        let tex = ui.ctx().load_texture(
-                            format!("sorter_{}", id.raw()),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        ui.painter().image(
-                            tex.id(),
-                            rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    }
-                    if resp.clicked() {
-                        goto = Some(i);
-                    }
-                    if resp.double_clicked() {
-                        goto = Some(i);
-                        app.page_sorter = false;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}. {name}", i + 1));
-                        if i > 0 && ui.small_button("\u{25C0}").clicked() {
-                            mv = Some((*id, i - 1));
-                        }
-                        if i + 1 < n && ui.small_button("\u{25B6}").clicked() {
-                            mv = Some((*id, i + 1));
-                        }
-                        if n > 1 && ui.small_button("x").clicked() {
-                            del = Some(*id);
-                        }
+                    ))
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_width(thumb_w);
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 8.0);
+                            let resp = crate::ui::page_thumbnails::picture(
+                                app,
+                                ui,
+                                *id,
+                                name,
+                                egui::vec2(thumb_w, 150.0),
+                            );
+                            if resp.clicked() {
+                                goto = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                goto = Some(i);
+                                app.page_sorter = false;
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{}. {name}", i + 1)).strong(),
+                                )
+                                .truncate(),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                if button(ui, Action::Earlier, i > 0, false).clicked() {
+                                    mv = Some((*id, i.saturating_sub(1)));
+                                }
+                                if button(ui, Action::Later, i + 1 < n, false).clicked() {
+                                    mv = Some((*id, i + 1));
+                                }
+                                if button(ui, Action::Delete, n > 1, false).clicked() {
+                                    del = Some(*id);
+                                }
+                            });
+                        })
                     });
-                });
-                ui.add_space(12.0);
             }
         });
     });
+    crate::ui::page_thumbnails::finish(app, ui);
     if let Some(i) = goto {
         app.goto_page(i);
     }

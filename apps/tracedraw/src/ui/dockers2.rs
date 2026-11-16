@@ -9,7 +9,7 @@ use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
 use crate::ui::tips::RichTip;
 use egui::Ui;
-use tracedraw_core::{document::ShapeKind, live::Effect, Color, Command, Fill, ShapeId};
+use tracedraw_core::{Color, Command, Fill, ShapeId, document::ShapeKind, live::Effect};
 
 /// The colour picker every colour of the drawing uses (#442).
 fn color_button(ui: &mut Ui, c: &mut Color) -> bool {
@@ -2791,86 +2791,67 @@ fn symbols(app: &mut App, ui: &mut Ui) {
 }
 
 fn pages(app: &mut App, ui: &mut Ui) {
-    let pages: Vec<(tracedraw_core::PageId, String, tracedraw_core::Size)> = app
-        .doc()
-        .pages
-        .iter()
-        .map(|p| (p.id, p.name.clone(), p.size))
-        .collect();
-    let n = pages.len();
-    ui.horizontal(|ui| {
-        if ui
-            .button(tr("menu.layout.insert_page"))
-            .rich_tip(crate::ui::tips::keyed("menu.layout.insert_page"))
-            .clicked()
-        {
+    use crate::ui::page_thumbnails::{button, Action, ROW_HEIGHT};
+    let n = app.doc().pages.len();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if button(ui, Action::Insert, true, false).clicked() {
             app.add_page();
         }
-        if ui
-            .add_enabled(n > 1, egui::Button::new(tr("menu.layout.delete_page")))
-            .rich_tip(crate::ui::tips::keyed("menu.layout.delete_page"))
-            .rich_disabled_tip(crate::ui::tips::keyed("menu.layout.delete_page"))
-            .clicked()
-        {
-            app.ask_delete_page();
-        }
-        if ui
-            .button(tr("menu.layout.duplicate_page"))
-            .rich_tip(crate::ui::tips::keyed("menu.layout.duplicate_page"))
-            .clicked()
-        {
+        if button(ui, Action::Duplicate, true, false).clicked() {
             app.dialog = crate::ui::dialogs::Dialog::duplicate_page();
         }
-        if ui
-            .selectable_label(app.page_sorter, tr("menu.view.page_sorter"))
-            .rich_tip(crate::ui::tips::keyed("menu.view.page_sorter"))
-            .clicked()
-        {
+        if button(ui, Action::Delete, n > 1, false).clicked() {
+            app.ask_delete_page();
+        }
+        ui.add(egui::Separator::default().vertical().spacing(12.0));
+        if button(ui, Action::Overview, true, app.page_sorter).clicked() {
             app.page_sorter = !app.page_sorter;
+            if app.page_sorter {
+                app.multipage = false;
+            }
         }
     });
-    for (i, (id, name, size)) in pages.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let active = *id == app.page;
-            if ui
-                .selectable_label(active, format!("{}. {name}", i + 1))
-                .rich_tip_with(|| format!("{name}\n{}", tr("docker.page_list_desc")))
-                .clicked()
-            {
-                app.goto_page(i);
-            }
-            dim(
-                ui,
-                format!(
-                    "{} x {}",
-                    app.units.from_mm(size.width).round(),
-                    app.units.from_mm(size.height).round()
-                ),
-            );
-            if i > 0
-                && ui
-                    .small_button("\u{23F6}")
-                    .rich_tip(crate::ui::tips::keyed("docker.page_move_up"))
-                    .clicked()
-            {
-                app.run(Command::MovePage {
-                    page: *id,
-                    to: i - 1,
-                });
-            }
-            if i + 1 < n
-                && ui
-                    .small_button("\u{23F7}")
-                    .rich_tip(crate::ui::tips::keyed("docker.page_move_down"))
-                    .clicked()
-            {
-                app.run(Command::MovePage {
-                    page: *id,
-                    to: i + 1,
-                });
-            }
-        });
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(4.0);
+    let n = app.doc().pages.len();
+    let followed = egui::Id::new("page_thumbnails_followed");
+    let current = (app.engine.instance(), app.page);
+    let changed = ui
+        .ctx()
+        .data(|d| d.get_temp::<(u64, tracedraw_core::PageId)>(followed))
+        != Some(current);
+    ui.ctx().data_mut(|d| d.insert_temp(followed, current));
+    let mut scroll =
+        egui::ScrollArea::vertical().id_salt(("page_thumbnails", app.engine.instance()));
+    if changed {
+        scroll = scroll.vertical_scroll_offset(
+            app.page_index() as f32 * (ROW_HEIGHT + ui.spacing().item_spacing.y),
+        );
     }
+    let mut goto = None;
+    let mut move_page = None;
+    scroll.show_rows(ui, ROW_HEIGHT, n, |ui, rows| {
+        for i in rows {
+            let Some(row) = crate::ui::page_thumbnails::row(app, ui, i) else {
+                continue;
+            };
+            if row.response.clicked() {
+                goto = Some(i);
+            }
+            if row.move_page.is_some() {
+                move_page = row.move_page;
+            }
+        }
+    });
+    if let Some(i) = goto {
+        app.goto_page(i);
+    }
+    if let Some((page, to)) = move_page {
+        app.run(Command::MovePage { page, to });
+    }
+    crate::ui::page_thumbnails::finish(app, ui);
 }
 
 fn guidelines(app: &mut App, ui: &mut Ui) {

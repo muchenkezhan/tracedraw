@@ -703,3 +703,124 @@ fn scratch_196_window() {
     }
     crate::i18n::set_language("en");
 }
+
+/// Reproducible visual check of page pictures and narrow panel layouts.
+#[test]
+#[ignore]
+fn page_thumbnails_visual_check() {
+    use tracedraw_core::{Color, Command, Fill, Rect, ShapeKind, Size};
+    let dir = std::path::PathBuf::from(std::env::var("PAGE_THUMB_SHOTS").expect("output folder"));
+    std::fs::create_dir_all(&dir).expect("screenshot folder");
+    for theme in [crate::theme::Theme::Light, crate::theme::Theme::Dark] {
+        crate::theme::set_theme(theme);
+        let mut sh = Shooter::new();
+        sh.ctx.set_visuals(crate::theme::visuals());
+        let mut app = App::headless();
+        crate::i18n::set_language("en");
+        for (i, (name, color, size)) in [
+            ("Cover", Color::rgb8(23, 73, 86), Size::new(148.0, 210.0)),
+            (
+                "Contents",
+                Color::rgb8(223, 120, 77),
+                Size::new(210.0, 148.0),
+            ),
+            (
+                "Chapter one: Layout study with an intentionally long page name for truncation",
+                Color::rgb8(237, 226, 194),
+                Size::new(148.0, 210.0),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i > 0 {
+                app.add_page();
+            }
+            app.run(Command::RenamePage {
+                page: app.page,
+                name: name.into(),
+            });
+            app.run(Command::ResizePage {
+                page: app.page,
+                size,
+            });
+            app.run(Command::SetPageBackground {
+                page: app.page,
+                background: Some(Fill::Solid(color)),
+            });
+            let shape = app
+                .new_shape(ShapeKind::Rect {
+                    rect: Rect::new(20.0, 40.0 + i as f64 * 30.0, 128.0, 110.0 + i as f64 * 25.0),
+                    radius: 0.0,
+                    corners: None,
+                })
+                .expect("page content");
+            app.select(vec![shape]);
+            app.apply_fill(Fill::Solid(Color::rgb8(245, 243, 231)));
+        }
+        app.goto_page(1);
+        let saved = app.doc().to_json().expect("navigation drawing");
+        std::fs::write(dir.join("page-navigation.tdraw"), &saved).expect("saved drawing");
+        let reopened = tracedraw_core::Document::from_json(&saved).expect("reopened drawing");
+        app.open_document(reopened, None);
+        app.goto_page(1);
+        for lang in ["en", "zh-CN"] {
+            crate::i18n::set_language(lang);
+            if crate::theme::needs_system_font(lang) {
+                crate::theme::install_fonts(&sh.ctx);
+            }
+            for (tag, width, sorter) in [
+                ("panel", 320, false),
+                ("narrow", 240, false),
+                ("sorter", 760, true),
+            ] {
+                let mut canvas = None;
+                for _ in 0..8 {
+                    let mut out = sh.ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width as f32, 620.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            app.page_thumbs.begin_frame();
+                            ui.painter().rect_filled(
+                                ui.max_rect(),
+                                0.0,
+                                crate::theme::Tokens::panel(),
+                            );
+                            if sorter {
+                                crate::ui::preview::page_sorter(&mut app, ui);
+                            } else {
+                                crate::ui::dockers2::show(&mut app, ui, DockerTab::Pages);
+                            }
+                        },
+                    );
+                    sh.tex.apply(&out.textures_delta);
+                    let primitives = sh
+                        .ctx
+                        .tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+                    let mut c = Canvas::new(width, 620);
+                    c.paint(&sh.tex, &primitives);
+                    for id in &out.textures_delta.free {
+                        sh.tex.0.remove(id);
+                    }
+                    out.textures_delta.clear();
+                    canvas = Some(c);
+                }
+                let name = if lang == "en" {
+                    format!("page-thumbnails-{}-{tag}.png", theme.id())
+                } else {
+                    format!("page-thumbnails-{}-{lang}-{tag}.png", theme.id())
+                };
+                canvas
+                    .expect("rendered")
+                    .save(&dir.join(name), (0, 0, width, 620));
+            }
+        }
+    }
+    crate::i18n::set_language("en");
+    crate::theme::set_theme(crate::theme::Theme::Light);
+}

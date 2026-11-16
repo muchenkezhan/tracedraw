@@ -1223,6 +1223,11 @@ fn docker_page(app: &mut App, ui: &mut Ui, tab: DockerTab) {
         crate::ui::objects_docker::objects_docker(app, ui);
         return;
     }
+    // Pages virtualises its thumbnail rows in its own scroll area.
+    if tab == DockerTab::Pages {
+        crate::ui::dockers2::show(app, ui, tab);
+        return;
+    }
     egui::ScrollArea::vertical()
         .id_salt(("docker_scroll", tab.key()))
         .show(ui, |ui| match tab {

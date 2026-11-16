@@ -6,6 +6,9 @@ full, row-by-row status.
 
 ## Unreleased
 
+- The Pages panel shows clickable page thumbnails and opens from the bottom
+  page counter. Page Overview shares the cached pictures (#2932).
+
 - Saving to CorelDRAW (`.cdr`): text fitted to a path, or bent by an envelope, perspective or distortion, goes out as curves that fill with the nonzero rule (Fill winding on), as the text is drawn. They went out even-odd, so CorelDRAW showed holes where letters or their strokes overlapped (#2733).
 - Panel tabs at the window's sides show their picture and their name again, however many panels are open: a column with more tabs than fit slides, as before. Options > Customization > Appearance > Panel tabs: icons only (off by default) shows the pictures alone, the name in the tip. Since 0.46.0 a column too short for the names showed the pictures alone (#2902).
 - Document tabs can be dragged along the strip to change their order, as page tabs can: the other tabs slide aside to show where the dragged one will land, and the same drawing stays active (#2903).

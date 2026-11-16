@@ -340,14 +340,29 @@ pub fn page_navigator(app: &mut App, ui: &mut Ui) {
         if nav_button(ui, Glyph::Previous, &tr("status.previous_page")) && idx > 0 {
             app.goto_page(idx - 1);
         }
-        ui.label(
-            egui::RichText::new(trf(
-                "status.page_n_of_m",
-                &[("n", &(idx + 1).to_string()), ("m", &n.to_string())],
-            ))
-            .size(11.0)
-            .color(Tokens::text_dim()),
-        );
+        let pages = ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(trf(
+                        "status.page_n_of_m",
+                        &[("n", &(idx + 1).to_string()), ("m", &n.to_string())],
+                    ))
+                    .size(11.0)
+                    .color(Tokens::text_dim()),
+                )
+                .frame(false)
+                .min_size(Vec2::ZERO),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "docker.pages",
+                "docker.page_list_desc",
+            ));
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("page_thumbnails_button"), pages.rect));
+        if pages.clicked() {
+            app.open_docker(crate::app::DockerTab::Pages);
+        }
         if nav_button(ui, Glyph::Next, &tr("status.next_page")) {
             app.goto_page(idx + 1);
         }
