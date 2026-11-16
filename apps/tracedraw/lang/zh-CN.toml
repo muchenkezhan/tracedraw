@@ -9111,3 +9111,16 @@ docker.bevel_center = "居中" # mt
 docker.bevel_center_desc = "斜角带一半在轮廓内、一半在轮廓外。" # mt
 docker.bevel_smooth_light = "柔和光线" # mt
 docker.bevel_smooth_light_desc = "光线按方向落在边缘四周，每部分的亮度取决于它朝向光的程度，而不是分成两半。" # mt
+
+# Page-range layers
+docker.range_pages = "范围页" # mt
+docker.range_pages_desc = "在指定页面范围内共享的图层。右键新建图层。" # mt
+docker.new_range_layer = "新建范围图层..." # mt
+docker.range_layer_n = "范围图层 {n}" # mt
+docker.page_range = "页面范围" # mt
+docker.page_range_desc = "按文档顺序从 1 开始编号，例如 1-8, 12, 15-20。可以包含尚未创建的页面。" # mt
+docker.page_range_invalid = "请输入有效的页码或范围，例如 1-8, 12, 15-20。" # mt
+docker.page_range_matches = "当前匹配 {n} / {total} 页" # mt
+docker.range_no_current_page = "请选择此图层范围内的页面，添加页面或修改范围。" # mt
+docker.range_name_required = "请输入图层名称。" # mt
+docker.page_range_example = "1-8, 12, 15-20" # mt

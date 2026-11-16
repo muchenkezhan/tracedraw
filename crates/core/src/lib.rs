@@ -32,6 +32,7 @@ pub mod join;
 pub mod linked_text;
 pub mod live;
 pub mod nodes;
+pub mod page_range;
 pub mod painterly;
 pub mod paragraphs;
 pub mod patch;
@@ -65,6 +66,7 @@ pub use engine::Engine;
 pub use geometry::{Affine, BezPath, Point, Rect, Size, Vec2};
 pub use icc::{Intent as RenderingIntent, Profile as IccProfile, Transform as IccTransform};
 pub use id::{LayerId, PageId, ShapeId};
+pub use page_range::PageRanges;
 pub use paragraphs::ParagraphFormat;
 pub use style::{
     arrowhead_paths, Arrowhead, ArrowheadPlacement, ColorBlend, Fill, Fountain, FountainKind,
@@ -90,6 +92,8 @@ pub enum Error {
     LastPage,
     #[error("cannot delete the last layer of a page")]
     LastLayer,
+    #[error("page range must include at least one positive page number")]
+    InvalidPageRange,
     #[error("nothing to undo")]
     NothingToUndo,
     #[error("nothing to redo")]

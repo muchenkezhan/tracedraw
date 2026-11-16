@@ -9111,3 +9111,16 @@ docker.bevel_center = "Centro" # mt
 docker.bevel_center_desc = "La banda del bisel mitad dentro y mitad fuera del contorno." # mt
 docker.bevel_smooth_light = "Luz suave" # mt
 docker.bevel_smooth_light_desc = "La luz cae alrededor del borde según la dirección, cada parte tan iluminada como mira a la luz, en lugar de dos mitades." # mt
+
+# Page-range layers
+docker.range_pages = "Páginas de intervalo" # mt
+docker.range_pages_desc = "Capas compartidas en los intervalos elegidos. Clic derecho para añadir una capa." # mt
+docker.new_range_layer = "Nueva capa de intervalo..." # mt
+docker.range_layer_n = "Capa de intervalo {n}" # mt
+docker.page_range = "Intervalo de páginas" # mt
+docker.page_range_desc = "Use posiciones desde 1. Ejemplos 1-8, 12, 15-20. Se permiten páginas futuras." # mt
+docker.page_range_invalid = "Introduzca números o intervalos, como 1-8, 12, 15-20." # mt
+docker.page_range_matches = "{n} de {total} páginas actuales" # mt
+docker.range_no_current_page = "Seleccione una página de este intervalo, añada páginas o edite el intervalo." # mt
+docker.range_name_required = "Introduzca un nombre de capa." # mt
+docker.page_range_example = "1-8, 12, 15-20" # mt

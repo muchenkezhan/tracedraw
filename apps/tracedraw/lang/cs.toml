@@ -9111,3 +9111,16 @@ docker.bevel_center = "Střed" # mt
 docker.bevel_center_desc = "Pás zkosení napůl uvnitř a napůl vně obrysu." # mt
 docker.bevel_smooth_light = "Měkké světlo" # mt
 docker.bevel_smooth_light_desc = "Světlo dopadá kolem okraje podle směru, každá část tak světlá, jak je natočena ke světlu, místo dvou polovin." # mt
+
+# Page-range layers
+docker.range_pages = "Stránky rozsahu" # mt
+docker.range_pages_desc = "Sdílené vrstvy vybraných rozsahů stránek. Vrstvu přidáte pravým tlačítkem." # mt
+docker.new_range_layer = "Nová vrstva rozsahu..." # mt
+docker.range_layer_n = "Vrstva rozsahu {n}" # mt
+docker.page_range = "Rozsah stránek" # mt
+docker.page_range_desc = "Použijte pořadí od 1. Příklady 1-8, 12, 15-20. Lze zadat budoucí stránky." # mt
+docker.page_range_invalid = "Zadejte čísla nebo rozsahy, například 1-8, 12, 15-20." # mt
+docker.page_range_matches = "{n} z {total} současných stránek" # mt
+docker.range_no_current_page = "Vyberte stránku v rozsahu vrstvy, přidejte stránky nebo upravte rozsah." # mt
+docker.range_name_required = "Zadejte název vrstvy." # mt
+docker.page_range_example = "1-8, 12, 15-20" # mt

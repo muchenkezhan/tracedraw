@@ -9111,3 +9111,16 @@ docker.bevel_center = "По центру" # mt
 docker.bevel_center_desc = "Полоса фаски наполовину внутри, наполовину снаружи контура." # mt
 docker.bevel_smooth_light = "Мягкий свет" # mt
 docker.bevel_smooth_light_desc = "Свет ложится вокруг края по направлению, каждая часть освещена настолько, насколько обращена к свету, а не две половины." # mt
+
+# Page-range layers
+docker.range_pages = "Страницы диапазона" # mt
+docker.range_pages_desc = "Общие слои выбранных диапазонов страниц. Добавление слоя правой кнопкой мыши." # mt
+docker.new_range_layer = "Новый слой диапазона..." # mt
+docker.range_layer_n = "Слой диапазона {n}" # mt
+docker.page_range = "Диапазон страниц" # mt
+docker.page_range_desc = "Позиции страниц начинаются с 1. Примеры 1-8, 12, 15-20. Допустимы будущие страницы." # mt
+docker.page_range_invalid = "Введите номера или диапазоны, например 1-8, 12, 15-20." # mt
+docker.page_range_matches = "{n} из {total} существующих страниц" # mt
+docker.range_no_current_page = "Выберите страницу диапазона, добавьте страницы или измените диапазон." # mt
+docker.range_name_required = "Введите имя слоя." # mt
+docker.page_range_example = "1-8, 12, 15-20" # mt
