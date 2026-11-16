@@ -5,6 +5,7 @@
 
 #![allow(clippy::field_reassign_with_default)]
 pub mod accel;
+pub mod bitmap_effects;
 mod image_cache;
 
 use tiny_skia::{
@@ -1992,17 +1993,34 @@ impl Renderer<'_> {
         } else {
             0.0
         };
-        let radius = (blur * self.zoom).round().min(64.0) as i32;
-        // Room round the object for the blur to draw on what lies outside.
+        // Blurs wider than the box blur's reach are drawn on a layer of
+        // a fraction of the picture's pixels and blown up: the shadow
+        // keeps its width in mm at every zoom. Its radius stopped at 64
+        // pixels, so zoomed in close the shadow came out narrower at each
+        // zoom step than the picture scaled meanwhile showed it, and the
+        // drawing seemed to shake while zooming (#2895).
+        let full = (blur * self.zoom).round().max(0.0);
+        let k = if full.is_finite() {
+            (full / f64::from(BLUR_REACH)).ceil().max(1.0)
+        } else {
+            1.0
+        };
+        let radius = if full.is_finite() {
+            (full / k).round() as i32
+        } else {
+            0
+        };
+        // Room round the object for the blur to draw on what lies outside
+        // (layer pixels).
         let pad = radius.max(0) as u32 * 3 + 2;
-        let (lw, lh) = (x1 - x0 + 2 * pad, y1 - y0 + 2 * pad);
+        let lw = (f64::from(x1 - x0) / k).ceil() as u32 + 2 * pad + 1;
+        let lh = (f64::from(y1 - y0) / k).ceil() as u32 + 2 * pad + 1;
         let Some(mut layer) = Pixmap::new(lw, lh) else {
             return;
         };
-        let to_layer = Affine::translate((
-            f64::from(pad) - f64::from(x0),
-            f64::from(pad) - f64::from(y0),
-        ));
+        let to_layer = Affine::translate((f64::from(pad), f64::from(pad)))
+            * Affine::scale(1.0 / k)
+            * Affine::translate((-f64::from(x0), -f64::from(y0)));
         let rule = shape_fill_rule(shape, self.flags.text_outline);
         // Everything outside the object, moved by the offset, casts.
         layer.fill(tiny_skia::Color::WHITE);
@@ -2018,31 +2036,31 @@ impl Renderer<'_> {
         if radius > 0 {
             accel::box_blur(&mut layer, radius, 3);
         }
-        // Kept where the object covers.
-        let Some(mut mask) = tiny_skia::Mask::new(lw, lh) else {
+        // Kept where the object covers, at the picture's own pixels.
+        let (ow, oh) = (x1 - x0, y1 - y0);
+        let Some(mut mask) = tiny_skia::Mask::new(ow, oh) else {
             return;
         };
-        if let Some(sk) = to_sk_path(&(to_layer * (self.screen * page_path))) {
+        let to_out = Affine::translate((-f64::from(x0), -f64::from(y0)));
+        if let Some(sk) = to_sk_path(&(to_out * (self.screen * page_path))) {
             mask.fill_path(&sk, rule, self.flags.anti_alias, Transform::identity());
         }
+        let Some(mut out) = Pixmap::new(ow, oh) else {
+            return;
+        };
         let [cr, cg, cb] = ish.color.to_rgb8();
-        for (px, m) in layer.pixels_mut().iter_mut().zip(mask.data()) {
-            let a = px.alpha() as f64 / 255.0 * f64::from(*m) / 255.0 * opacity;
+        let alpha = layer_alpha_sampler(&layer, k, pad);
+        let data = mask.data();
+        for (n, px) in out.pixels_mut().iter_mut().enumerate() {
+            let m = data[n];
+            if m == 0 {
+                continue;
+            }
+            let (x, y) = ((n as u32) % ow, (n as u32) / ow);
+            let a = alpha(x, y) / 255.0 * f64::from(m) / 255.0 * opacity;
             *px =
                 tiny_skia::ColorU8::from_rgba(cr, cg, cb, (a * 255.0).round() as u8).premultiply();
         }
-        // Back to the picture's size and place.
-        let Some(mut out) = Pixmap::new(x1 - x0, y1 - y0) else {
-            return;
-        };
-        out.draw_pixmap(
-            -(pad as i32),
-            -(pad as i32),
-            layer.as_ref(),
-            &tiny_skia::PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
         composite_layer(self.pixmap, &out, (x0 as i32, y0 as i32), ish.merge);
     }
 
@@ -3796,6 +3814,114 @@ fn silhouette(
     }
 }
 
+/// Widest radius, in pixels, a shadow's box blur takes at the picture's
+/// own pixels; wider blurs run on a layer that many times smaller.
+const BLUR_REACH: i32 = 64;
+
+/// The alpha (0 to 255) of `layer`, drawn `k` times smaller than the
+/// picture with `pad` layer pixels of margin, at the picture pixel `x`,
+/// `y` (counted from the layer's origin less its margin): exact at
+/// `k` = 1, read between the four nearest layer pixels otherwise.
+fn layer_alpha_sampler(layer: &Pixmap, k: f64, pad: u32) -> impl Fn(u32, u32) -> f64 + '_ {
+    let (w, h) = (layer.width() as i64, layer.height() as i64);
+    let px = layer.pixels();
+    let at = move |x: i64, y: i64| -> f64 {
+        let (x, y) = (x.clamp(0, w - 1), y.clamp(0, h - 1));
+        f64::from(px[(y * w + x) as usize].alpha())
+    };
+    move |x: u32, y: u32| {
+        if k <= 1.0 {
+            return at(i64::from(x + pad), i64::from(y + pad));
+        }
+        let fx = (f64::from(x) + 0.5) / k - 0.5 + f64::from(pad);
+        let fy = (f64::from(y) + 0.5) / k - 0.5 + f64::from(pad);
+        let (ix, iy) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - ix, fy - iy);
+        let (ix, iy) = (ix as i64, iy as i64);
+        let top = at(ix, iy) * (1.0 - tx) + at(ix + 1, iy) * tx;
+        let bottom = at(ix, iy + 1) * (1.0 - tx) + at(ix + 1, iy + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+}
+
+/// A box blur of `radius` pixels and `passes` passes on `pm`, however
+/// wide: past [`BLUR_REACH`] it runs on a copy that many times smaller,
+/// then blown back up, so a shadow keeps its width at every zoom (#2895).
+fn wide_box_blur(pm: &mut Pixmap, radius: i32, passes: usize) {
+    if radius <= BLUR_REACH {
+        accel::box_blur(pm, radius, passes);
+        return;
+    }
+    let k = (radius + BLUR_REACH - 1) / BLUR_REACH;
+    let (w, h) = (pm.width(), pm.height());
+    let ku = k as u32;
+    let (sw, sh) = (w.div_ceil(ku), h.div_ceil(ku));
+    let Some(mut small) = Pixmap::new(sw, sh) else {
+        accel::box_blur(pm, BLUR_REACH, passes);
+        return;
+    };
+    {
+        let src = pm.data();
+        let dst = small.data_mut();
+        for sy in 0..sh {
+            for sx in 0..sw {
+                let mut acc = [0u32; 4];
+                let mut n = 0u32;
+                for y in sy * ku..((sy + 1) * ku).min(h) {
+                    for x in sx * ku..((sx + 1) * ku).min(w) {
+                        let i = ((y * w + x) * 4) as usize;
+                        for c in 0..4 {
+                            acc[c] += u32::from(src[i + c]);
+                        }
+                        n += 1;
+                    }
+                }
+                let o = ((sy * sw + sx) * 4) as usize;
+                for c in 0..4 {
+                    dst[o + c] = ((acc[c] + n / 2) / n.max(1)) as u8;
+                }
+            }
+        }
+    }
+    let r = (f64::from(radius) / f64::from(k)).round() as i32;
+    accel::box_blur(&mut small, r, passes);
+    let kf = f64::from(k);
+    let (sw, sh) = (i64::from(sw), i64::from(sh));
+    let sd = small.data();
+    let dst = pm.data_mut();
+    for y in 0..h {
+        let fy = (f64::from(y) + 0.5) / kf - 0.5;
+        let iy = fy.floor();
+        let ty = fy - iy;
+        let (y0, y1) = (
+            (iy as i64).clamp(0, sh - 1),
+            (iy as i64 + 1).clamp(0, sh - 1),
+        );
+        for x in 0..w {
+            let fx = (f64::from(x) + 0.5) / kf - 0.5;
+            let ix = fx.floor();
+            let tx = fx - ix;
+            let (x0, x1) = (
+                (ix as i64).clamp(0, sw - 1),
+                (ix as i64 + 1).clamp(0, sw - 1),
+            );
+            let p = |xx: i64, yy: i64, c: usize| f64::from(sd[((yy * sw + xx) * 4) as usize + c]);
+            let o = ((y * w + x) * 4) as usize;
+            let mut v: [u8; 4] = std::array::from_fn(|c| {
+                let top = p(x0, y0, c) * (1.0 - tx) + p(x1, y0, c) * tx;
+                let bottom = p(x0, y1, c) * (1.0 - tx) + p(x1, y1, c) * tx;
+                (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8
+            });
+            // Premultiplied: no channel above the alpha.
+            let a = v[3];
+            for c in &mut v[..3] {
+                *c = (*c).min(a);
+            }
+            dst[o..o + 4].copy_from_slice(&v);
+        }
+    }
+}
+
 /// Turn a layer holding a shadow's silhouette in white into the shadow:
 /// feathered, faded along a perspective shadow, in its colour and
 /// opacity. `b` is the box the shadow is measured on.
@@ -3816,7 +3942,7 @@ fn shade_shadow(
             FeatherDirection::Average => {
                 accel::box_blur(layer, ((radius as f64) * 1.7).round().min(110.0) as i32, 1)
             }
-            _ => accel::box_blur(layer, radius.min(64), 3),
+            _ => wide_box_blur(layer, radius, 3),
         }
     }
     // The fade of a perspective shadow, in pixels.
@@ -3935,6 +4061,87 @@ pub fn render_shadow_image(shape: &Shape, dpi: f64) -> Option<(Rect, Pixmap)> {
     }
     let exact = Rect::new(area.x0, area.y1 - h / zoom, area.x0 + w / zoom, area.y1);
     Some((exact, pm))
+}
+
+/// The inner shadow of `shape` (its first `Effect::InnerShadow`, `shape`
+/// in page space) as a picture at `dpi`, for Break Shadow Apart (#2893):
+/// the shadow's density in the alpha of each pixel, its colour in all of
+/// them, over the box of the object; with the box it covers on the page.
+/// The merge mode is left to the caller. `None` when the object has no
+/// inner shadow or casts nothing.
+pub fn render_inner_shadow_image(shape: &Shape, dpi: f64) -> Option<(Rect, Pixmap)> {
+    let (offset, color, opacity, blur) = shape.effects.iter().find_map(|e| match e {
+        tracedraw_core::live::Effect::InnerShadow {
+            offset,
+            color,
+            opacity,
+            blur,
+            ..
+        } => Some((*offset, *color, *opacity, *blur)),
+        _ => None,
+    })?;
+    let opacity = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let path = shape.page_path();
+    if opacity <= 0.0 || path.elements().is_empty() || !(dpi.is_finite() && dpi > 0.0) {
+        return None;
+    }
+    let area = path.bounding_box();
+    let zoom = dpi / 25.4;
+    let w = (area.width() * zoom).ceil();
+    let h = (area.height() * zoom).ceil();
+    if !(w >= 1.0 && h >= 1.0 && w * h <= 64.0e6) {
+        return None;
+    }
+    let blur = if blur.is_finite() { blur.max(0.0) } else { 0.0 };
+    let radius = (blur * zoom).round().min(64.0) as i32;
+    // Room round the object for the blur to draw what lies outside.
+    let pad = radius.max(0) as u32 * 3 + 2;
+    let (lw, lh) = (w as u32 + 2 * pad, h as u32 + 2 * pad);
+    let mut layer = Pixmap::new(lw, lh)?;
+    // Page (y up) to the layer (y down), the object's box at `pad`.
+    let screen = Affine::new([
+        zoom,
+        0.0,
+        0.0,
+        -zoom,
+        f64::from(pad) - area.x0 * zoom,
+        f64::from(pad) + area.y1 * zoom,
+    ]);
+    let rule = shape_fill_rule(shape, false);
+    // Everything outside the object, moved by the offset, casts.
+    layer.fill(tiny_skia::Color::WHITE);
+    let moved = screen * (Affine::translate((offset.x, offset.y)) * path.clone());
+    if let Some(sk) = to_sk_path(&moved) {
+        let mut clear = Paint::default();
+        clear.anti_alias = true;
+        clear.blend_mode = tiny_skia::BlendMode::Clear;
+        layer.fill_path(&sk, &clear, rule, Transform::identity(), None);
+    }
+    if radius > 0 {
+        accel::box_blur(&mut layer, radius, 3);
+    }
+    // Kept where the object covers.
+    let mut mask = tiny_skia::Mask::new(lw, lh)?;
+    if let Some(sk) = to_sk_path(&(screen * path)) {
+        mask.fill_path(&sk, rule, true, Transform::identity());
+    }
+    let [cr, cg, cb] = color.to_rgb8();
+    let mut out = Pixmap::new(w as u32, h as u32)?;
+    let (ow, pad) = (w as usize, pad as usize);
+    let src = layer.pixels();
+    let m = mask.data();
+    for (i, px) in out.pixels_mut().iter_mut().enumerate() {
+        let (x, y) = (i % ow + pad, i / ow + pad);
+        let j = y * lw as usize + x;
+        let a = f64::from(src[j].alpha()) / 255.0 * f64::from(m[j]) / 255.0 * opacity;
+        *px = tiny_skia::ColorU8::from_rgba(cr, cg, cb, (a * 255.0).round() as u8).premultiply();
+    }
+    let exact = Rect::new(area.x0, area.y1 - h / zoom, area.x0 + w / zoom, area.y1);
+    Some((exact, out))
 }
 
 /// The blend mode a merge mode draws with. Subtract, Texturize and
@@ -5361,6 +5568,7 @@ mod tests {
                 light_color: Color::WHITE,
                 level,
                 emboss_color: None,
+                directional: false,
             });
             let (doc, page) = doc_with(vec![s]);
             let pm = render_page_image(&doc, page, 25.4).expect("render");
@@ -6784,6 +6992,7 @@ mod tests {
             to_center: false,
             fill_to: Color::rgb8(0, 0, 255),
             outline_to: None,
+            fill_end_to: None,
             color_blend: 0,
             corners: None,
             accel_objects: 0.0,
@@ -10576,6 +10785,200 @@ mod band_tests {
                 let _ = render_page(&doc, page, &opts);
                 eprintln!("n={n} {w}x{h} zoom={zoom}: {:?}", t.elapsed());
             }
+        }
+    }
+}
+
+/// Shadows seen zoomed in close (#2895): the object reaches past the
+/// picture, which is drawn in bands and anew at every pan and zoom step.
+/// Each pixel comes out the same whatever band or view draws it, and a
+/// shadow keeps its width in mm, so nothing moves on screen while the
+/// picture is replaced.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod inner_shadow_view_tests {
+    use super::*;
+    use tracedraw_core::{Color, Fill};
+
+    fn mesh_with_inner_shadow() -> (Document, PageId) {
+        let r = Rect::new(10.0, 10.0, 90.0, 90.0);
+        let mut s = Shape::new(
+            tracedraw_core::ShapeId(1),
+            ShapeKind::Rect {
+                rect: r,
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        let mut m = tracedraw_core::Mesh::new(r, 2, 2, Color::WHITE);
+        let colors = [
+            Color::rgb8(255, 0, 0),
+            Color::rgb8(0, 255, 0),
+            Color::rgb8(0, 0, 255),
+            Color::rgb8(255, 255, 0),
+            Color::rgb8(0, 255, 255),
+            Color::rgb8(255, 0, 255),
+            Color::rgb8(255, 128, 0),
+            Color::rgb8(0, 128, 255),
+            Color::rgb8(128, 0, 255),
+        ];
+        for (n, c) in m.nodes.iter_mut().zip(colors) {
+            n.color = c;
+        }
+        s.fill = Fill::Mesh(m);
+        s.stroke = None;
+        s.effects.push(tracedraw_core::live::Effect::InnerShadow {
+            offset: tracedraw_core::geometry::Vec2::new(2.0, -2.0),
+            color: Color::BLACK,
+            opacity: 0.8,
+            blur: 2.0,
+            merge: tracedraw_core::live::MergeMode::Normal,
+        });
+        let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(100.0, 100.0));
+        let layer = doc.pages[0].layers[0].id;
+        doc.layer_mut(layer).expect("layer").shapes.push(s);
+        let page = doc.pages[0].id;
+        (doc, page)
+    }
+
+    fn opts(zoom: f64, dx: f64) -> RenderOptions {
+        RenderOptions {
+            width: 1200,
+            height: 900,
+            view: ViewTransform {
+                zoom,
+                origin_x: -8.0 * zoom - dx,
+                origin_y: 900.0 + 8.0 * zoom,
+            },
+            draft: true,
+            ..Default::default()
+        }
+    }
+
+    fn diff(p: tiny_skia::PremultipliedColorU8, q: tiny_skia::PremultipliedColorU8) -> u8 {
+        p.red()
+            .abs_diff(q.red())
+            .max(p.green().abs_diff(q.green()))
+            .max(p.blue().abs_diff(q.blue()))
+            .max(p.alpha().abs_diff(q.alpha()))
+    }
+
+    #[test]
+    fn bands_draw_an_inner_shadow_as_one_picture_does() {
+        let (doc, page) = mesh_with_inner_shadow();
+        for zoom in [4.0, 20.0, 60.0] {
+            let a = render_page(&doc, page, &opts(zoom, 0.0)).expect("bands");
+            let b = render_page_on_one_thread(&doc, page, &opts(zoom, 0.0)).expect("whole");
+            let worst = a
+                .pixels()
+                .iter()
+                .zip(b.pixels())
+                .map(|(p, q)| diff(*p, *q))
+                .max()
+                .unwrap_or(0);
+            assert!(worst <= 1, "zoom {zoom}: {worst}");
+        }
+    }
+
+    /// How far into a white square, mm, an inner shadow or a drop
+    /// shadow beside it reaches at `zoom` before it fades to 90% light.
+    fn shadow_reach_mm(inner: bool, zoom: f64) -> f64 {
+        let r = Rect::new(10.0, 10.0, 90.0, 90.0);
+        let mut s = Shape::new(
+            tracedraw_core::ShapeId(1),
+            ShapeKind::Rect {
+                rect: r,
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        s.fill = Fill::Solid(Color::WHITE);
+        s.stroke = None;
+        if inner {
+            s.effects.push(tracedraw_core::live::Effect::InnerShadow {
+                offset: tracedraw_core::geometry::Vec2::new(0.0, 0.0),
+                color: Color::BLACK,
+                opacity: 1.0,
+                blur: 2.0,
+                merge: tracedraw_core::live::MergeMode::Normal,
+            });
+        } else {
+            s.shadow = Some(tracedraw_core::Shadow {
+                offset: tracedraw_core::geometry::Vec2::new(0.0, 0.0),
+                opacity: 1.0,
+                blur: 2.0,
+                color: Color::BLACK,
+                ..Default::default()
+            });
+        }
+        let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(100.0, 100.0));
+        let layer = doc.pages[0].layers[0].id;
+        doc.layer_mut(layer).expect("layer").shapes.push(s);
+        let page = doc.pages[0].id;
+        // The square's left edge at x = 600, a row through its middle.
+        let o = RenderOptions {
+            width: 1200,
+            height: 50,
+            view: ViewTransform {
+                zoom,
+                origin_x: 600.0 - 10.0 * zoom,
+                origin_y: 25.0 + 50.0 * zoom,
+            },
+            draft: true,
+            ..Default::default()
+        };
+        let pm = render_page(&doc, page, &o).expect("render");
+        let light = |x: u32| {
+            let p = pm.pixel(x, 25).expect("pixel");
+            // Over the transparent desktop the shadow shows in its alpha.
+            if p.alpha() < 255 {
+                255 - p.alpha()
+            } else {
+                p.red()
+            }
+        };
+        let x = if inner {
+            (600..1200).find(|&x| light(x) > 230)
+        } else {
+            (0..600).rev().find(|&x| light(x) > 230)
+        }
+        .expect("fades");
+        (f64::from(x) - 600.0).abs() / zoom
+    }
+
+    /// A shadow keeps its width in mm zoomed in close (#2895): its blur
+    /// stopped at 64 pixels, so past that zoom each step drew it
+    /// narrower than the scaled picture shown meanwhile, and the drawing
+    /// seemed to shake while zooming.
+    #[test]
+    fn a_shadow_keeps_its_width_zoomed_in_close() {
+        for inner in [true, false] {
+            let at = |z: f64| shadow_reach_mm(inner, z);
+            let base = at(20.0);
+            for zoom in [40.0, 60.0, 75.0] {
+                let w = at(zoom);
+                assert!(
+                    (w - base).abs() < 0.2,
+                    "inner {inner}: {w} mm at zoom {zoom}, {base} mm at 20"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pan_moves_an_inner_shadow_and_nothing_else() {
+        let (doc, page) = mesh_with_inner_shadow();
+        for zoom in [4.0, 20.0, 60.0] {
+            let a = render_page(&doc, page, &opts(zoom, 0.0)).expect("before");
+            let b = render_page(&doc, page, &opts(zoom, 37.0)).expect("panned");
+            let mut worst = 0;
+            for y in 0..900 {
+                for x in 0..1100 {
+                    let p = a.pixel(x + 37, y).expect("pixel");
+                    let q = b.pixel(x, y).expect("pixel");
+                    worst = worst.max(diff(p, q));
+                }
+            }
+            assert!(worst <= 1, "zoom {zoom}: {worst}");
         }
     }
 }

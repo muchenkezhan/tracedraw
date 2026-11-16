@@ -1,5 +1,13 @@
 # Attribution
 
+The original two-rectangle Gaussian blur fixture
+(`crates/cdr/tests/fixtures/gaussian-blur.cdr`), its generator
+(`scripts/samples/cdr_gaussian_blur.py`) and associated synthetic sample
+images are by TraceDraw contributors, written for this change and licensed
+MIT OR Apache-2.0. They contain no private source drawing or application
+assets. The style record layout was observed independently in a
+contributor-owned CDR27 file; see `CLEANROOM.md`.
+
 Every asset bundled with TraceDraw, with its author, source and license.
 Code dependencies (Rust crates) keep their own licenses, recorded in
 their packages; `cargo tree` lists them from `Cargo.lock`.
@@ -34,6 +42,8 @@ pure-Rust `vaam-image-webp` crate (MIT OR Apache-2.0) for it instead.
 | eframe 0.36.2 (patched copy of the crate, its OpenGL context fallback backported from 0.37.0, #616) | `vendor/eframe/` | Copyright Emil Ernerfeldt and the egui contributors, from crates.io; the change is listed in `vendor/README.md` | MIT OR Apache-2.0 |
 | winit 0.30.13 (patched copy of the crate, a pen's pressure on X11 and macOS, #850) | `vendor/winit/` | Copyright the winit contributors, from crates.io; the change is listed in `vendor/README.md` | Apache-2.0 |
 | Sample drawing | `sample.tdraw` | Made for TraceDraw | MIT OR Apache-2.0 |
+| Hidden group CDR27 parser fixtures and generator (#2850) | `crates/cdr/tests/fixtures/hidden-groups/` | Made for TraceDraw; original rectangles and generated chunk records, no private drawing data | MIT OR Apache-2.0 |
+| Layer visibility CDR27 parser fixtures and generator (#2862) | `crates/cdr/tests/fixtures/hidden-layers/` | Made for TraceDraw; original rectangles and generated chunk records, no source drawing data | MIT OR Apache-2.0 |
 | Picture import test files (a progressive RGB JPEG, a progressive CMYK JPEG, a palette PNG; a few flat colours each) | `apps/tracedraw/testdata/` | Made for TraceDraw's tests with a general-purpose imaging library | MIT OR Apache-2.0 |
 | Screenshots | `docs/images/` | TraceDraw itself, captured with `scripts/visual/readme_shots.sh` from drawings made for TraceDraw by `apps/tracedraw-cli/examples/showcase.rs`; their text is set in Inter and Lora (SIL Open Font License 1.1), fonts installed on the capture machine and not bundled | MIT OR Apache-2.0 |
 

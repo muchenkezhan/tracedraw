@@ -3153,6 +3153,15 @@ pub struct Shape {
     /// frames, which is another feature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_link: Option<u64>,
+    /// A heading of the table of contents (#1660): the text is listed
+    /// in the drawing's tables of contents at this level, 1 to 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toc_level: Option<u8>,
+    /// A table of contents (#1660): the text lists the headings of the
+    /// drawing with their page numbers, worked out anew whenever it is
+    /// drawn, printed or exported (see [`crate::toc`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toc: Option<crate::toc::TocField>,
 }
 
 /// What a QR code holds: the kind of content, which decides the fields
@@ -3454,6 +3463,8 @@ impl Shape {
             qr: None,
             fill_rule: crate::shaping::FillRule::EvenOdd,
             content_link: None,
+            toc_level: None,
+            toc: None,
         }
     }
 
@@ -5169,6 +5180,79 @@ pub struct Metadata {
     /// while empty.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub multipage_pages: String,
+    /// The page margins for book layouts (Document Setup > Layout,
+    /// #1660): the box the text and pictures of every page keep inside,
+    /// shown on the pages as a dashed frame. `None`: no margins. Left out
+    /// of the file while unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margins: Option<PageMargins>,
+}
+
+/// Page margins, mm (#1660). With facing pages the inside margin lies at
+/// the spine and the outside one at the page's free edge, so they swap
+/// sides between the left and the right pages of a spread; a page shown
+/// alone takes the inside margin on its left, as a right-hand page.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PageMargins {
+    pub top: f64,
+    pub bottom: f64,
+    pub inside: f64,
+    pub outside: f64,
+}
+
+/// The widest page margin taken, mm.
+pub const MAX_PAGE_MARGIN: f64 = 1000.0;
+
+impl PageMargins {
+    /// The same margin all round.
+    pub fn uniform(mm: f64) -> Self {
+        PageMargins {
+            top: mm,
+            bottom: mm,
+            inside: mm,
+            outside: mm,
+        }
+    }
+
+    /// Each margin kept between 0 and [`MAX_PAGE_MARGIN`] (0 for a value
+    /// that is not a number).
+    pub fn clamped(self) -> Self {
+        let c = |v: f64| {
+            if v.is_finite() {
+                v.clamp(0.0, MAX_PAGE_MARGIN)
+            } else {
+                0.0
+            }
+        };
+        PageMargins {
+            top: c(self.top),
+            bottom: c(self.bottom),
+            inside: c(self.inside),
+            outside: c(self.outside),
+        }
+    }
+
+    /// No margin is set.
+    pub fn is_zero(&self) -> bool {
+        let m = self.clamped();
+        m.top == 0.0 && m.bottom == 0.0 && m.inside == 0.0 && m.outside == 0.0
+    }
+
+    /// The box inside the margins of a page whose box is `page` (y up),
+    /// sitting on `side` of a spread: the inside margin at the spine,
+    /// on the right of a left page and on the left of a right page.
+    /// Margins wider than the page leave a box of no width there.
+    pub fn inner(&self, page: Rect, side: crate::spreads::PageSide) -> Rect {
+        let m = self.clamped();
+        let (left, right) = match side {
+            crate::spreads::PageSide::Left => (m.outside, m.inside),
+            crate::spreads::PageSide::Right => (m.inside, m.outside),
+        };
+        let x0 = (page.x0 + left).min(page.x1);
+        let y0 = (page.y0 + m.bottom).min(page.y1);
+        Rect::new(x0, y0, (page.x1 - right).max(x0), (page.y1 - m.top).max(y0))
+    }
 }
 
 /// The pages of `range` ("1-3, 5"; page numbers from 1, ranges either
@@ -5940,15 +6024,27 @@ impl std::fmt::Debug for DocumentFont {
     }
 }
 
-/// Shared binary data as base64 text, like bitmaps.
+/// Shared binary data as base64 text, like bitmaps (a reference to the
+/// table of a packed file, as pictures are).
 mod shared_bytes {
-    use serde::{Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
     use std::sync::Arc;
     pub fn serialize<S: Serializer>(v: &Arc<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
-        super::png_bytes::serialize(v.as_slice(), s)
+        match crate::bytes::blob_reference(crate::bytes::Blob::Font(v.clone())) {
+            Some(r) => s.serialize_str(&r),
+            None => super::png_bytes::serialize(v.as_slice(), s),
+        }
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<Vec<u8>>, D::Error> {
-        super::png_bytes::deserialize(d).map(Arc::new)
+        let text = String::deserialize(d)?;
+        if let Some(found) = crate::bytes::blob_read(&text) {
+            return found
+                .map(|b| Arc::new(b.to_vec()))
+                .map_err(serde::de::Error::custom);
+        }
+        crate::bytes::decode_base64(&text)
+            .map(Arc::new)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -6266,16 +6362,33 @@ impl Document {
 
     /// [`Document::layers_for_page`] as drawn, printed and exported: a
     /// master layer holding a page number field comes as a copy showing
-    /// this page's number (#807).
+    /// this page's number (#807), and a layer holding a table of contents
+    /// as a copy listing the headings as they stand (#1660).
     pub fn layers_drawn_for_page(&self, page: PageId) -> Result<Vec<std::borrow::Cow<'_, Layer>>> {
         use std::borrow::Cow;
         let idx = self.page_index(page)?;
+        // The headings, found once for the tables of contents (#1660).
+        let entries = std::cell::OnceCell::new();
         Ok(self
             .layers_for_page(page)?
             .into_iter()
             .map(|l| {
                 let master = self.master.iter().any(|m| m.id == l.id);
-                if master && l.shapes.iter().any(Shape::holds_page_number) {
+                if l.shapes.iter().any(Shape::holds_toc) {
+                    let entries = entries.get_or_init(|| crate::toc::entries(self));
+                    let mut l = l.clone();
+                    if master {
+                        l.shapes
+                            .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers(idx)));
+                    }
+                    for s in &mut l.shapes {
+                        if master {
+                            s.show_page_number(idx);
+                        }
+                        s.show_toc(entries);
+                    }
+                    Cow::Owned(l)
+                } else if master && l.shapes.iter().any(Shape::holds_page_number) {
                     let mut l = l.clone();
                     // A field on a page before the first numbered page
                     // is left out (#2127).
@@ -6635,8 +6748,58 @@ impl Document {
         for step in DOWN_STEPS.iter().skip(version as usize).rev() {
             step(&mut v);
         }
+        if let serde_json::Value::Object(m) = &mut v {
+            m.insert(FORMAT_VERSION_KEY.into(), serde_json::Value::from(version));
+        }
         serde_json::to_writer(w, &v)?;
         Ok(())
+    }
+
+    /// Write a `.tdraw` file of format `version` to `w`, as Save does.
+    /// From [`PACKED_VERSION`] on the file is packed (#2849): each
+    /// distinct picture and font once, in a table at the end that the
+    /// objects refer to, and the whole JSON gzip-compressed (the file
+    /// starts with gzip's `1f 8b`; [`tdraw_text`] reads both kinds). An
+    /// older version is written as plain JSON, as that TraceDraw reads it.
+    pub fn write_tdraw_version<W: std::io::Write>(&self, w: W, version: u32) -> Result<()> {
+        if version < PACKED_VERSION {
+            return self.write_json_version(w, version);
+        }
+        let mut gz = flate2::write::GzEncoder::new(w, flate2::Compression::new(TDRAW_GZIP_LEVEL));
+        self.write_packed(&mut gz)?;
+        gz.finish().map_err(serde_json::Error::io)?;
+        Ok(())
+    }
+
+    /// The packed JSON of the current format, uncompressed: the drawing
+    /// with references for its pictures and fonts, then their table.
+    pub fn write_packed<W: std::io::Write>(&self, w: W) -> Result<()> {
+        use crate::finite::FiniteSerializer;
+        #[derive(Serialize)]
+        struct Packed<'a> {
+            #[serde(flatten)]
+            doc: &'a Document,
+            format_version: u32,
+            // Last, so that the drawing has filled it.
+            blobs: crate::bytes::BlobsOut,
+        }
+        let _table = crate::bytes::WritingTable::start();
+        let mut ser = serde_json::Serializer::new(std::io::BufWriter::new(w));
+        Packed {
+            doc: self,
+            format_version: TDRAW_FORMAT_VERSION,
+            blobs: crate::bytes::BlobsOut,
+        }
+        .serialize(FiniteSerializer(&mut ser))?;
+        use std::io::Write as _;
+        ser.into_inner().flush().map_err(serde_json::Error::io)?;
+        Ok(())
+    }
+
+    /// Read a `.tdraw` file's bytes, packed or plain JSON of any version.
+    pub fn from_tdraw_bytes(bytes: &[u8]) -> Result<Self> {
+        let text = tdraw_text(bytes).map_err(serde_json::Error::io)?;
+        Self::from_json(&text)
     }
 
     /// Read a `.tdraw` file of any version: older ones are brought up to
@@ -6646,16 +6809,64 @@ impl Document {
         let mut v: serde_json::Value = json_value(s)?;
         let from = tdraw_version(&v);
         migrate(&mut v, from);
+        // A packed file's pictures and fonts (#2849): the objects refer
+        // to this table while they are read.
+        let mut blobs = Vec::new();
         if let serde_json::Value::Object(m) = &mut v {
             m.remove(FORMAT_VERSION_KEY);
+            if let Some(serde_json::Value::Array(list)) = m.remove(BLOBS_KEY) {
+                blobs = list
+                    .into_iter()
+                    .map(|b| match b {
+                        serde_json::Value::String(t) => t,
+                        _ => String::new(),
+                    })
+                    .collect();
+            }
         }
+        let _table = crate::bytes::ReadingTable::start(blobs);
         let mut doc: Document = match Document::deserialize(&v) {
             Ok(doc) => doc,
             Err(e) => numbers_lost_as_zero(v, e)?,
         };
         // What text wraps around is not saved: work it out again.
         doc.refresh_text_flow();
+        doc.refit_text_meshes();
         Ok(doc)
+    }
+
+    /// Stretch the mesh fill of every text whose grid lies inside the
+    /// text's box but no longer covers it back over the whole box. Before
+    /// 0.47 a text typed over (a T made a C, more letters) kept the grid
+    /// made over its old box; the part past it had no fill, and a block
+    /// or inner shadow showed through it (#2892, #2894). A file saved
+    /// that way opens with the text filled again. A grid reaching past
+    /// the text's box, or already over it, is left as it is.
+    pub fn refit_text_meshes(&mut self) {
+        fn walk(s: &mut Shape) {
+            if let (ShapeKind::Text { .. }, Fill::Mesh(m)) = (&s.kind, &s.fill) {
+                let b = crate::geometry::Shape::bounding_box(&s.local_path());
+                if let Some(m) = m.refit_inside(b) {
+                    s.fill = Fill::Mesh(m);
+                }
+            }
+            match &mut s.kind {
+                ShapeKind::Group { children } => children.iter_mut().for_each(walk),
+                ShapeKind::ClipFrame { frame, contents } => {
+                    walk(frame);
+                    contents.iter_mut().for_each(walk);
+                }
+                _ => {}
+            }
+        }
+        for page in &mut self.pages {
+            for l in &mut page.layers {
+                l.shapes.iter_mut().for_each(walk);
+            }
+        }
+        for l in &mut self.master {
+            l.shapes.iter_mut().for_each(walk);
+        }
     }
 }
 
@@ -6793,7 +7004,46 @@ const NULL_SETTINGS: [&str; 29] = [
 /// with a default does not. The next version is 2: 1 was written by
 /// TraceDraw 0.5 to 0.9 for the layout of 0 and is read as 0. See
 /// `docs/tdraw-format.md`.
-pub const TDRAW_FORMAT_VERSION: u32 = 0;
+pub const TDRAW_FORMAT_VERSION: u32 = 2;
+
+/// The first format written packed and compressed (#2849): Save writes
+/// it, also for a plain file opened; TraceDraw 0.46 and older open only
+/// plain files (TraceDraw is an alpha, people know files move forward).
+pub const PACKED_VERSION: u32 = 2;
+
+/// gzip's level for `.tdraw` files: most of the gain of the highest at a
+/// fraction of the time (pictures are already compressed PNG).
+const TDRAW_GZIP_LEVEL: u32 = 4;
+
+/// The key of a packed file's table of pictures and fonts.
+const BLOBS_KEY: &str = "blobs";
+
+/// The JSON text of a `.tdraw` file's bytes: gzip (`1f 8b`, the packed
+/// files of 0.47 on) is decompressed, anything else is read as UTF-8
+/// text (the plain files of every version). Readers of `.tdraw` (the
+/// app, the thumbnailer, the command line, templates) read through it
+/// ([`read_tdraw_text`] for a stream).
+pub fn tdraw_text(bytes: &[u8]) -> std::io::Result<String> {
+    read_tdraw_text(bytes)
+}
+
+/// [`tdraw_text`] from a reader, as it reads (the window of a large
+/// file counts the bytes as they go).
+pub fn read_tdraw_text<R: std::io::BufRead>(mut r: R) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    if is_gzip(r.fill_buf()?) {
+        flate2::read::MultiGzDecoder::new(r).read_to_string(&mut text)?;
+    } else {
+        r.read_to_string(&mut text)?;
+    }
+    Ok(text)
+}
+
+/// Whether bytes start as gzip does (a packed `.tdraw`).
+pub fn is_gzip(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1f, 0x8b])
+}
 
 /// The number TraceDraw 0.5 to 0.9 wrote for the layout of version 0.
 const SAME_AS_ZERO: u64 = 1;
@@ -6819,16 +7069,21 @@ pub fn tdraw_text_version(s: &str) -> u32 {
 /// One step of [`migrate`]: the JSON of version `i` to version `i + 1`.
 type Step = fn(&mut serde_json::Value);
 
-/// `STEPS[i]` takes a file from version `i` to `i + 1` (none yet).
-const STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [];
+/// `STEPS[i]` takes a file from version `i` to `i + 1`. 0 to 1 and 1 to
+/// 2 change no field: 1 has the layout of 0, and 2 only packs the file,
+/// which [`Document::from_json`] reads in any version.
+const STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
 
 /// `DOWN_STEPS[i]` takes a file from version `i + 1` back to `i`, for
-/// saving in an older version (none yet).
-const DOWN_STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [];
+/// saving in an older version (a plain file, written unpacked).
+const DOWN_STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
+
+fn same_layout(_: &mut serde_json::Value) {}
 
 /// The TraceDraw release that first wrote each `.tdraw` format version
-/// (`TDRAW_RELEASES[v]`), for Save As.
-pub const TDRAW_RELEASES: [&str; TDRAW_FORMAT_VERSION as usize + 1] = ["0.4"];
+/// (`TDRAW_RELEASES[v]`), for Save As. Version 1 is not offered: it has
+/// the layout of 0.
+pub const TDRAW_RELEASES: [&str; TDRAW_FORMAT_VERSION as usize + 1] = ["0.4", "0.5", "0.47"];
 
 /// Bring a `.tdraw` file's JSON from version `from` up to
 /// [`TDRAW_FORMAT_VERSION`], one step at a time.
@@ -7033,6 +7288,73 @@ mod tests {
             children[0].node_types.get(&3),
             Some(&crate::nodes::NodeType::Smooth)
         );
+    }
+
+    /// A text saved with a mesh grid left over its old, smaller box (typed
+    /// over before 0.47: a T made a C) opens with the grid over its whole
+    /// box again, inside a group too, so no part of it is left without
+    /// fill for the shadows to show through (#2892, #2894). A grid
+    /// reaching past the text's box is left as it is.
+    #[test]
+    fn a_texts_mesh_left_over_its_old_box_covers_it_when_the_file_opens() {
+        use crate::geometry::{Point, Rect};
+        let text = |s: &str| {
+            Shape::new(
+                ShapeId(1),
+                ShapeKind::Text {
+                    spans: vec![TextSpan::new(s, "Any", 72.0)],
+                    origin: Point::ZERO,
+                    frame: None,
+                    align: Default::default(),
+                    para: Default::default(),
+                    on_path: None,
+                },
+            )
+        };
+        let bounds = |s: &Shape| crate::geometry::Shape::bounding_box(&s.local_path());
+        let grid = |f: &Fill| {
+            let Fill::Mesh(m) = f else { panic!("{f:?}") };
+            let p = m.nodes[0].pos;
+            m.nodes
+                .iter()
+                .fold(Rect::from_points(p, p), |r, n| r.union_pt(n.pos))
+        };
+        let old = bounds(&text("T"));
+        let mut cc = text("CC");
+        let wide = bounds(&cc);
+        assert!(wide.width() > old.width() * 1.5, "{wide:?} vs {old:?}");
+        cc.fill = Fill::Mesh(crate::Mesh::new(old, 2, 2, crate::Color::BLACK));
+        let mut past = text("CC");
+        let big = wide.inflate(10.0, 10.0);
+        past.fill = Fill::Mesh(crate::Mesh::new(big, 2, 2, crate::Color::BLACK));
+        let group = Shape::new(
+            ShapeId(2),
+            ShapeKind::Group {
+                children: vec![cc.clone()],
+            },
+        );
+        let mut doc = Document::default();
+        doc.pages[0].layers[0].shapes = vec![cc, group, past];
+        let json = doc.to_json().expect("json");
+        let back = Document::from_json(&json).expect("opens");
+        let shapes = &back.pages[0].layers[0].shapes;
+        let ShapeKind::Group { children } = &shapes[1].kind else {
+            panic!("a group");
+        };
+        for (got, want) in [
+            (grid(&shapes[0].fill), wide),
+            (grid(&children[0].fill), wide),
+            (grid(&shapes[2].fill), big),
+        ] {
+            for (g, w) in [
+                (got.x0, want.x0),
+                (got.y0, want.y0),
+                (got.x1, want.x1),
+                (got.y1, want.y1),
+            ] {
+                assert!((g - w).abs() < 1e-9, "{got:?} vs {want:?}");
+            }
+        }
     }
 
     use super::*;
@@ -7720,6 +8042,104 @@ mod tests {
         p
     }
 
+    /// A saved drawing is packed (#2849): each distinct picture and font
+    /// once however many objects hold it, the whole JSON gzip-compressed;
+    /// it reads back the same, with the copies sharing one buffer again.
+    /// Plain files (version 0, and every file before 0.47) still open,
+    /// and Save As version 0 writes one.
+    #[test]
+    fn tdraw_files_are_packed_with_each_picture_once() {
+        let mut doc = Document::new("Packed", crate::geometry::Size::new(100.0, 50.0));
+        let layer = doc.pages[0].layers[0].id;
+        // A picture of 200 kB of noise (it does not compress), on 50
+        // objects, as copies and symbols of a large drawing hold it.
+        let mut seed = 7u32;
+        let noise: Vec<u8> = (0..200_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8
+            })
+            .collect();
+        let picture = crate::SharedBytes::from(noise.clone());
+        for i in 0..50 {
+            let id = doc.ids_mut().shape();
+            // Half of them a copy of the bytes, not the shared buffer.
+            let png = if i % 2 == 0 {
+                picture.clone()
+            } else {
+                crate::SharedBytes::from(noise.clone())
+            };
+            let s = Shape::new(
+                id,
+                ShapeKind::Bitmap {
+                    rect: Rect::new(0.0, 0.0, 20.0, 10.0),
+                    width_px: 4,
+                    height_px: 2,
+                    png,
+                    fx: None,
+                },
+            );
+            doc.layer_mut(layer).expect("layer").shapes.push(s);
+        }
+        doc.fonts
+            .push(DocumentFont::new("Embedded", vec![5u8; 3000]));
+        doc.fonts
+            .push(DocumentFont::new("Same bytes", vec![5u8; 3000]));
+        let mut packed = Vec::new();
+        doc.write_tdraw_version(&mut packed, TDRAW_FORMAT_VERSION)
+            .expect("write");
+        assert!(is_gzip(&packed));
+        let plain = doc.to_json_version(0).expect("plain");
+        // 50 copies of 200 kB in base64 would be some 13 MB.
+        assert!(plain.len() > 13_000_000, "{}", plain.len());
+        assert!(packed.len() < 300_000, "{} bytes", packed.len());
+        let text = tdraw_text(&packed).expect("text");
+        assert_eq!(text.matches(crate::bytes::BLOB_PREFIX).count(), 52);
+        let table: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(table[BLOBS_KEY].as_array().map(Vec::len), Some(2));
+        assert_eq!(tdraw_text_version(&text), TDRAW_FORMAT_VERSION);
+        let back = Document::from_tdraw_bytes(&packed).expect("reads");
+        let pictures: Vec<&crate::SharedBytes> = back.pages[0].layers[0]
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.kind {
+                ShapeKind::Bitmap { png, .. } => Some(png),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pictures.len(), 50);
+        assert!(pictures.iter().all(|p| ***p == noise[..]));
+        assert!(pictures
+            .iter()
+            .all(|p| crate::SharedBytes::ptr_eq(p, pictures[0])));
+        assert_eq!(back.fonts.len(), 2);
+        assert_eq!(*back.fonts[1].data, vec![5u8; 3000]);
+        // The same drawing as before: its JSON matches.
+        assert_eq!(
+            back.to_json_version(0).expect("json"),
+            plain,
+            "the packed file reads back as the drawing"
+        );
+        // A plain file of 0.46 (version 0, no table) opens, as bytes too.
+        assert!(!is_gzip(plain.as_bytes()));
+        assert_eq!(tdraw_text_version(&plain), 0);
+        let old = Document::from_tdraw_bytes(plain.as_bytes()).expect("plain opens");
+        assert_eq!(old.to_json_version(0).expect("json"), plain);
+        // Save As version 0 writes that plain file.
+        let mut v0 = Vec::new();
+        doc.write_tdraw_version(&mut v0, 0).expect("v0");
+        assert_eq!(String::from_utf8(v0).expect("text"), plain);
+        // A reference outside the table is an error, not a panic.
+        let broken = text.replace("blob:1\"", "blob:9\"");
+        assert!(Document::from_json(&broken).is_err());
+        // No table is left behind for the next file read or written.
+        assert!(crate::bytes::blob_read("blob:0").is_none());
+        assert!(!doc
+            .to_json()
+            .expect("json")
+            .contains(crate::bytes::BLOB_PREFIX));
+    }
+
     /// The file is written as it is made, and reads as the same JSON the
     /// tree built in memory gave.
     #[test]
@@ -7786,7 +8206,9 @@ mod tests {
         };
         for version in 0..=TDRAW_FORMAT_VERSION {
             let json = doc.to_json_version(version).expect("json");
-            assert_eq!(tdraw_text_version(&json), version);
+            // 1 is read as 0, whose layout it has.
+            let read_as = if version == 1 { 0 } else { version };
+            assert_eq!(tdraw_text_version(&json), read_as);
             assert_eq!(Document::from_json(&json).expect("reads").title, "Older");
         }
         let newer = doc.to_json_version(TDRAW_FORMAT_VERSION + 5).expect("json");

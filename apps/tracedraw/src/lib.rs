@@ -39,6 +39,7 @@ mod blend_link;
 mod blend_tool;
 mod border_grommet;
 mod brushes;
+mod balloons;
 mod callouts;
 mod captions;
 mod chinese;
@@ -47,6 +48,7 @@ mod clipboard;
 mod clone_effect;
 mod color_drop;
 mod color_policy;
+mod color_styles;
 mod comments;
 mod common_shapes;
 mod connectors;
@@ -89,12 +91,14 @@ mod fill_page;
 mod fill_tool;
 mod fit_path;
 mod focus;
+mod formula;
 #[cfg(any(target_arch = "wasm32", test))]
 mod font_folder;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_stats;
 mod frame_type;
 mod fx;
+mod gather_pages;
 mod github;
 #[cfg(not(target_arch = "wasm32"))]
 mod gpu;
@@ -145,6 +149,7 @@ mod object_thumbs;
 mod offset_shadow_handle;
 mod ops;
 mod ops2;
+mod opening;
 mod package;
 mod page_drop;
 mod page_names;
@@ -159,6 +164,8 @@ mod pick_drag_tests;
 mod picture_mosaic;
 mod picture_plates;
 mod placeholder;
+mod plugins;
+mod pmd_open;
 mod preflight;
 mod prefs;
 mod print_merge;
@@ -176,6 +183,8 @@ mod select_region;
 mod select_similar;
 mod settings;
 mod shadow_tool;
+#[cfg(test)]
+mod shadow_split_tests;
 mod shape_builder;
 mod shape_tool;
 #[cfg(test)]
@@ -218,6 +227,7 @@ mod text_effect_tests;
 mod text_frames;
 mod text_nodes;
 mod text_path;
+mod toc;
 #[cfg(test)]
 mod text_wrap_tests;
 mod textflow;
@@ -229,9 +239,12 @@ mod time_tracker;
 mod title_bar;
 mod tools;
 mod tools2;
+mod touch_bars;
 mod touch_modifiers;
 mod touch_taps;
 mod trace;
+mod trace_blend;
+mod trace_fine;
 mod trace_preview;
 mod tracecut;
 mod tracecut_cut;
@@ -252,6 +265,7 @@ mod web;
 mod web_page;
 #[cfg(windows)]
 mod win_clipboard;
+mod window_buttons;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod x11_clipboard;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -900,6 +914,16 @@ fn paint_probe(ctx: &egui::Context) -> [usize; 2] {
 #[cfg(not(target_arch = "wasm32"))]
 const RENDERER_CHECK: &str = "renderer-check";
 
+/// The end of a step of the frame, named for the slow-frame log
+/// (`frame_stats::mark`, d#2729).
+#[inline]
+pub(crate) fn frame_mark(name: &'static str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    frame_stats::mark(name);
+    #[cfg(target_arch = "wasm32")]
+    let _ = name;
+}
+
 impl eframe::App for Shell {
     /// Characters the windowing layer lost (input methods on Windows,
     /// #1151) and what Android's on-screen keyboard typed (#1309) join the
@@ -922,6 +946,7 @@ impl eframe::App for Shell {
         // (#2362).
         if let Some(app) = self.app.as_mut() {
             touch_modifiers::fingers_on_keys(app, raw_input);
+            touch_bars::second_finger_copies(app, raw_input);
             app.touch_mods.apply(ctx, raw_input);
         }
     }
@@ -1052,6 +1077,11 @@ impl eframe::App for Shell {
         if app.sync_mcp_link(ui.ctx()) {
             ui.ctx().request_repaint();
         }
+        // A large drawing being opened off the interface's thread (#2849).
+        if app.poll_opening() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // An answer from GitHub (File > GitHub).
         if app.poll_github() {
             ui.ctx()
@@ -1077,7 +1107,9 @@ impl eframe::App for Shell {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
+        frame_mark("before the interface");
         ui::root(app, ui);
+        frame_mark("the dialogs");
         // The frame around the safe area (#1917).
         ui::screen_margins::paint(ui.ctx(), &app.settings);
         // The emulator check's typing test (Android, soft_keyboard.rs).

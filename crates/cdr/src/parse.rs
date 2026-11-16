@@ -18,7 +18,8 @@ use crate::text::{self, RunStyle, StyleRec};
 use std::collections::HashMap;
 use tracedraw_core::{
     document::{
-        Corners, EllipseArc, Layer, Page, ParagraphStyle, Shape, ShapeKind, TextAlign, TextSpan,
+        Corners, EllipseArc, Layer, LeadingUnit, Page, ParagraphStyle, Shape, ShapeKind, TextAlign,
+        TextSpan,
     },
     geometry::{Affine, BezPath, Point, Rect, Size},
     style::{
@@ -843,13 +844,17 @@ pub(crate) fn parse_document_kept(
             let default_name = format!("Layer {}", page.layers.len() + 1);
             let name = ctx.layer_name(lc).unwrap_or(default_name);
             let mut layer = Layer::new(doc.ids_mut().layer(), name);
+            if let Some(f) = ctx.modern_layer_flags(lc) {
+                layer.locked = f[0] & 0x10 != 0;
+                layer.printable = f[0] & 0x08 == 0;
+            }
             // Guides and grid layers hold no drawable content.
             match ctx.layer_type(lc) {
                 Some(t) if t & 0x0f == 0x0a => {
                     layer.visible = false;
                     layer.printable = false;
                 }
-                _ => layer.visible = true,
+                _ => layer.visible = !ctx.layer_hidden(lc),
             }
             let mut ids = std::mem::take(doc.ids_mut());
             layer.shapes = ctx.read_objects(lc, &mut ids, size, 0);
@@ -922,26 +927,34 @@ pub(crate) fn parse_document_kept(
     // the right and left of the spine, from the first page alone on the
     // right (or on the left starting a spread). Which of the two the
     // file starts with is the one that puts more of the objects on their
-    // pages, and every page then goes by its place in the spreads. Each
+    // pages, and every page then goes by its place in the spreads, the
+    // turns breaking only where many pages after hold their objects
+    // better the other way (a page lost or added, #2833). Each
     // page took the side holding more of its own objects before, and a
     // page with objects reaching across the spine took the wrong one,
     // mixing it with the page beside it; the pages showed one by one,
     // not in spreads (#1660).
     if ctx.facing_pages {
-        let side = |i: usize, starts_right: bool| i.is_multiple_of(2) == starts_right;
-        let on_pages = |starts_right: bool| -> usize {
-            doc.pages
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let dx = spine_shift(p.size.width, side(i, starts_right));
-                    centres_on_page(&p.layers, p.size.width, dx)
-                })
-                .sum()
-        };
-        let starts_right = on_pages(true) >= on_pages(false);
-        for (i, p) in doc.pages.iter_mut().enumerate() {
-            let dx = spine_shift(p.size.width, side(i, starts_right));
+        // Each page's share of its objects that lands on it from the right
+        // of the spine and from the left; then the sides, taking turns
+        // with as few breaks as those shares allow (#2833).
+        let shares: Vec<(f64, f64)> = doc
+            .pages
+            .iter()
+            .map(|p| {
+                let w = p.size.width;
+                let n = p.layers.iter().map(|l| l.shapes.len()).sum::<usize>();
+                if n == 0 {
+                    return (0.0, 0.0);
+                }
+                let on = |right: bool| centres_on_page(&p.layers, w, spine_shift(w, right));
+                (on(true) as f64 / n as f64, on(false) as f64 / n as f64)
+            })
+            .collect();
+        let sides = facing_sides(&shares);
+        let starts_right = sides.first().copied().unwrap_or(true);
+        for (p, right) in doc.pages.iter_mut().zip(sides) {
+            let dx = spine_shift(p.size.width, right);
             for s in p.layers.iter_mut().flat_map(|l| l.shapes.iter_mut()) {
                 s.transform = Affine::translate((dx, 0.0)) * s.transform;
             }
@@ -1024,9 +1037,9 @@ impl<'a> Ctx<'a> {
         Reader::at(d, pos, self.v16())
     }
 
-    /// `flgs` of a `page` or `layr` list: 4 bytes, byte 3 is the record
-    /// type (0x90 page, 0x98 layer), byte 2 marks the master page, byte 0
-    /// is the layer type (0 normal, 8 desktop, 0x0a guides, 0x1a grid).
+    /// Four-byte state flags; byte 3 identifies the record (0x90 page,
+    /// 0x98 layer), and byte 2 marks master-page entries. Modern layers
+    /// identify their kind in `loda`; byte 0 also holds state bits.
     fn flags(&self, list: &Chunk) -> Option<[u8; 4]> {
         let f = list.find(b"flgs")?;
         let d = self.data(f);
@@ -1041,18 +1054,60 @@ impl<'a> Ctx<'a> {
         matches!(self.flags(oc), Some(f) if f[3] & 0xf8 == 0x08 && f[0] & OBJECT_LOCKED != 0)
     }
 
+    /// Modern object and group records share byte 1's hidden bit. A
+    /// hidden text has [0, 3, 0, 8], its visible neighbour [0, 2, 0, 8];
+    /// groups use record type 0x10 and keep their children's own state.
+    fn shape_hidden(&self, oc: &Chunk) -> bool {
+        self.v >= 16
+            && matches!(self.flags(oc), Some(f) if (f[3] & 0xf8 == 0x08 || f[3] == 0x10) && f[1] & 1 != 0)
+    }
+
     fn page_is_master(&self, pc: &Chunk) -> bool {
         matches!(self.flags(pc), Some(f) if f[3] == 0x90 && f[2] != 0)
     }
 
     fn layer_type(&self, lc: &Chunk) -> Option<u8> {
+        // Modern `loda` kinds distinguish an ordinary excluded layer
+        // from the desktop: both can have byte-0 flag 0x08 (#2850).
+        if self.v >= 16 {
+            if let Some(kind) = self
+                .own_loda(lc)
+                .and_then(|c| tracedraw_cdr_format::loda::table(self.data(c), self.v))
+                .map(|l| l.kind)
+            {
+                match kind {
+                    0 => return Some(0),
+                    11 => return Some(0x1a),
+                    12 => return Some(0x0a),
+                    17 => return Some(0x08),
+                    _ => {}
+                }
+            }
+        }
         self.flags(lc).filter(|f| f[3] == 0x98).map(|f| f[0])
+    }
+
+    fn modern_layer_flags(&self, lc: &Chunk) -> Option<[u8; 4]> {
+        (self.v >= 16)
+            .then(|| self.flags(lc))
+            .flatten()
+            .filter(|f| f[3] == 0x98)
+    }
+
+    /// Modern hidden layers carry bit 0 of byte 1, observed in version
+    /// 27 as [0x40, 1, 0, 0x98] beside [0, 0, 0, 0x98] (#2862).
+    fn layer_hidden(&self, lc: &Chunk) -> bool {
+        self.modern_layer_flags(lc).is_some_and(|f| f[1] & 1 != 0)
     }
 
     /// A guides, grid or desktop layer (type byte not 0), or a page's
     /// entry for a layer of the master page (byte 2 set).
     fn is_structural_layer(&self, lc: &Chunk) -> bool {
-        matches!(self.flags(lc), Some(f) if f[3] == 0x98 && (f[0] != 0 || f[2] != 0))
+        let Some(f) = self.flags(lc).filter(|f| f[3] == 0x98) else {
+            return false;
+        };
+        let kind = self.layer_type(lc).unwrap_or(0);
+        kind != 0 || f[2] != 0
     }
 
     /// The `loda`/`lobj` chunk of a list: a direct child, or (version 16+,
@@ -4476,6 +4531,9 @@ impl<'a> Ctx<'a> {
         shape.keep_corner_size();
         shape.name = name;
         shape.opacity = opacity;
+        if let Some(style) = style_string.as_deref() {
+            crate::bitmap_effects::apply(style, self.v, &mut shape, &mut self.report);
+        }
         // Version 16+: the fill's winding (#1919): "1" fills nonzero.
         if style_string.as_deref().and_then(text::object_fill_winding) == Some(true) {
             shape.fill_rule = tracedraw_core::shaping::FillRule::NonZero;
@@ -4768,6 +4826,10 @@ impl<'a> Ctx<'a> {
                 let id = ids.shape();
                 match self.read_object(c, id, page_size) {
                     Some(mut shape) => {
+                        // Both the older hidden-object argument and the
+                        // modern flag apply to the whole object, also
+                        // when a crop or clip wraps it in a new shape.
+                        let visible = shape.visible && !self.shape_hidden(c);
                         if std::mem::take(&mut self.pending_renumber) {
                             renumber(&mut shape, ids);
                         }
@@ -4789,6 +4851,7 @@ impl<'a> Ctx<'a> {
                         if self.object_locked(c) {
                             shape.locked = true;
                         }
+                        shape.visible &= visible;
                         self.note_static_id(c, shape.id);
                         out.push(shape);
                     }
@@ -4797,8 +4860,10 @@ impl<'a> Ctx<'a> {
                     None => self.report.skipped_objects += 1,
                 }
             } else if c.is(b"grp ") {
+                let hidden = self.shape_hidden(c);
                 // A table (versions 14 on) is a group of cell groups.
-                if let Some(table) = self.read_table(c, ids, page_size) {
+                if let Some(mut table) = self.read_table(c, ids, page_size) {
+                    table.visible = !hidden;
                     self.note_static_id(c, table.id);
                     out.push(table);
                     continue;
@@ -4856,9 +4921,10 @@ impl<'a> Ctx<'a> {
                 let mask = self.group_pattern_transparency(c);
                 match children.len() {
                     0 => {}
-                    1 if mask.is_none() => out.extend(children),
+                    1 if mask.is_none() && !hidden => out.extend(children),
                     _ => {
                         let mut g = Shape::new(ids.shape(), ShapeKind::Group { children });
+                        g.visible = !hidden;
                         g.fill = Fill::None;
                         g.stroke = None;
                         if let Some(mask) = mask {
@@ -6522,6 +6588,7 @@ fn contour_effect(
         to_center: false,
         fill_to,
         outline_to,
+        fill_end_to: None,
         color_blend: 0,
         corners,
         accel_objects: 0.0,
@@ -7475,6 +7542,65 @@ fn spine_shift(width: f64, right: bool) -> f64 {
     }
 }
 
+/// What a break in the turns of a book's pages costs, in pages' worth of
+/// objects: more than one page whose objects reach across the spine can
+/// win (two breaks, in and out, cost three), less than the pages after a
+/// page the file lost or added, which all sit on the other side.
+const SIDE_BREAK: f64 = 1.5;
+
+/// The side of the spine each facing page sits on (true: right), from
+/// `shares`, each page's share of its objects that lands on it from the
+/// right and from the left. Pages take turns on the right and left, and
+/// the turns may break (two pages on one side running) where the pages
+/// after hold their objects better that way, each break costing
+/// [`SIDE_BREAK`]: the sides that put most objects on their pages for
+/// the fewest breaks (Viterbi's way through the pages). With no break
+/// worth it, this is the strict turns from the better start (#1660); a
+/// page the file lost or added in a long book no longer throws every
+/// page after it half a page across, onto the page beside it (#2833).
+/// On a tie the first page is on the right, and turns go on.
+fn facing_sides(shares: &[(f64, f64)]) -> Vec<bool> {
+    let n = shares.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // best[i][s]: the most score for pages 0..=i with page i on side s
+    // (0 right, 1 left); from[i][s]: page i - 1's side on that way.
+    let mut best = vec![[0.0f64; 2]; n];
+    let mut from = vec![[0usize; 2]; n];
+    let score = |i: usize, s: usize| if s == 0 { shares[i].0 } else { shares[i].1 };
+    // A tiny lean to the right for the first page and to taking turns,
+    // so equal ways keep the strict turns from the right.
+    const LEAN: f64 = 1e-9;
+    best[0] = [score(0, 0) + LEAN, score(0, 1)];
+    for i in 1..n {
+        for s in 0..2 {
+            let turn = best[i - 1][1 - s] + LEAN;
+            let stay = best[i - 1][s] - SIDE_BREAK;
+            let (b, f) = if turn >= stay {
+                (turn, 1 - s)
+            } else {
+                (stay, s)
+            };
+            best[i][s] = b + score(i, s);
+            from[i][s] = f;
+        }
+    }
+    let mut s = if best[n - 1][0] >= best[n - 1][1] {
+        0
+    } else {
+        1
+    };
+    let mut sides = vec![true; n];
+    for i in (0..n).rev() {
+        sides[i] = s == 0;
+        if i > 0 {
+            s = from[i][s];
+        }
+    }
+    sides
+}
+
 /// How many of the objects' centres moved `dx` across land on a page
 /// `width` across.
 fn centres_on_page(layers: &[Layer], width: f64, dx: f64) -> usize {
@@ -7509,23 +7635,38 @@ fn paragraph_spacing(style: &text::RunStyle, base: &ParagraphStyle) -> Paragraph
         2 => f * size_mm,
         _ => f * line_mm,
     };
+    // Points and the point size stay what they are: turned into a share
+    // of a line height taken as 1.15 times the size, they grew with the
+    // font's real line height, so a face whose lines are taller than
+    // that (1.41 times the size for some Tamil faces) set its lines
+    // about 1.23 times as far apart as the file (#2676).
+    const MM_PT: f64 = 72.0 / 25.4;
     if let Some(ls) = style.line_spacing {
-        let pct = match method {
-            1 | 2 if line_mm > 0.0 => to_mm(ls) / line_mm * 100.0,
-            _ => ls * 100.0,
-        };
-        p.leading_pct = pct.clamp(10.0, 1000.0);
-    } else if let Some(mm) = style.line_spacing_mm {
-        // A distance between baselines, as a share of the line height.
-        if line_mm > 0.0 {
-            p.leading_pct = (mm / line_mm * 100.0).clamp(10.0, 1000.0);
+        match method {
+            1 => {
+                p.leading_unit = LeadingUnit::Points;
+                p.leading_pct = (to_mm(ls) * MM_PT).clamp(0.1, 2000.0);
+            }
+            2 => {
+                p.leading_unit = LeadingUnit::PercentPointSize;
+                p.leading_pct = (ls * 100.0).clamp(10.0, 1000.0);
+            }
+            _ => {
+                p.leading_unit = LeadingUnit::PercentCharHeight;
+                p.leading_pct = (ls * 100.0).clamp(10.0, 1000.0);
+            }
         }
+    } else if let Some(mm) = style.line_spacing_mm {
+        // A distance between baselines (a version 12 interval entry of
+        // unit 1), in points for the same reason.
+        p.leading_unit = LeadingUnit::Points;
+        p.leading_pct = (mm * MM_PT).clamp(0.1, 2000.0);
     }
     // Space before: the distance from the paragraph before, so only what
     // goes past the line spacing is extra room (100 % of the character
     // height, the default, is none). Space after: all extra room.
     if method <= 2 {
-        let baseline_mm = line_mm * p.leading_pct / 100.0;
+        let baseline_mm = p.line_step(line_mm, size_mm);
         if let Some(b) = style.para_before {
             let before = match method {
                 0 => (b - 1.0) * line_mm,
@@ -7676,9 +7817,13 @@ pub(crate) mod tests {
         );
         let p = paragraph_spacing(&st, &ParagraphStyle::default());
         let size_mm = st.size_pt.expect("size") * 25.4 / 72.0;
-        let line_mm = size_mm * 1.15;
-        let baseline = line_mm * p.leading_pct / 100.0;
-        assert!((baseline - 3.5277).abs() < 1e-6, "{p:?}");
+        // Points stay points, whatever the face's own line height
+        // (#2676: a tall face set the lines further apart than the file).
+        assert_eq!(p.leading_unit, LeadingUnit::Points);
+        for line_height in [size_mm * 1.15, size_mm * 1.41] {
+            let baseline = p.line_step(line_height, size_mm);
+            assert!((baseline - 3.5277).abs() < 1e-6, "{p:?}");
+        }
         assert!((p.space_before - (6.2603 - 3.5277)).abs() < 1e-6, "{p:?}");
         assert!((p.space_after - 0.2118).abs() < 1e-6, "{p:?}");
         // In the point size: 1.2 times the size between baselines.
@@ -7687,8 +7832,11 @@ pub(crate) mod tests {
         );
         let p = paragraph_spacing(&pt, &ParagraphStyle::default());
         let size_mm = pt.size_pt.expect("size") * 25.4 / 72.0;
-        let baseline = size_mm * 1.15 * p.leading_pct / 100.0;
-        assert!((baseline - 1.2 * size_mm).abs() < 1e-6, "{p:?}");
+        assert_eq!(p.leading_unit, LeadingUnit::PercentPointSize);
+        for line_height in [size_mm * 1.15, size_mm * 1.41] {
+            let baseline = p.line_step(line_height, size_mm);
+            assert!((baseline - 1.2 * size_mm).abs() < 1e-6, "{p:?}");
+        }
     }
     use tracedraw_core::geometry::Shape as _;
 
@@ -9454,6 +9602,81 @@ pub(crate) mod tests {
         assert!(!doc.metadata.facing_pages);
         let x0 = doc.pages[1].layers[0].shapes[0].bounds().x0;
         assert!((x0 - 50.0).abs() < 1e-6, "{x0}");
+    }
+
+    /// The sides of facing pages: strict turns from the better start,
+    /// one page whose objects reach across the spine does not break them,
+    /// and a run of pages that all sit the other way (after a page the
+    /// file lost or added) does, once (#2833).
+    #[test]
+    fn facing_sides_take_turns_and_follow_a_lost_page() {
+        let r = (1.0, 0.0);
+        let l = (0.0, 1.0);
+        let e = (0.0, 0.0);
+        assert_eq!(facing_sides(&[r, l, r, l]), vec![true, false, true, false]);
+        assert_eq!(facing_sides(&[l, r, l]), vec![false, true, false]);
+        // Nothing to go by: from the right.
+        assert_eq!(facing_sides(&[e, e, e]), vec![true, false, true]);
+        // Page 3 reads the wrong way: it keeps its turn.
+        assert_eq!(
+            facing_sides(&[r, l, l, l, r, l]),
+            vec![true, false, true, false, true, false]
+        );
+        // From page 4 every page sits the other way: one break.
+        assert_eq!(
+            facing_sides(&[r, l, r, r, l, r, l]),
+            vec![true, false, true, true, false, true, false]
+        );
+    }
+
+    /// A book of 300 facing pages (#2833, a 1 GB file of almost 300
+    /// pages whose pages overlapped): from page 151 on, the pages sit on
+    /// the other side of the spine than strict turns from the first page
+    /// give, as when the file holds one page more or less there. Every
+    /// page's object lands on its own page; page 11, whose object reads
+    /// from the wrong side, keeps its turn.
+    #[test]
+    fn a_long_book_whose_turns_break_keeps_every_page_on_its_side() {
+        // A 25.4 mm square from the spine, to the right or the left.
+        let page = |right: bool| {
+            let w = if right { 254000.0 } else { -254000.0 };
+            let mut c = f64s(&[w, 127000.0]);
+            c.extend_from_slice(&f64s(&[1.0, 1.0]));
+            c.push(0);
+            c.extend_from_slice(&[0; 7]);
+            for gap in [16usize, 16, 16, 0] {
+                c.extend_from_slice(&f64s(&[0.0]));
+                c.extend_from_slice(&vec![0u8; gap]);
+            }
+            list(
+                b"page",
+                &list(
+                    b"layr",
+                    &list(
+                        b"obj ",
+                        &chunk(b"loda", &loda(OBJ_RECT, &[(ARG_COORDS, c)])),
+                    ),
+                ),
+            )
+        };
+        let true_side = |i: usize| if i < 150 { i % 2 == 0 } else { i % 2 == 1 };
+        let mut m = mcfg(21, 1_000_000, 1_500_000);
+        m.resize(32, 0);
+        m[26] = 1;
+        let mut body = chunk(b"mcfg", &m);
+        for i in 0..300 {
+            // Page 11's object is drawn from the other side.
+            let right = if i == 10 { !true_side(i) } else { true_side(i) };
+            body.extend_from_slice(&page(right));
+        }
+        let (doc, rep) = parse(&riff(b"CDRL", &body), 21);
+        assert_eq!(doc.pages.len(), 300, "{:?}", rep.warnings);
+        assert!(doc.metadata.facing_pages);
+        for (i, p) in doc.pages.iter().enumerate() {
+            let b = p.layers[0].shapes[0].bounds();
+            let on = b.x0 >= -1e-6 && b.x1 <= 100.0 + 1e-6;
+            assert_eq!(on, i != 10, "page {}: {:?}", i + 1, b);
+        }
     }
 
     #[test]
@@ -12304,7 +12527,9 @@ pub(crate) mod tests {
                 assert_eq!(*align, TextAlign::Center);
                 assert!((para.char_spacing_pct + 10.0).abs() < 1e-9, "{para:?}");
                 assert_eq!(spans[0].tracking_pct, 0.0);
-                assert!((para.leading_pct - 150.0).abs() < 1e-6, "{para:?}");
+                // The distance in points: 1.5 times 1.15 times 36 pt.
+                assert_eq!(para.leading_unit, LeadingUnit::Points);
+                assert!((para.leading_pct - 36.0 * 1.15 * 1.5).abs() < 1e-3, "{para:?}");
             }
             other => panic!("{other:?}"),
         }

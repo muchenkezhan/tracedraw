@@ -325,6 +325,12 @@ pub struct Settings {
     /// theme's icon colour.
     #[serde(default)]
     pub colored_icons: bool,
+    /// Appearance: the panel tabs at the window's sides show their
+    /// pictures alone, the name in the tab's tip. Off (the default) they
+    /// show the picture and the name, the column sliding when the tabs
+    /// do not fit (#2902).
+    #[serde(default)]
+    pub docker_tabs_icons_only: bool,
     /// Customization > Appearance > Theme: "light", "medium_light",
     /// "medium_dark" or "dark".
     #[serde(default)]
@@ -369,6 +375,10 @@ pub struct Settings {
     /// where there is a touch screen (#1996).
     #[serde(default = "default_true")]
     pub touch_keys: bool,
+    /// Options > Display: the touch bars beside the selection, where
+    /// there is a touch screen (#1691).
+    #[serde(default = "default_true")]
+    pub touch_selection_bar: bool,
     #[serde(default = "default_true")]
     pub preview_page_border: bool,
     /// Options > Edit: Ctrl constrains rotation and line angles to
@@ -433,6 +443,35 @@ pub struct Settings {
     /// touches (off by default; Alt does it either way round).
     #[serde(default)]
     pub marquee_touching: bool,
+    /// Options > Tools > Pick, Ctrl and Shift keys: off (Traditional,
+    /// the default) Ctrl constrains and Shift works from the centre; on
+    /// (Windows standard) Shift constrains and Ctrl held when a move is
+    /// let go leaves the original, a copy taking the new place (#1436).
+    #[serde(default)]
+    pub pick_windows_keys: bool,
+    /// Options > Tools > Eraser: the curves the Eraser leaves lose the
+    /// nodes they do not need (#1436).
+    #[serde(default)]
+    pub eraser_reduce_nodes: bool,
+    /// Options > Tools > Ellipse: new pies and arcs run clockwise from
+    /// the starting to the ending angle (#1436). The tool's stored arc is
+    /// always counterclockwise; with this on its angles are the other
+    /// way round.
+    #[serde(default)]
+    pub ellipse_clockwise: bool,
+    /// Options > Tools > Spiral and the property bar: how fast a
+    /// logarithmic spiral widens, 1 (almost even) to 100 (#1436).
+    #[serde(default = "default_spiral_expansion")]
+    pub spiral_expansion: u32,
+    /// Options > Tools > Angular Dimension: the decimals, degree sign,
+    /// prefix and suffix new angular dimensions take (#1436).
+    pub angular_dimension: crate::dimensions::AngularDefaults,
+    /// Options > Tools > Connector: an object's own nodes are anchors
+    /// too, besides its side midpoints and custom anchors (#1436).
+    pub connector_geometric_anchors: bool,
+    /// Options > Tools > Connector: how far new right-angle connectors
+    /// run straight out of an object before they turn, mm (#1436).
+    pub connector_gap: f64,
     /// The one-time changes already made to preferences saved by older
     /// versions (see `Settings::upgrade`); 0 in files that predate them.
     #[serde(default)]
@@ -662,6 +701,14 @@ pub struct Settings {
     /// or write (see `behavior/script-filters.md`).
     #[serde(default)]
     pub script_filters: Vec<crate::scripting::ScriptFilter>,
+    /// The plugins of Tools > Plugins, on or off (#1802, see
+    /// `behavior/plugins.md`).
+    #[serde(default)]
+    pub plugins: Vec<crate::scripting::Plugin>,
+    /// Minimize, Maximize and Close at the right end of the menu bar,
+    /// for windows without the desktop's title bar (#2574).
+    #[serde(default)]
+    pub window_buttons: bool,
     /// File > GitHub's last repository, branch, path (and the token, when
     /// the user asked to remember it).
     #[serde(default)]
@@ -813,6 +860,10 @@ const UPGRADES: u32 = 8;
 
 fn default_outline_units() -> String {
     "pt".into()
+}
+
+fn default_spiral_expansion() -> u32 {
+    100
 }
 
 fn default_true() -> bool {
@@ -1251,6 +1302,12 @@ pub struct PalettePrefs {
     /// [`SWATCH_STEP`] a notch. Preferences written before it existed
     /// keep the 20 px swatches.
     pub swatch_size: u8,
+    /// The side of a swatch of the document palette row, as
+    /// [`Self::swatch_size`] and set the same ways over that row, so
+    /// Ctrl+wheel over one palette leaves the other's size alone
+    /// (#2900). 0 (preferences written before it existed): the default
+    /// palette's, until either is sized.
+    pub document_swatch_size: u8,
     /// The room asked for the floating palette's swatches (points, the
     /// title left out): its rows or columns flow from it (see
     /// `ui::palette::floating_flow`).
@@ -1286,6 +1343,15 @@ impl PalettePrefs {
     /// [`Self::swatch_size`] brought into its range, as points.
     pub fn swatch_size(&self) -> f32 {
         f32::from(self.swatch_size.clamp(SWATCH_MIN, SWATCH_MAX))
+    }
+
+    /// The document palette row's swatch side setting: its own, or the
+    /// default palette's while it has none.
+    pub fn document_swatch(&self) -> u8 {
+        match self.document_swatch_size {
+            0 => self.swatch_size,
+            s => s,
+        }
     }
 }
 
@@ -1457,6 +1523,7 @@ impl Default for PalettePrefs {
             show_palette: true,
             rows: 1,
             swatch_size: SWATCH_DEFAULT,
+            document_swatch_size: 0,
             float_size: FLOAT_SIZE,
         }
     }
@@ -2016,6 +2083,7 @@ impl Default for Settings {
             hide_bbox_curve_tools: false,
             node_tracking: false,
             touch_keys: true,
+            touch_selection_bar: true,
             preview_page_border: true,
             constrain_angle: default_constrain_angle(),
             symmetry_show_lines: true,
@@ -2034,6 +2102,13 @@ impl Default for Settings {
             follow_text_size: true,
             follow_high_contrast: true,
             marquee_touching: false,
+            pick_windows_keys: false,
+            eraser_reduce_nodes: false,
+            ellipse_clockwise: false,
+            spiral_expansion: 100,
+            angular_dimension: Default::default(),
+            connector_geometric_anchors: false,
+            connector_gap: 0.0,
             upgrades: UPGRADES,
             crosshair_cursor: false,
             screen_ppi: default_screen_ppi(),
@@ -2079,6 +2154,7 @@ impl Default for Settings {
             center_dialogs: true,
             ui_shadows: true,
             colored_icons: false,
+            docker_tabs_icons_only: false,
             theme: String::new(),
             bars: crate::ui::bars::BarLayout::default(),
             bar_items: Default::default(),
@@ -2123,6 +2199,8 @@ impl Default for Settings {
             skipped_update: String::new(),
             pending_update: String::new(),
             script_filters: Vec::new(),
+            plugins: Vec::new(),
+            window_buttons: false,
             github: Default::default(),
             tracing: Default::default(),
             warnings: Default::default(),

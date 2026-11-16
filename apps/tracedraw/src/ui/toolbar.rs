@@ -193,6 +193,16 @@ fn zoom_level_menu(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// A zoom level as the zoom box shows it: whole percents, with a decimal
+/// below 10% so a small zoom never reads 0%.
+fn zoom_label(percent: f32) -> String {
+    if percent < 9.95 {
+        format!("{percent:.1}%")
+    } else {
+        format!("{percent:.0}%")
+    }
+}
+
 /// The zoom box: the zoom level as text (type a value and press Enter)
 /// and the list of levels behind its arrow.
 pub(crate) fn zoom_box_pub(app: &mut App, ui: &mut Ui, id: &str, width: f32) {
@@ -201,9 +211,16 @@ pub(crate) fn zoom_box_pub(app: &mut App, ui: &mut Ui, id: &str, width: f32) {
 
 fn zoom_box(app: &mut App, ui: &mut Ui, id: &str, width: f32) {
     let edit_id = egui::Id::new((id, "text"));
+    let typed_id = egui::Id::new((id, "typed"));
     let stored = ui.data(|d| d.get_temp::<String>(edit_id));
     let fresh = stored.is_none();
-    let mut text = stored.unwrap_or_else(|| format!("{:.0}%", app.zoom_percent()));
+    // Until something is typed the box follows the zoom, even while it
+    // has the focus: a level it showed when clicked stayed there while
+    // the wheel zoomed on, and was put back when the box let go (#2898).
+    let typed = ui.data(|d| d.get_temp::<bool>(typed_id)).unwrap_or(false);
+    let mut text = stored
+        .filter(|_| typed)
+        .unwrap_or_else(|| zoom_label(app.zoom_percent()));
     let field = egui::Frame::new()
         .fill(crate::theme::Tokens::field())
         .stroke(egui::Stroke::new(1.0, Tokens::control_border()))
@@ -223,12 +240,19 @@ fn zoom_box(app: &mut App, ui: &mut Ui, id: &str, width: f32) {
                 );
                 // Typed over, not into: "64" in "58%" was "5864%" (#1329).
                 crate::ui::field::select_all_when_focused(ui, &r, fresh, &text);
+                if r.changed() {
+                    ui.data_mut(|d| d.insert_temp(typed_id, true));
+                }
+                let typed = typed || r.changed();
                 if r.has_focus() {
                     ui.data_mut(|d| d.insert_temp(edit_id, text.clone()));
                 } else {
-                    ui.data_mut(|d| d.remove::<String>(edit_id));
+                    ui.data_mut(|d| {
+                        d.remove::<String>(edit_id);
+                        d.remove::<bool>(typed_id);
+                    });
                 }
-                if r.lost_focus() {
+                if r.lost_focus() && typed {
                     // Sums and products too, as in the number fields (#1495).
                     if let Some(v) = crate::ui::field::parse(&text, None) {
                         if v > 0.0 {
@@ -1126,6 +1150,47 @@ pub fn transform_toolbar(app: &mut App, ui: &mut Ui) {
 
 /// A dim label and the control `add` draws after it, both showing the
 /// tip of `key`: the label's text in bold and the `key_desc` description.
+/// The Speech Balloon tool's bar (#2179): the style, then the tail's
+/// width and bend. It shows the selected balloon's settings, and a change
+/// goes to the selected balloons and the ones drawn next.
+fn balloon_bar(app: &mut App, ui: &mut Ui) {
+    use crate::balloons::BalloonStyle;
+    let shown = app
+        .selected_balloons()
+        .first()
+        .map(|(_, b, _)| (b.style, b.width, b.bend))
+        .unwrap_or((app.balloon_style, app.balloon_width, app.balloon_bend));
+    for style in BalloonStyle::ALL {
+        if ui
+            .selectable_label(shown.0 == style, tr(style.key()))
+            .rich_tip(crate::ui::tips::keyed(style.key()))
+            .clicked()
+        {
+            app.set_balloon_settings(|s, _, _| *s = style);
+        }
+    }
+    let mut width = shown.1;
+    if dim_labelled(ui, "balloon.tail_width", |ui| {
+        ui.add(
+            crate::ui::field::NumField::new(&mut width)
+                .range(5.0..=100.0)
+                .suffix(" %"),
+        )
+    })
+    .changed()
+    {
+        app.set_balloon_settings(|_, w, _| *w = width);
+    }
+    let mut bend = shown.2;
+    if dim_labelled(ui, "balloon.tail_bend", |ui| {
+        ui.add(crate::ui::field::NumField::new(&mut bend).range(-100.0..=100.0))
+    })
+    .changed()
+    {
+        app.set_balloon_settings(|_, _, b| *b = bend);
+    }
+}
+
 pub(crate) fn dim_labelled<R>(ui: &mut Ui, key: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     dim_labelled_as(ui, key, &format!("{key}_desc"), add)
 }
@@ -1632,6 +1697,15 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
                 {
                     app.spiral_logarithmic = true;
                 }
+                if app.spiral_logarithmic {
+                    // How fast it widens (#1436).
+                    dim_labelled(ui, "toolbar.spiral_expansion", |ui| {
+                        ui.add(
+                            crate::ui::field::NumField::new(&mut app.settings.spiral_expansion)
+                                .range(1..=100),
+                        )
+                    });
+                }
             }
             Tool::GraphPaper => {
                 dim_labelled(ui, "toolbar.rows", |ui| {
@@ -1643,6 +1717,7 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
             }
             Tool::ActionLines => action_lines_bar(app, ui),
             Tool::CommonShapes => common_shapes_bar(app, ui),
+            Tool::Balloon => balloon_bar(app, ui),
             Tool::Table => crate::ui::table_bar::table_bar(app, ui, true),
             Tool::PainterlyBrush => crate::painterly_tool::painterly_bar(app, ui),
             Tool::BrushStrokes => brush_strokes_bar(app, ui),

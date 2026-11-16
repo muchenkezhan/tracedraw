@@ -614,6 +614,7 @@ impl App {
                 // The page's picture is kept from the drag's first step
                 // (#1259); a handle drag has no `begun` of its own.
                 self.node_drag_shown = None;
+                self.choose_handle((shape, index, which));
                 self.drag = Drag::Handle {
                     shape,
                     index,
@@ -945,6 +946,11 @@ impl App {
         }
 
         if response.clicked_by(PointerButton::Primary) {
+            // A click anywhere but on a handle lets go of the chosen
+            // handle (below, a click on one chooses it again).
+            if self.ctrl_handle_at(p).is_none() {
+                self.chosen_handle = None;
+            }
             // Ctrl+click on a corner widget chooses its corner, or takes
             // it out, so one or several corners round together.
             if self.settings.nodes.corner_one_at_a_time && mods.command && !mods.shift {
@@ -994,7 +1000,10 @@ impl App {
             // handle can be dragged next; the segment under it is not
             // taken instead (#639). A node comes first, so a handle lying
             // on its node never swallows a click on the node.
-            if self.ctrl_handle_at(p).is_some() {
+            // The handle is chosen: the arrow keys then move it, not its
+            // node (#2819).
+            if let Some(key) = self.ctrl_handle_at(p) {
+                self.choose_handle(key);
                 return;
             }
             // A plain click on a corner widget chooses its corner alone:
@@ -1367,6 +1376,62 @@ impl App {
         if !cmds.is_empty() {
             let _ = self.engine.run_batch("Align Nodes", &cmds);
         }
+        true
+    }
+
+    /// Choose control handle `key`, with the nodes chosen now (#2819).
+    fn choose_handle(&mut self, key: (ShapeId, usize, Which)) {
+        self.chosen_handle = Some((key, self.node_selection.clone()));
+    }
+
+    /// Where control handle `key` is, on the page.
+    fn handle_point(&self, (id, index, which): (ShapeId, usize, Which)) -> Option<Point> {
+        let (path, _, t) = self.path_of(id)?;
+        let n = nodes::nodes(&path).into_iter().find(|n| n.index == index)?;
+        let c = match which {
+            Which::In => n.ctrl_in,
+            Which::Out => n.ctrl_out,
+        }?;
+        Some(t * c)
+    }
+
+    /// The control handle chosen by a click or a drag on it, while the
+    /// Shape tool is on and the nodes chosen then still are (#2819):
+    /// the arrow keys move it.
+    pub(crate) fn chosen_handle(&self) -> Option<(ShapeId, usize, Which)> {
+        let (key, chosen_nodes) = self.chosen_handle.as_ref()?;
+        (self.tool == crate::tools::Tool::Shape && *chosen_nodes == self.node_selection)
+            .then_some(*key)
+            .filter(|k| self.handle_point(*k).is_some())
+    }
+
+    /// Where the chosen control handle is, on the page (drawn ringed).
+    pub(crate) fn chosen_handle_point(&self) -> Option<Point> {
+        self.handle_point(self.chosen_handle()?)
+    }
+
+    /// Move the chosen control handle by `d` (page millimetres), one undo
+    /// step: the arrow keys with the Shape tool. A smooth or symmetrical
+    /// node's other handle follows, as in a drag. False when no handle
+    /// is chosen (the chosen nodes move instead).
+    pub fn nudge_chosen_handle(&mut self, d: Vec2) -> bool {
+        let Some(key) = self.chosen_handle() else {
+            return false;
+        };
+        let (id, index, which) = key;
+        let (Some((path, closed, t)), Some(at)) = (self.path_of(id), self.handle_point(key)) else {
+            return false;
+        };
+        let lp = t.inverse() * (at + d);
+        let ty = self.node_type_of(id, index);
+        let np = nodes::move_handle(&path, index, which, lp, ty);
+        let _ = self.engine.run_with_label(
+            &Command::SetShapeKind {
+                shape: id,
+                kind: ShapeKind::Path { path: np, closed },
+            },
+            "Nudge Handle",
+        );
         true
     }
 
@@ -2045,8 +2110,17 @@ impl App {
     /// pressure gives at each place (#883), from a fifth of the width at
     /// the lightest touch.
     pub fn eraser_band(&self, points: &[Point]) -> tracedraw_core::geometry::BezPath {
-        let even =
-            || tracedraw_core::shaping::stroke_band(points, self.eraser_width, self.eraser_square);
+        // The hand's shake, about two screen pixels, is smoothed away
+        // so the edge left is smooth and has few nodes (#2831).
+        let steady = 2.0 / f64::from(self.view.zoom.max(1e-3));
+        let even = || {
+            tracedraw_core::shaping::eraser_band(
+                points,
+                self.eraser_width,
+                self.eraser_square,
+                steady,
+            )
+        };
         if self.eraser_square || points.len() < 2 {
             return even();
         }
@@ -2138,6 +2212,17 @@ impl App {
                 deleted.push(s.id);
                 continue;
             }
+            // Auto-reduce nodes (Options > Tools > Eraser, #1436): the
+            // nodes the nib's edge left that the shape does not need go,
+            // the curve staying within 2% of the nib's width.
+            let remaining = if self.settings.eraser_reduce_nodes {
+                tracedraw_core::nodes::reduce_nodes(
+                    &remaining,
+                    (self.eraser_width * 0.02).max(0.005),
+                )
+            } else {
+                remaining
+            };
             let local = s.transform.inverse() * remaining;
             cmds.push(Command::SetShapeKind {
                 shape: s.id,
@@ -2345,6 +2430,40 @@ mod eraser_tests {
         assert!(app.doc().find_shape(id).is_none());
     }
 
+    /// A shaky drag of the Eraser across an ellipse (#2831): the cut edges
+    /// are smooth and the ellipse keeps few nodes, its own curves outside
+    /// the band untouched.
+    #[test]
+    fn a_shaky_eraser_drag_leaves_a_smooth_edge_with_few_nodes() {
+        let mut app = App::headless();
+        let id = app
+            .new_shape(ShapeKind::Ellipse {
+                rect: Rect::new(0.0, 0.0, 60.0, 40.0),
+                arc: None,
+            })
+            .unwrap();
+        app.select(vec![id]);
+        app.eraser_width = 6.0;
+        app.view.zoom = 4.0;
+        let points: Vec<Point> = (0..=400)
+            .map(|i| {
+                let x = -5.0 + i as f64 * 0.175;
+                Point::new(x, 20.0 + 0.2 * ((i as f64) * 1.9).sin())
+            })
+            .collect();
+        app.erase_along(&points);
+        let s = app.doc().find_shape(id).unwrap();
+        let ShapeKind::Path { path, .. } = &s.kind else {
+            panic!("{:?}", s.kind);
+        };
+        let n = path.elements().len();
+        assert!(n <= 20, "{n} nodes");
+        assert!(path
+            .elements()
+            .iter()
+            .any(|e| matches!(e, tracedraw_core::geometry::PathEl::CurveTo(..))));
+    }
+
     /// A 40 mm square clip frame holding a 30 mm square, moved 10 mm right.
     fn clip_frame(app: &mut App) -> ShapeId {
         let frame = app
@@ -2449,6 +2568,34 @@ mod eraser_tests {
         app.erase_along(&[Point::new(10.0, 20.0), Point::new(50.0, 20.0)]);
         assert!(app.doc().find_shape(id).is_none());
         assert!(app.selection.is_empty());
+    }
+
+    /// Options > Tools > Eraser, "Auto-reduce nodes": what a round nib
+    /// leaves keeps fewer nodes (#1436).
+    #[test]
+    fn auto_reduce_leaves_fewer_nodes() {
+        let nodes = |reduce: bool| {
+            let mut app = App::headless();
+            app.settings.eraser_reduce_nodes = reduce;
+            let id = app
+                .new_shape(ShapeKind::Rect {
+                    rect: Rect::new(0.0, 0.0, 40.0, 20.0),
+                    radius: 0.0,
+                    corners: None,
+                })
+                .unwrap();
+            app.select(vec![id]);
+            app.eraser_width = 10.0;
+            app.eraser_square = false;
+            let stroke: Vec<Point> = (0..=20)
+                .map(|i| Point::new(f64::from(i) * 2.0, 20.0 + (f64::from(i) * 0.7).sin() * 2.0))
+                .collect();
+            app.erase_along(&stroke);
+            let s = app.doc().find_shape(id).unwrap();
+            s.page_path().elements().len()
+        };
+        let (plain, reduced) = (nodes(false), nodes(true));
+        assert!(reduced < plain, "{reduced} < {plain}");
     }
 }
 

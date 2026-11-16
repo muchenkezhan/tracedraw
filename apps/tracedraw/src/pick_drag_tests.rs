@@ -13,6 +13,9 @@ use egui::{Event, Modifiers, PointerButton, Pos2};
 use tracedraw_core::geometry::{Affine, Point, Rect, Vec2};
 use tracedraw_core::{ShapeId, ShapeKind};
 
+#[path = "field_focus_tests.rs"]
+mod field_focus_tests;
+
 fn frame(ctx: &egui::Context, app: &mut App, events: Vec<Event>, modifiers: Modifiers) {
     // The keys held come first, as the windowing layer sends them.
     let mut all = vec![Event::ModifiersChanged(modifiers)];
@@ -1587,6 +1590,95 @@ fn click_at(ctx: &egui::Context, app: &mut App, at: Pos2, mods: Modifiers) {
     for _ in 0..20 {
         frame(ctx, app, Vec::new(), mods);
     }
+}
+
+/// #2897: the Attributes Eyedropper takes the source's attributes and
+/// gives them to every target clicked, also when the pointer moves a
+/// little while the button is down (a pen or a shaky hand) or the
+/// button is held a moment: such a click was a drag or a long press to
+/// the window, and nothing was sampled or applied.
+#[test]
+fn the_attributes_eyedropper_applies_on_every_click() {
+    use tracedraw_core::{Color, Fill};
+    let (ctx, mut app, src) = setup();
+    let red = Fill::Solid(Color::rgb8(200, 30, 30));
+    let blue = Fill::Solid(Color::rgb8(20, 40, 220));
+    let mut targets = Vec::new();
+    for x in [80.0, 140.0, 200.0] {
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(x, 10.0, x + 40.0, 40.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.run(tracedraw_core::Command::SetFill {
+            shapes: vec![id],
+            fill: blue.clone(),
+        });
+        targets.push(id);
+    }
+    app.select(Vec::new());
+    app.choose_tool(Tool::AttributesEyedropper);
+    let none = Modifiers::NONE;
+    let fill_of = |app: &App, id| app.doc().find_shape(id).expect("shape").fill.clone();
+    let centre = |app: &App, id| app.view.to_screen(bounds(app, id).center());
+    // A wobbly press on the source samples it.
+    let at = centre(&app, src);
+    drag(
+        &ctx,
+        &mut app,
+        at,
+        at + egui::vec2(9.0, 7.0),
+        none,
+        Vec::new(),
+    );
+    for _ in 0..20 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    assert!(app.eyedropper_attrs.is_some(), "sampled");
+    assert!(app.eyedropper_apply);
+    // A wobbly press on the first target applies.
+    let at = centre(&app, targets[0]);
+    drag(
+        &ctx,
+        &mut app,
+        at,
+        at + egui::vec2(-8.0, 10.0),
+        none,
+        Vec::new(),
+    );
+    for _ in 0..20 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    assert_eq!(fill_of(&app, targets[0]), red, "the wobbly click");
+    // A press held for a second on the second target applies.
+    let at = centre(&app, targets[1]);
+    frame(&ctx, &mut app, vec![Event::PointerMoved(at)], none);
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(at, true, PointerButton::Primary, none)],
+        none,
+    );
+    for _ in 0..60 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(at, false, PointerButton::Primary, none)],
+        none,
+    );
+    for _ in 0..20 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    assert_eq!(fill_of(&app, targets[1]), red, "the long click");
+    // A plain click on the third applies, and the tool stays applying.
+    let at = centre(&app, targets[2]);
+    click_at(&ctx, &mut app, at, none);
+    assert_eq!(fill_of(&app, targets[2]), red, "the plain click");
+    assert!(app.eyedropper_apply);
 }
 
 fn last_path(app: &App) -> tracedraw_core::BezPath {
@@ -18915,7 +19007,8 @@ fn trace_ok_is_at_the_right_and_best_optimization_sets_the_detail() {
     let st = trace_state(&app);
     assert!(!st.settings.optimize);
     assert!(
-        [50.0, 60.0, 70.0, 80.0, 85.0].contains(&st.settings.detail),
+        // The details the search tries, and the one it started from.
+        [50.0, 60.0, 70.0, 75.0, 80.0, 90.0, 95.0].contains(&st.settings.detail),
         "{}",
         st.settings.detail
     );
@@ -21324,6 +21417,7 @@ fn repeat_turns_copies_about_the_moved_centre_of_rotation() {
     let centre = |app: &App, id: ShapeId| bounds(app, id).center();
     let start = centre(&app, id);
     let radius = (start - pivot).hypot();
+    app.rotate_mode = true;
     app.copy_selection_by(turn(30.0));
     let mut ids = vec![id, app.selection[0]];
     assert_eq!(
@@ -21331,10 +21425,12 @@ fn repeat_turns_copies_about_the_moved_centre_of_rotation() {
         Some(pivot),
         "the copy keeps the centre"
     );
+    assert!(app.rotate_mode, "the copy stays in rotate mode");
     for _ in 0..4 {
         app.repeat_last();
         ids.push(app.selection[0]);
     }
+    assert!(app.rotate_mode, "and so do its repeats");
     assert_eq!(shape_count(&app), 6);
     for (i, s) in ids.iter().enumerate() {
         let want = turn(30.0 * i as f64) * start;
@@ -28312,4 +28408,249 @@ fn pen_pressure_reaches_painterly_sketch_brushes_and_eraser() {
     }
     let light = app.eraser_band(&points).area().abs();
     assert!(light > 0.0 && light < even * 0.6, "{light} vs {even}");
+}
+
+/// #2819: a click on a node's control handle with the Shape tool
+/// chooses the handle, and the arrow keys then move that handle, not
+/// the node (each press one undo step). A click elsewhere lets go of it
+/// and the arrows move the node again. The handle still drags with the
+/// mouse, and a dragged handle is the chosen one.
+#[test]
+fn a_clicked_handle_moves_with_the_arrow_keys() {
+    use tracedraw_core::geometry::BezPath;
+    let (ctx, mut app, _) = setup();
+    let mut p = BezPath::new();
+    p.move_to((20.0, 20.0));
+    p.curve_to((30.0, 40.0), (50.0, 40.0), (60.0, 20.0));
+    let curve = app
+        .new_shape(ShapeKind::Path {
+            path: p,
+            closed: false,
+        })
+        .expect("curve");
+    app.select(vec![curve]);
+    app.set_tool(Tool::Shape);
+    for _ in 0..3 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    let path = |app: &App| match &app.doc().find_shape(curve).expect("curve").kind {
+        ShapeKind::Path { path, .. } => path.clone(),
+        k => panic!("{k:?}"),
+    };
+    let ctrl1 = |app: &App| match path(app).elements()[1] {
+        tracedraw_core::geometry::PathEl::CurveTo(c1, _, _) => c1,
+        e => panic!("{e:?}"),
+    };
+    let start = |app: &App| match path(app).elements()[0] {
+        tracedraw_core::geometry::PathEl::MoveTo(q) => q,
+        e => panic!("{e:?}"),
+    };
+    // Choose the first node, then click its outgoing handle at (30, 40).
+    let node = app.view.to_screen(Point::new(20.0, 20.0));
+    click_at(&ctx, &mut app, node, Modifiers::NONE);
+    assert_eq!(app.node_selection, vec![(curve, 0)]);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let handle = app.view.to_screen(Point::new(30.0, 40.0));
+    click_at(&ctx, &mut app, handle, Modifiers::NONE);
+    assert_eq!(
+        app.node_selection,
+        vec![(curve, 0)],
+        "the node stays chosen"
+    );
+    assert!(app.chosen_handle().is_some(), "the handle is chosen");
+    let press = |app: &mut App, k: egui::Key| {
+        frame(&ctx, app, vec![key(k, Modifiers::NONE)], Modifiers::NONE);
+        frame(&ctx, app, vec![key_up(k, Modifiers::NONE)], Modifiers::NONE);
+    };
+    let step = app.nudge_mm;
+    press(&mut app, egui::Key::ArrowRight);
+    press(&mut app, egui::Key::ArrowUp);
+    let c = ctrl1(&app);
+    assert!(
+        (c.x - (30.0 + step)).abs() < 1e-6 && (c.y - (40.0 + step)).abs() < 1e-6,
+        "{c:?}"
+    );
+    assert!(
+        (start(&app) - Point::new(20.0, 20.0)).hypot() < 1e-9,
+        "the node stays"
+    );
+    let steps = app.engine.history_labels().0;
+    assert_eq!(
+        steps.iter().filter(|l| **l == "Nudge Handle").count(),
+        2,
+        "{steps:?}"
+    );
+    // A click on the node: the arrows move the node (and its handle).
+    let node = app.view.to_screen(Point::new(20.0, 20.0));
+    click_at(&ctx, &mut app, node, Modifiers::NONE);
+    assert!(app.chosen_handle().is_none());
+    press(&mut app, egui::Key::ArrowRight);
+    assert!(
+        (start(&app) - Point::new(20.0 + step, 20.0)).hypot() < 1e-6,
+        "{:?}",
+        start(&app)
+    );
+}
+
+/// Options > Tools > Pick, "Ctrl and Shift keys", Windows standard
+/// (#1436): Ctrl held as a move is dropped leaves the original (the moved
+/// one is a copy) and does not keep the move straight; Shift still does.
+#[test]
+fn windows_keys_ctrl_drops_a_copy_and_shift_keeps_straight() {
+    let (ctx, mut app, id) = setup();
+    app.settings.pick_windows_keys = true;
+    let from = app.view.to_screen(Point::new(35.0, 25.0));
+    drag(
+        &ctx,
+        &mut app,
+        from,
+        from + egui::vec2(120.0, 60.0),
+        Modifiers::CTRL,
+        Vec::new(),
+    );
+    assert_eq!(shape_count(&app), 2, "a copy");
+    assert!(close(bounds(&app, id).x0, 10.0), "the original stays");
+    let copy = app.selection.first().copied().expect("copy");
+    assert_ne!(copy, id);
+    let b = bounds(&app, copy);
+    assert!(b.x0 > 15.0 && !close(b.y0, 10.0), "moved both ways: {b:?}");
+    // Shift keeps it straight.
+    let from = app.view.to_screen(b.center());
+    drag(
+        &ctx,
+        &mut app,
+        from,
+        from + egui::vec2(120.0, 35.0),
+        Modifiers::SHIFT,
+        Vec::new(),
+    );
+    let after = bounds(&app, copy);
+    assert!(after.x0 > b.x0 + 5.0 && close(after.y0, b.y0), "{after:?}");
+    assert_eq!(shape_count(&app), 2);
+}
+
+/// With the Windows standard keys, Ctrl and Shift trade places while
+/// scaling, rotating or skewing; with the traditional ones nothing
+/// changes.
+#[test]
+fn windows_keys_swap_ctrl_and_shift_for_transforms() {
+    let mut app = App::headless();
+    app.drag = Drag::Rotate {
+        center: Point::ZERO,
+        start_angle: 0.0,
+        current_angle: 0.0,
+        grab: None,
+    };
+    assert_eq!(app.pick_mods(Modifiers::CTRL), Modifiers::CTRL);
+    app.settings.pick_windows_keys = true;
+    let m = app.pick_mods(Modifiers::CTRL);
+    assert!(m.shift && !m.ctrl, "{m:?}");
+    let m = app.pick_mods(Modifiers::SHIFT);
+    assert!(m.ctrl && !m.shift, "{m:?}");
+    app.drag = Drag::None;
+    assert_eq!(app.pick_mods(Modifiers::CTRL), Modifiers::CTRL, "a press");
+}
+
+/// A drop shadow cast past the page (#2891): the backdrop shown while
+/// the view moves reaches all of it, not only the page and the object,
+/// which cut the shadow off at the page's edge.
+#[test]
+fn the_backdrop_reaches_a_shadow_cast_past_the_page() {
+    let (_ctx, mut app, _) = setup();
+    let size = app.page_size();
+    let r = Rect::new(size.width - 30.0, 20.0, size.width - 10.0, 40.0);
+    let id = app
+        .new_shape(ShapeKind::Rect {
+            rect: r,
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect");
+    app.select(vec![id]);
+    app.set_shadow(
+        Some(tracedraw_core::Shadow {
+            offset: Vec2::new(50.0, -5.0),
+            blur: 3.0,
+            ..Default::default()
+        }),
+        false,
+    );
+    let shadow = app
+        .doc()
+        .find_shape(id)
+        .and_then(|s| s.shadow.map(|sh| sh.bounds(s.bounds())))
+        .expect("shadow");
+    assert!(shadow.x1 > size.width + 20.0, "{shadow:?}");
+    let area = app.backdrop_area(app.engine.revision());
+    assert!(
+        area.x1 >= shadow.x1 - 1e-6 && area.y0 <= shadow.y0 + 1e-6,
+        "{area:?} misses {shadow:?}"
+    );
+    // A stacked outer shadow (#1141) reaches as far.
+    app.set_shadow(None, false);
+    app.push_effect(
+        tracedraw_core::live::Effect::OuterShadow {
+            offset: Vec2::new(40.0, 0.0),
+            color: tracedraw_core::Color::BLACK,
+            opacity: 0.5,
+            blur: 2.0,
+            merge: tracedraw_core::live::MergeMode::Normal,
+        },
+        false,
+    );
+    let area = app.backdrop_area(app.engine.revision());
+    assert!(area.x1 >= r.x1 + 40.0, "{area:?}");
+}
+
+/// The Zoom tool's click brings the point clicked to the middle of the
+/// window, as the reference program does: after a zoom to fit a click at
+/// the page's top edge shows that edge with room above it (#2898).
+#[test]
+fn the_zoom_tool_brings_the_point_clicked_to_the_middle() {
+    let (ctx, mut app, _id) = setup();
+    app.set_tool(Tool::Zoom);
+    let page = app.page_rect();
+    let edge = Point::new(page.center().x - 40.0, page.y1);
+    let at = app.view.to_screen(edge);
+    let zoom = app.view.zoom;
+    click_at(&ctx, &mut app, at, Modifiers::NONE);
+    assert!((app.view.zoom / zoom - 2.0).abs() < 1e-6);
+    let c = app.canvas_rect.center();
+    let now = app.view.to_screen(edge);
+    assert!((now - c).length() < 0.5, "{now:?} at {c:?}");
+    assert!(now.y - app.canvas_rect.top() > 100.0, "room above the edge");
+    let r = app.view.rect_to_screen(page);
+    assert!(r.top() > app.canvas_rect.top(), "the top edge in view");
+}
+
+/// Zoom to fit (F4) leaves a margin round a drop shadow too, not only
+/// round the objects' own outlines (#2898).
+#[test]
+fn zoom_to_fit_leaves_room_round_a_shadow() {
+    let (_ctx, mut app, id) = setup();
+    let own = app.doc().find_shape(id).expect("shape").bounds();
+    let shadow = tracedraw_core::Shadow {
+        offset: tracedraw_core::geometry::Vec2::new(30.0, -30.0),
+        ..Default::default()
+    };
+    app.run(tracedraw_core::Command::SetShadow {
+        shapes: vec![id],
+        shadow: Some(shadow),
+    });
+    let drawn = app.drawn_bounds().expect("drawn");
+    assert!(
+        drawn.y0 < own.y0 - 20.0 && drawn.x1 > own.x1 + 20.0,
+        "{drawn:?} {own:?}"
+    );
+    app.zoom_to_fit();
+    let r = app.view.rect_to_screen(drawn);
+    let canvas = app.canvas_rect;
+    for gap in [
+        r.left() - canvas.left(),
+        r.top() - canvas.top(),
+        canvas.right() - r.right(),
+        canvas.bottom() - r.bottom(),
+    ] {
+        assert!(gap >= 40.0, "{gap} px between the shadow and the edge");
+    }
 }

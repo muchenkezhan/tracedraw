@@ -182,6 +182,31 @@ impl App {
         self.page_drawing_bounds(self.page)
     }
 
+    /// What the current page's objects draw, in page mm: their visual
+    /// bounds with the drop shadows, outer shadows, glows and blurs that
+    /// reach past them (#2891: the backdrop shown while the view moves
+    /// cut a shadow cast past the page off at the page's edge).
+    pub fn drawing_reach_bounds(&self) -> Option<tracedraw_core::geometry::Rect> {
+        let doc = self.doc();
+        let page = doc.page(self.page).ok()?;
+        page.layers
+            .iter()
+            .flat_map(|l| l.shapes.iter())
+            .filter(|s| s.visible)
+            .map(|s| {
+                let mut b = self.visual_bounds(s);
+                let r = effects_reach(s);
+                if r > 0.0 {
+                    b = b.inflate(r, r);
+                }
+                match shadow_reach(s, Affine::IDENTITY) {
+                    Some(sh) => b.union(sh),
+                    None => b,
+                }
+            })
+            .reduce(|a, b| a.union(b))
+    }
+
     /// As [`Self::drawing_bounds`], for the page `page`.
     pub fn page_drawing_bounds(
         &self,
@@ -2629,6 +2654,25 @@ impl App {
         });
     }
 
+    /// The area Convert to Bitmap renders, the whole of what the
+    /// selection draws: a drop shadow reaches past the objects' box and
+    /// was cut off at it (#2351), and so did a thick outline, its outer
+    /// half or all of it (#2369). The dialog works its size out from it.
+    pub fn convert_to_bitmap_area(&self) -> Option<Rect> {
+        let shapes = self.selected_shapes();
+        self.selection_bounds().map(|b| {
+            shapes
+                .iter()
+                .filter_map(|s| shadow_reach(s, Affine::IDENTITY))
+                .chain(
+                    shapes
+                        .iter()
+                        .filter_map(|s| outline_area(s, Affine::IDENTITY)),
+                )
+                .fold(b, |a, r| a.union(r))
+        })
+    }
+
     /// Image > Convert to Bitmap: the selection becomes one bitmap with
     /// the dialog's resolution, colour mode, dithering, anti-aliasing,
     /// background and overprint, in one undo step.
@@ -2642,20 +2686,7 @@ impl App {
         } else {
             300.0
         };
-        // The whole of what the selection draws: a drop shadow reaches
-        // past the objects' box and was cut off at it (#2351), and so did
-        // a thick outline, its outer half or all of it (#2369).
-        let Some(area) = self.selection_bounds().map(|b| {
-            shapes
-                .iter()
-                .filter_map(|s| shadow_reach(s, Affine::IDENTITY))
-                .chain(
-                    shapes
-                        .iter()
-                        .filter_map(|s| outline_area(s, Affine::IDENTITY)),
-                )
-                .fold(b, |a, r| a.union(r))
-        }) else {
+        let Some(area) = self.convert_to_bitmap_area() else {
             return;
         };
         let Some(tmp) = self.selection_alone(area) else {
@@ -2879,6 +2910,7 @@ impl App {
             for t in traced {
                 let sid = self.engine.new_shape_id();
                 let path = crate::trace::to_rect(&t.path, w, h, rect);
+                let path_box = tracedraw_core::geometry::Shape::bounding_box(&path);
                 let mut s = Shape::new(
                     sid,
                     ShapeKind::Path {
@@ -2887,7 +2919,10 @@ impl App {
                     },
                 );
                 if t.closed {
-                    s.fill = Fill::Solid(t.color);
+                    s.fill = match t.blend {
+                        Some(blend) => crate::trace::blend_fill(&blend, &path_box, w, h, rect),
+                        None => Fill::Solid(t.color),
+                    };
                     s.stroke = None;
                 } else {
                     s.fill = Fill::None;
@@ -5578,6 +5613,27 @@ fn outline_area(s: &Shape, parent: Affine) -> Option<Rect> {
     }
 }
 
+/// How far past its visual bounds `s` or an object in it draws, mm: its
+/// widest outer shadow (offset and feathering), glow or Gaussian blur.
+fn effects_reach(s: &Shape) -> f64 {
+    use tracedraw_core::live::Effect;
+    let own = s
+        .effects
+        .iter()
+        .map(|e| match e {
+            Effect::OuterShadow { offset, blur, .. } => blur.abs() + offset.hypot(),
+            Effect::Glow { blur, .. } | Effect::GaussianBlur { radius: blur } => blur.abs(),
+            _ => 0.0,
+        })
+        .filter(|r| r.is_finite())
+        .fold(0.0f64, f64::max);
+    let inner = match &s.kind {
+        ShapeKind::Group { children } => children.iter().map(effects_reach).fold(0.0, f64::max),
+        _ => 0.0,
+    };
+    own.max(inner)
+}
+
 /// The area the drop shadows of `s` (inside `parent`) and of the objects
 /// in it cover, in page space: the shadow's box grown by its feathering.
 /// `None` when nothing in it casts a shadow.
@@ -6294,6 +6350,62 @@ mod tests {
         }
     }
 
+    /// A trace lies exactly over its bitmap, wherever the bitmap is on
+    /// the page (#2926): the group covers the bitmap's rectangle, and a
+    /// square of the picture is traced where the picture shows it, to a
+    /// fiftieth of a pixel.
+    #[test]
+    fn a_trace_lies_exactly_over_its_bitmap() {
+        use tracedraw_core::geometry::Shape as _;
+        let mut app = App::headless();
+        let img = image::RgbaImage::from_fn(300, 300, |x, y| {
+            if (200..260).contains(&x) && (40..100).contains(&y) {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let bmp = app.place_image(img, Some("Square".into())).expect("bitmap");
+        app.select(vec![bmp]);
+        app.nudge(tracedraw_core::geometry::Vec2::new(13.7, -4.2));
+        let rect = app.doc().shape(bmp).expect("the bitmap").1.bounds();
+        let mut settings = crate::trace::Preset::Logo.settings();
+        settings.remove = crate::trace::Remove::None;
+        app.select(vec![bmp]);
+        app.trace_bitmaps(&settings);
+        let group = app.selection[0];
+        assert_ne!(group, bmp);
+        let (_, traced) = app.doc().shape(group).expect("the trace");
+        let px = rect.width() / 300.0;
+        let near = |a: f64, b: f64| (a - b).abs() < 0.02 * px;
+        let all = traced.bounds();
+        assert!(
+            near(all.x0, rect.x0)
+                && near(all.y0, rect.y0)
+                && near(all.x1, rect.x1)
+                && near(all.y1, rect.y1),
+            "{all:?} over {rect:?}"
+        );
+        let ShapeKind::Group { children } = &traced.kind else {
+            panic!("a group");
+        };
+        let square = children
+            .iter()
+            .find(|c| matches!(&c.fill, Fill::Solid(k) if k.to_rgb8() == [0, 0, 0]))
+            .expect("the black square");
+        let ShapeKind::Path { path, .. } = &square.kind else {
+            panic!("a curve");
+        };
+        let b = (traced.transform * path.clone()).bounding_box();
+        assert!(
+            near(b.x0, rect.x0 + 200.0 * px)
+                && near(b.x1, rect.x0 + 260.0 * px)
+                && near(b.y1, rect.y1 - 40.0 * px)
+                && near(b.y0, rect.y1 - 100.0 * px),
+            "{b:?} in {rect:?}"
+        );
+    }
+
     #[test]
     fn fit_text_to_path_waits_for_a_path_and_starts_text_on_it() {
         let mut app = App::headless();
@@ -6692,6 +6804,8 @@ mod tests {
             Affine::IDENTITY,
         );
         app.select(vec![circle]);
+        // The size the dialog shows is that of this area.
+        let told = app.convert_to_bitmap_area().expect("area");
         app.convert_to_bitmap(150.0, true);
         let pic = app.selection[0];
         let s = app.doc().find_shape(pic).expect("picture");
@@ -6706,6 +6820,14 @@ mod tests {
             panic!("a bitmap");
         };
         let want = object.inflate(line, line).union(reach);
+        assert_eq!(
+            (
+                (told.width() / 25.4 * 150.0).ceil() as u32,
+                (told.height() / 25.4 * 150.0).ceil() as u32
+            ),
+            (*width_px, *height_px),
+            "the dialog tells the size of the bitmap made"
+        );
         assert!(
             (rect.x0 - want.x0).abs() < 1e-6
                 && (rect.y0 - want.y0).abs() < 1e-6

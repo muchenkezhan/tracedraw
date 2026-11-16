@@ -27,6 +27,7 @@ pub mod fit;
 pub mod geometry;
 pub mod icc;
 pub mod id;
+pub mod jpeg_source;
 pub mod join;
 pub mod linked_text;
 pub mod live;
@@ -44,6 +45,7 @@ pub mod spreads;
 pub mod style;
 pub mod table;
 pub mod text_flow;
+pub mod toc;
 
 pub use bytes::SharedBytes;
 pub use color::Color;

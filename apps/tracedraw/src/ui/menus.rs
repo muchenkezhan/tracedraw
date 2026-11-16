@@ -733,6 +733,7 @@ fn menu_pic(key: &str) -> Option<crate::ui::propbar::Pic> {
         "menu.object.combine" => Pic::Combine,
         "menu.object.break_apart"
         | "menu.object.break_shadow_apart"
+        | "menu.object.break_shadows_apart"
         | "menu.object.break_contour_apart"
         | "menu.object.break_blend_apart"
         | "menu.object.break_extrude_apart" => Pic::BreakApart,
@@ -1393,7 +1394,8 @@ pub(crate) mod replay {
 
     /// Items that would block on a native file chooser, start another
     /// program (an editor or the web browser) or close the window.
-    const SKIP: [&str; 18] = [
+    const SKIP: [&str; 19] = [
+        "menu.tools.plugin_install",
         "menu.object.insert_object_add",
         "menu.object.insert_object_file",
         "menu.file.send_to_mail",
@@ -3167,6 +3169,19 @@ pub(crate) fn layout_menu(app: &mut App, ui: &mut Ui) {
     if item(ui, "menu.layout.delete_page", "", app.doc().pages.len() > 1) {
         app.ask_delete_page();
     }
+    // Every page's objects side by side on the first page (#2098).
+    if item(
+        ui,
+        "menu.layout.gather_pages",
+        "",
+        app.doc().pages.len() > 1,
+    ) {
+        app.dialog = Dialog::GatherPages {
+            gap: app.units.from_mm(5.0),
+            resize: true,
+            delete: false,
+        };
+    }
     if item(ui, "menu.layout.go_to_page", "", true) {
         app.dialog = Dialog::GoToPage {
             page: app.page_index() + 1,
@@ -3382,6 +3397,10 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
     sub(ui, "menu.object.insert", |ui| {
         if item(ui, "menu.object.insert_barcode", "", true) {
             app.dialog = Dialog::Barcode(Default::default());
+        }
+        // A formula; with one selected, the same item edits it (#2183).
+        if item(ui, "menu.object.insert_formula", "", true) {
+            app.open_formula_dialog();
         }
         if item(ui, "menu.object.insert_qr", "", true) {
             app.insert_qr_code();
@@ -4397,6 +4416,26 @@ fn text_menu(app: &mut App, ui: &mut Ui) {
             app.add_pinyin();
         }
     });
+    // Headings and a table of contents listing them (#1660).
+    sub(ui, "menu.text.toc", |ui| {
+        if item(ui, "menu.text.toc_insert", "", true) {
+            app.insert_toc();
+        }
+        sep(ui);
+        let level = app.selected_toc_level();
+        for (n, key) in [
+            (1, "menu.text.toc_heading_1"),
+            (2, "menu.text.toc_heading_2"),
+            (3, "menu.text.toc_heading_3"),
+        ] {
+            if check(ui, key, "", level == Some(Some(n))) {
+                app.set_toc_level(Some(n));
+            }
+        }
+        if item(ui, "menu.text.toc_not_heading", "", is_text) {
+            app.set_toc_level(None);
+        }
+    });
     sep(ui);
     if item(ui, "menu.text.encode", "", is_text) {
         app.dialog = Dialog::Encode(Default::default());
@@ -4605,6 +4644,10 @@ fn tools_menu(app: &mut App, ui: &mut Ui) {
         }
     });
     sub(ui, "menu.tools.macros", |ui| macros_items(app, ui));
+    // Commands added by plugins, and their manager (#1802).
+    sub(ui, "menu.tools.plugins", |ui| {
+        crate::plugins::menu_items(app, ui)
+    });
     if item(ui, "menu.tools.ai_generate", "", true) {
         app.open_ai_generate();
     }

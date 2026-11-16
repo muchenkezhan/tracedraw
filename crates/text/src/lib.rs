@@ -824,6 +824,14 @@ pub struct FamilyInfo {
     pub feature_tags: Vec<[u8; 4]>,
     /// The folders its font files are in, sorted.
     pub folders: Vec<std::path::PathBuf>,
+    /// What the Font Manager's Favorites and collections remember its
+    /// faces by: each face's PostScript name, else its family and style
+    /// as `family|style` (see `catalog::FaceRecord::key`), sorted
+    /// (#867).
+    pub face_keys: Vec<String>,
+    /// A face of it is a font of the operating system's own folders,
+    /// which the Font Manager never uninstalls (#867).
+    pub system: bool,
     /// The family's English name when the listed one is in another
     /// language (a Hindi or Japanese name of the font), for the font
     /// lists to show beside it (#1249).
@@ -1349,6 +1357,90 @@ fn display_order(glyphs: &[Glyph]) -> Option<Vec<usize>> {
         level -= 1;
     }
     Some(order)
+}
+
+/// One line of `text` as it is seen, its characters from left to right:
+/// the Unicode bidirectional algorithm, the first strong letter setting
+/// the direction, so the words of a Hebrew or Arabic name run from right
+/// to left and brackets inside them turn round. For a user interface
+/// whose text fields lay characters out in typed order (d#2122). `None`
+/// when the text holds no right-to-left letter.
+pub fn seen_order(text: &str) -> Option<String> {
+    let runs = bidi_runs(text, false)?;
+    let mut chars: Vec<(char, u8)> = Vec::new();
+    for (range, level) in runs {
+        chars.extend(text[range].chars().map(|c| (c, level)));
+    }
+    let base = if text.chars().find_map(strong_direction) == Some(true) {
+        1
+    } else {
+        0
+    };
+    // Spaces at the end take the paragraph's level, as on a line.
+    for (c, l) in chars.iter_mut().rev() {
+        if !c.is_whitespace() {
+            break;
+        }
+        *l = base;
+    }
+    let top = chars.iter().map(|&(_, l)| l).max().unwrap_or(0);
+    let lowest_odd = chars
+        .iter()
+        .map(|&(_, l)| l)
+        .filter(|l| l % 2 == 1)
+        .min()
+        .unwrap_or(top + 1);
+    let mut level = top;
+    while level >= lowest_odd && level > 0 {
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].1 >= level {
+                let start = i;
+                while i < chars.len() && chars[i].1 >= level {
+                    i += 1;
+                }
+                chars[start..i].reverse();
+            } else {
+                i += 1;
+            }
+        }
+        level -= 1;
+    }
+    Some(
+        chars
+            .into_iter()
+            .map(|(c, l)| if l % 2 == 1 { mirror_bracket(c) } else { c })
+            .collect(),
+    )
+}
+
+/// Whether `c` is a strong right-to-left letter (`Some(true)`), a strong
+/// left-to-right one (`Some(false)`) or neither.
+fn strong_direction(c: char) -> Option<bool> {
+    if right_to_left(c) && c.is_alphabetic() {
+        Some(true)
+    } else if c.is_alphabetic() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The bracket that faces the other way, for text seen right to left.
+fn mirror_bracket(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        '<' => '>',
+        '>' => '<',
+        '\u{AB}' => '\u{BB}',
+        '\u{BB}' => '\u{AB}',
+        other => other,
+    }
 }
 
 /// `text` cut where its script changes (see [`script_of`]); what the
@@ -2972,6 +3064,10 @@ impl FontSystem {
         let mut embedding: Option<catalog::Embedding> = None;
         let mut feature_tags: Vec<[u8; 4]> = Vec::new();
         let mut folders: Vec<std::path::PathBuf> = Vec::new();
+        let mut face_keys: Vec<String> = Vec::new();
+        let mut system = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let system_roots = system_font_roots();
         let mut english: Option<String> = None;
         for id in ids {
             let Some(info) = db.face(id) else {
@@ -3020,6 +3116,7 @@ impl FontSystem {
                 if let Some(dir) = folder_under(p, roots) {
                     folders.push(dir);
                 }
+                system |= system_roots.iter().any(|r| p.starts_with(r));
             }
             if class == traits::FontClass::Unknown {
                 class = face_traits.class;
@@ -3042,6 +3139,11 @@ impl FontSystem {
                     (true, true) => "Bold Italic",
                 }
                 .to_string()
+            });
+            face_keys.push(if info.post_script_name.is_empty() {
+                format!("{family}|{name}")
+            } else {
+                info.post_script_name.clone()
             });
             if !faces.iter().any(|f| f.name == name) {
                 faces.push(FaceStyle {
@@ -3078,6 +3180,12 @@ impl FontSystem {
                 folders.dedup();
                 folders
             },
+            face_keys: {
+                face_keys.sort();
+                face_keys.dedup();
+                face_keys
+            },
+            system,
             english,
         })
     }
@@ -6242,6 +6350,36 @@ fn decoration_rects(
 mod tests {
     use super::*;
 
+    /// d#2122: a Hebrew file name of two words reads right to left, the
+    /// second word left of the first, with Latin and digits kept left to
+    /// right inside it; a name without right-to-left letters is left alone.
+    #[test]
+    fn a_hebrew_name_is_seen_right_to_left() {
+        // "שלום עולם": the first word (shin lamed vav mem) on the right.
+        let name = "\u{5E9}\u{5DC}\u{5D5}\u{5DD} \u{5E2}\u{5D5}\u{5DC}\u{5DD}";
+        assert_eq!(
+            seen_order(name).as_deref(),
+            Some("\u{5DD}\u{5DC}\u{5D5}\u{5E2} \u{5DD}\u{5D5}\u{5DC}\u{5E9}")
+        );
+        // Digits and a Latin word keep their own order inside it.
+        let mixed = "\u{5D0}\u{5D1} 2026 abc";
+        assert_eq!(
+            seen_order(mixed).as_deref(),
+            Some("abc 2026 \u{5D1}\u{5D0}")
+        );
+        // Brackets turn round in right-to-left text.
+        assert_eq!(
+            seen_order("\u{5D0}(\u{5D1})").as_deref(),
+            Some("(\u{5D1})\u{5D0}")
+        );
+        // A Latin name with one Hebrew word keeps its own order around it.
+        assert_eq!(
+            seen_order("logo \u{5D0}\u{5D1}.tdraw").as_deref(),
+            Some("logo \u{5D1}\u{5D0}.tdraw")
+        );
+        assert_eq!(seen_order("plain name"), None);
+    }
+
     #[test]
     fn a_name_in_another_language_shows_its_english_name() {
         use fontdb::Language as L;
@@ -9209,6 +9347,10 @@ mod tests {
         assert_eq!(names, ["Regular", "Bold"]);
         assert!(selawik.faces[1].weight >= 600 && !selawik.faces[1].italic);
         assert!(!selawik.embedded && !selawik.symbol);
+        // What the Font Manager's collections remember each face by, and
+        // fonts loaded from memory are none of the system's (#867).
+        assert_eq!(selawik.face_keys, ["Selawik-Bold", "Selawik-Regular"]);
+        assert!(!selawik.system);
         let quicksand = f.family_info("Quicksand").expect("installed");
         assert_eq!(quicksand.kind, FontKind::Variable);
         assert_eq!(quicksand.faces.len(), 1);

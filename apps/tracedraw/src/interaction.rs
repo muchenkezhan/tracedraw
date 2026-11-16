@@ -1188,6 +1188,10 @@ impl App {
     /// Add `id` to the selection, taking out the groups holding it and the
     /// objects inside it, so nothing is selected twice over.
     pub fn select_add(&mut self, id: ShapeId) {
+        // Shift+click adds no locked object either (#2901).
+        if self.locked_ids().contains(&id) {
+            return;
+        }
         let above = self.doc().ancestors(id);
         let doc = self.doc();
         let keep: Vec<ShapeId> = self
@@ -1425,6 +1429,33 @@ impl App {
         self.doc_palette_rect.is_some_and(|r| r.contains(p))
             || self.palette_strip_rects.iter().any(|(_, r)| r.contains(p))
             || self.page_tab_at(p).is_some()
+    }
+
+    /// The modifier keys as the Pick tool reads them. With the Windows
+    /// standard keys (Options > Tools > Pick, #1436) Ctrl no longer
+    /// constrains a move (Shift does; Ctrl leaves the original, see
+    /// `note_drop_keys`), and Ctrl and Shift trade places while the
+    /// selection is scaled, turned or slanted: Shift keeps steps and
+    /// proportions, Ctrl works from the centre.
+    pub fn pick_mods(&self, mods: Modifiers) -> Modifiers {
+        if !self.settings.pick_windows_keys {
+            return mods;
+        }
+        let mut m = mods;
+        match self.drag {
+            Drag::Move { .. } => {
+                m.ctrl = false;
+                m.command = false;
+            }
+            Drag::Scale { .. } | Drag::Rotate { .. } | Drag::Skew { .. } => {
+                let ctrl = mods.ctrl || mods.command;
+                m.ctrl = mods.shift;
+                m.command = mods.shift && cfg!(target_os = "macos");
+                m.shift = ctrl;
+            }
+            _ => {}
+        }
+        m
     }
 
     /// A move, scale, rotation or skew of the selection is being dragged.
@@ -1853,7 +1884,11 @@ impl App {
             && ((self.tool == Tool::Zoom && self.settings.zoom_right_click_out)
                 || (self.tool == Tool::Pan && self.settings.pan_right_click_out))
         {
-            self.view.zoom_at(screen, 0.5);
+            if self.tool == Tool::Zoom {
+                self.zoom_tool_click(screen, 0.5);
+            } else {
+                self.view.zoom_at(screen, 0.5);
+            }
             self.end_zoom_one_shot();
             return;
         }
@@ -1929,6 +1964,14 @@ impl App {
             if response.secondary_clicked() {
                 self.pending_clip_frame = false;
             }
+            return;
+        }
+        // Speech Balloon tool: the diamond at a selected balloon's tail
+        // tip takes a drag before the selection's handles (#2179).
+        if self.tool == Tool::Balloon
+            && matches!(self.drag, Drag::None)
+            && self.balloon_tip_input(response, p, screen)
+        {
             return;
         }
         // Right after a shape is drawn its handles show with the drawing
@@ -2025,7 +2068,11 @@ impl App {
             }
             Tool::Text => self.text_input(response, p, mods),
             Tool::ColorEyedropper | Tool::AttributesEyedropper => {
-                if response.clicked() {
+                // A press let go counts as a click also when the pointer
+                // moved a little (a pen, a shaky hand) or the button was
+                // held a moment, which the window takes for a drag: such
+                // a click sampled or applied nothing (#2897).
+                if response.clicked() || response.drag_stopped_by(PointerButton::Primary) {
                     let attrs = self.tool == Tool::AttributesEyedropper;
                     // Ctrl samples again in Apply mode (#1302).
                     self.eyedropper_click(p, attrs, mods.shift, mods.ctrl);
@@ -2610,6 +2657,10 @@ impl App {
     /// frame does (they are not tool shortcuts then).
     fn note_drop_keys(&mut self, ctx: &egui::Context) {
         if matches!(self.drag, Drag::Move { .. }) {
+            // Windows standard keys: Ctrl held at the drop leaves the
+            // original (#1436).
+            self.ctrl_copy = self.settings.pick_windows_keys
+                && ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
             // Alt adds to the frame as W does (#1337).
             self.drop_keys =
                 ctx.input(|i| (i.key_down(Key::W) || i.modifiers.alt, i.key_down(Key::K)));
@@ -2625,6 +2676,8 @@ impl App {
     }
 
     fn pick_drag_to(&mut self, p: Point, mods: Modifiers) {
+        // The Windows standard keys (Options > Tools > Pick, #1436).
+        let mods = self.pick_mods(mods);
         if let Drag::ShadowHandle {
             handle,
             grab,
@@ -3006,10 +3059,23 @@ impl App {
             }
         }
         if response.clicked_by(PointerButton::Primary) {
-            self.view
-                .zoom_at(screen, if mods.shift { 0.5 } else { 2.0 });
+            self.zoom_tool_click(screen, if mods.shift { 0.5 } else { 2.0 });
             self.end_zoom_one_shot();
         }
+    }
+
+    /// A click of the Zoom tool: the zoom changes by `factor` and the
+    /// point clicked comes to the middle of the window, so a click near
+    /// the page's edge brings that edge into view with room round it,
+    /// as the reference program does; before, the point stayed under
+    /// the pointer and the page's top edge, at the window's edge after
+    /// a zoom to fit, could not be zoomed into (#2898).
+    pub(crate) fn zoom_tool_click(&mut self, screen: egui::Pos2, factor: f32) {
+        let p = self.view.to_page(screen);
+        self.view.zoom_at(screen, factor);
+        let c = self.canvas_rect.center();
+        let at = self.view.to_screen(p);
+        self.view.pan(c - at);
     }
 
     /// After a zoom with the Zoom tool picked by F2, the tool before it
@@ -3996,6 +4062,9 @@ impl App {
                     .then(|| self.multipage_drop_page(total))
                     .flatten();
                 let mark = to_page.map(|_| self.engine.begin_group());
+                if std::mem::take(&mut self.ctrl_copy) {
+                    self.drag_copy = true;
+                }
                 if total.hypot() > 1e-6 {
                     self.finish_transform(Affine::translate(total));
                 }
@@ -4090,10 +4159,18 @@ impl App {
             Drag::Freehand { points } => {
                 // Smoothing (Options > Tools > Curves, the property bar)
                 // sets how far the stroke may be simplified, on screen.
+                // Corners and straight stretches (Options > Tools >
+                // Curves, #1436); as few nodes as fit (#2887).
                 let tol = self.settings.curves.freehand_tolerance_px() / self.view.zoom as f64;
-                let pts = tracedraw_core::geometry::simplify(&points, tol.max(0.02));
-                if pts.len() >= 2 {
-                    let path = tracedraw_core::geometry::smooth_path(&pts, false);
+                let c = self.settings.curves;
+                let px = 1.0 / self.view.zoom as f64;
+                if let Some(path) = crate::tools2::freehand_path(
+                    &points,
+                    tol,
+                    c.corner_turn_deg(),
+                    (c.straight_threshold > 0)
+                        .then(|| (f64::from(c.straight_threshold.min(10)) * px, 20.0 * px)),
+                ) {
                     // Drawn with a pen: the outline follows its pressure
                     // along the stroke (#850); the mouse keeps it even.
                     let widths = self
@@ -4410,6 +4487,45 @@ impl App {
             && self.table_keyboard(ctx)
         {
             return;
+        }
+        // Command shortcuts the field gave up last frame run now, on
+        // what the field applied.
+        if !self.deferred_keys.is_empty() {
+            let keys = std::mem::take(&mut self.deferred_keys);
+            ctx.input_mut(|i| i.events.extend(keys));
+        }
+        // A command shortcut (Ctrl+K, Ctrl+G...) pressed while a field of
+        // a bar or a docker has the keyboard: the field applies what was
+        // typed in it and gives the keyboard back to the drawing, and the
+        // command runs in the next frame, on what the field changed. The
+        // video of #2893 typed in the bar, then pressed Ctrl+K, and
+        // nothing happened. The keys that edit the field's text stay its
+        // own (see `field_editing_key`).
+        if !dialog_open && ctx.egui_wants_keyboard_input() {
+            let commands: Vec<egui::Event> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| match e {
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => modifiers.command && !modifiers.alt && !field_editing_key(*key),
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect()
+            });
+            if !commands.is_empty() {
+                if let Some(id) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+                ctx.input_mut(|i| i.events.retain(|e| !commands.contains(e)));
+                self.deferred_keys = commands;
+                ctx.request_repaint();
+                return;
+            }
         }
         // A field with the keyboard (the font search field of the
         // property bar, a docker's box) keeps what is typed in it, even
@@ -5347,12 +5463,43 @@ impl App {
             }
         }
         if d.hypot() > 0.0 {
-            // With the Shape tool and nodes chosen, the nodes move.
-            if self.tool == Tool::Shape && !self.node_selection.is_empty() {
+            // With the Shape tool a chosen control handle moves (#2819),
+            // else the chosen nodes.
+            let shape = self.tool == Tool::Shape;
+            if shape && self.nudge_chosen_handle(d) {
+                // The handle moved.
+            } else if shape && !self.node_selection.is_empty() {
                 self.nudge_nodes(d);
             } else {
                 self.nudge(d);
             }
         }
     }
+}
+
+/// A key that, with Ctrl (Command on macOS), edits the text of a field:
+/// select all, copy, cut, paste, undo, redo, and the moves and deletes by
+/// word. A field with the keyboard keeps these; other Ctrl shortcuts are
+/// commands for the drawing.
+fn field_editing_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::A
+            | Key::C
+            | Key::V
+            | Key::X
+            | Key::Z
+            | Key::Y
+            | Key::Backspace
+            | Key::Delete
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::ArrowUp
+            | Key::ArrowDown
+            | Key::Home
+            | Key::End
+            | Key::Insert
+            | Key::Enter
+            | Key::Tab
+    )
 }

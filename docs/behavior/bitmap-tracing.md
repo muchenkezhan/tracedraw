@@ -136,7 +136,17 @@ pane, the wireframe and the counts take the result when it comes in.
   out, inside the picture too.
 - None: the background is traced like any colour.
 - Automatically: the background colour is the commonest palette colour
-  along the border. Specify: the colour of the swatch, or the colour
+  along the border that is paper (brightness 180 or more, its channels
+  within 48 of each other). A dark or coloured surround is part of the
+  design (the dark square behind a gold emblem) and stays unless its
+  colour is specified (#2928). With Background color, the background's
+  soft shades go with it: from the border on through every pixel within
+  56 of the background colour and 10 of its neighbour that lies on no
+  edge (a vignette, a faint gradient), and the edge pixels a shade so
+  emptied leaves round the art. The edge pixels of a shade beside the
+  pixels of it that went go too when flat pixels of the shade stay
+  elsewhere (inside the letters): in a picture traced on its own pixels
+  they were a pale line round every letter. Specify: the colour of the swatch, or the colour
   under a click on the preview with the eyedropper (taken from the
   picture, so an anti-aliased or compressed colour still stands for the
   palette colour nearest it).
@@ -187,7 +197,8 @@ can be undone.
 
 ## Algorithm (outline mode)
 
-1. Noise (#611, off at detail 95 and up, where the specks stay too):
+1. Noise (#611, off at detail 88 and up: taking it out there takes the
+   finest lines of the art too):
    each colour channel of each opaque pixel becomes the median of the
    pixel and its four edge neighbours (opaque ones only), once at detail
    75 and up, twice below. Lone odd pixels and the grain of compressed
@@ -295,8 +306,9 @@ can be undone.
    white and two greys, a pixel or two of each, is one speck of nine
    pixels, not nine specks of one pixel passing their pixels around);
    then every 4-connected patch of one colour smaller than
-   `round(((100 - detail) / 10)^2)` pixels (none at detail 100, 4 at 80,
-   16 at 60, 42 at 35) takes the colour of a neighbour, so stray dots and
+   `round(((100 - detail) / 10)^2)` pixels (4 at 80, 16 at 60, 42 at 35;
+   2 at least below detail 100, so the Detailed logo preset at 90 drops
+   single stray pixels; none at detail 100) takes the colour of a neighbour, so stray dots and
    the fringes of soft edges make no curves of their own: the neighbour
    whose colour is nearest its own when one is within 40; else, when its
    colour lies between two neighbours at least 64 apart (the anti-aliased
@@ -342,31 +354,36 @@ can be undone.
    eyes). Regions side by side meet along their shared curve, as in the
    trace the program that wrote the #1250 sample made of the same
    picture (each region one ring, the borders coinciding).
-4. Smoothing 0: each ring as straight lines along the pixel edges
-   (Douglas-Peucker, tolerance `0.3 + (100 - detail) / 100 * 2.5` px).
-   Otherwise each ring is fitted (#611):
-   - one point in the middle of every pixel edge, so stair steps become
-     slopes;
-   - corners where the ring turns by more than `60 + corner smoothness *
-     0.8` degrees over 3 pixels (the sharpest point of each run) and
-     still does over 6, so a notch of a pixel or two along a smooth edge
-     is no corner, moved onto the pixel corner standing out, so a square
-     keeps its corners;
-   - the points between corners smoothed `round(1 + smoothing * 0.12)`
-     times with weights 1, 2, 1;
+4. Each border is fitted on the finer grid (see Fine edges below), at
+   every smoothing, 0 included (#2925: Detail 100 with Smoothing 0 put a
+   node on every pixel step, 14 479 nodes for a logo):
+   - one point in the middle of every step of the finer grid, smoothed
+     lightly (0.45 px; 0.9 px in a picture with hard edges) so the grid's
+     steps go;
+   - corners and the ends of thin strokes found on the straight sides
+     of the border (see Corners below); a corner is put where the lines
+     of its two sides cross, so a square keeps its corners to a tenth
+     of a pixel;
+   - the points between corners smoothed with a spread of
+     `0.3 + smoothing / 100 * 1.5` px (1.4 px at least in a picture with
+     hard edges), the rounded part beside each corner left out and the
+     two ends fixed. Each smoothing pass is followed by one that pushes
+     the points back out (1.06 times what the pass after would pull
+     in), so a high Smoothing takes the ripples out without drawing
+     round shapes in;
    - a border between two junctions keeps its ends on them, where the
      borders of the other regions meeting there end too, and is fitted
      like a stretch between corners;
-   - each stretch between corners (a ring without corners in quarters
-     meeting smoothly) fitted with as few cubic Beziers as keep every
-     point within `0.2 + (100 - detail) / 100 * 2` px (1 px at the
-     Clipart detail of 60, 0.6 before: the smoothed points lie on a
-     smooth curve already, and the tighter fit only added nodes): least
-     squares on
-     chord-length parameters with Newton steps, split at the worst point
-     (P. J. Schneider, "An Algorithm for Automatically Fitting Digitized
-     Curves", Graphics Gems, 1990). Ends take the direction over 4
-     points.
+   - each stretch between corners is one straight line when no point
+     lies further than 0.2 px from it, else as few cubic Beziers as keep
+     every point within `0.35 + ((100 - detail) / 100)^1.5 * 0.6` px
+     (0.2 before: a tenth to a quarter more nodes for the same likeness)
+     (a ring without corners in quarters meeting smoothly, grown about
+     its middle by up to a quarter to the area of its border, so a dot
+     of three pixels is not drawn smaller): least
+     squares on chord-length parameters with Newton steps, split at the
+     worst point (P. J. Schneider, "An Algorithm for Automatically
+     Fitting Digitized Curves", Graphics Gems, 1990).
 5. Stack regions as step 3 orders them; leave out the background (see Remove
    above) when requested. The background found (no colour specified) is
    the commonest colour on the picture's edge; when no colour touches
@@ -380,10 +397,198 @@ can be undone.
    there, so Remove background took their black for the background and
    erased every shape touching the edge).
 
+## Fine edges
+
+The colour of a pixel on the edge of two colours says how much of it
+each covers, so the edge is traced inside the pixels (`trace_fine.rs`;
+#2925, #2926, #2927, #2929).
+
+- Edge pixels: from each pixel, steps to the brightest and to the
+  darkest neighbour (by the red, green or blue channel alone where that
+  channel changes 1.5 times more than the brightness in the 3x3 block:
+  an edge between two colours equally bright, purple on blue, is found
+  too) while each gains 5 levels, 6 steps at
+  most, find the two ends of the edge it lies on (48 apart at least)
+  and its share between them. After the cleaning of step 1 each edge
+  pixel takes the label of the nearer end: the label the cleaning left
+  that end when its colour is within 48 of it; else (the core of a
+  stroke too thin to reach its colour, which the noise filter took out)
+  the nearest colour still in the picture that the end lies on the way
+  to from the colour at the other end, at least 0.3 of the way, else the
+  nearest. So no third colour that looks like the blend rings a shape
+  (the grey halo round black letters), and a grey hairline in a black
+  and white picture is black.
+- A step of a thin slanted line touches the next by a corner only: a
+  small patch that stands out from its neighbours (64) and reaches the
+  smallest kept area with the patches it touches by corners is no
+  speck.
+- In flat art, a colour with no flat pixel (every stroke of it under
+  three pixels wide) lying between the colour around it and a colour
+  with flat areas, at least 0.3 of the way, is that colour: grey small
+  print is black.
+- The labels are made on a grid 4 times finer (fewer times for large
+  pictures: 6 million fine pixels at most): the stand-in colours of the
+  pixels (the blend of the two labels' colours by the pixel's share on
+  an edge) are interpolated (Catmull-Rom) and each fine pixel takes the
+  nearest colour among the labels of the four pixels around it. Borders
+  are walked and fitted on this grid and the curves scaled back, so an
+  edge covering 30 % of its pixels is traced 0.3 px in, and the trace
+  lies on the picture to a fraction of a pixel.
+- A picture with hard edges (at least 70 % of its borders between full
+  colours, no blend) has nothing inside its pixels to read: its steps
+  are smoothed more instead.
+- An end of an edge is taken to be full colour when it is within 56 of
+  its label's colour; a fainter one (the core of small print, which
+  never reaches its colour) counts as three quarters of the way, so thin
+  letters are not traced thinner than they are. An end pixel with fewer
+  than two neighbours within 24 of its colour may take the colour it
+  lies on the way to even when its own label is near: the gap inside a
+  small letter becomes paper.
+- A patch of two pixels or more with one colour all round it and at
+  least 120 from it is a gap of the art (the bowls of a small B) and is
+  no speck.
+- Sharpening before the edges are placed, by itself: the softness of a
+  picture is the number of edge pixels that are a real mix (0.1 to 0.9
+  of the way) for each place two labels touch. A crisp anti-aliased
+  picture has about 0.7, one enlarged or blurred 1.0 to 1.3. From 0.8
+  on, growing to full at 1.25, the stand-in colours are sharpened
+  (unsharp mask, blur of 0.75 px, up to 2.2 times the difference), so
+  the bowls and gaps of small print open before the finer grid is made;
+  corners are also taken to be rounded further by the blur (below). A
+  crisp picture is left as it is.
+
+### Corners
+
+Corners are found on the polygon of each lightly smoothed border
+(Douglas-Peucker, 0.15 px).
+
+- Each side has a line fitted through its points (least squares). A
+  line within 0.15 px and 8 degrees of level or upright (12 degrees for
+  a side under 4 px; a side under 0.9 px is too short to say) is level
+  or upright exactly, so the stems and bars of small print come out
+  straight.
+- Ends of thin strokes: a half turn (132 to 206 degrees) over at most 5
+  short sides (1.5 px each), between two longer sides running opposite
+  ways no more than 2.6 px apart, is two corners on the line across the
+  tip. A short slanted side beside the tip takes the direction of the
+  level or longer side across the stroke (the blur slants the short
+  underside of a T's arm). Two sides of 2.2 px or more closing on each
+  other by more than 20 degrees are a wedge: one corner where they meet
+  when that is within 2.2 px of the tip (the notches of an N), else a
+  blunt end square to the level or upright side (the top of an N's
+  stem).
+- Other corners: a run of polygon points each turning 25 degrees or
+  more the same way, no more than 0.9 px apart (1.5 px in a soft
+  picture). The corner's two sides are, on each side of the run, the
+  first of the next three sides that is level or upright (the first is
+  often the slope the blur leaves), else the first of 0.9 px or more; a
+  side under 2 px gives way to one of 4 px or more after it that runs
+  another way. A side goes on through the sides after it that lie on
+  its line (level ones within 0.25 px, slanted ones turning under 8
+  degrees), and the line is the longest one's.
+  Their lines must turn by `35 + corner smoothness * 1.3` degrees at
+  least, 170 at most. A run turning more than 110 degrees is two corners
+  (a notch) when one side inside it stands out 1.4 times from the next
+  longest, else none.
+- No corner where the curve is the art's own: the rounding between the
+  two sides (the chord from where the border leaves the line of the one
+  by 0.15 px to where it comes onto the line of the other) may be no
+  wider than a corner of radius 0.7 px rounds (1.2 px in a soft picture;
+  1.4 times that between two level or upright sides of 2 px or more
+  that do not bend on; 1.6 px at least between two sides of 4 px or
+  more), and a slanted side that turns on at its far
+  end like an arc's (15 to 46 degrees, turn times length up to 1.3) is
+  part of a bowl.
+- A bowl has no corner: four polygon points or more in a row turning
+  the same way by 15 to 60 degrees each, 150 degrees or more in all,
+  no more than 1.5 px apart, the longest side between them at most 1.4
+  times the middle one (the round bottom inside a small U).
+- A round ring has none either: eight polygon points or more, every
+  one turning the same way by at most 60 degrees, the longest side at
+  most 2.5 times the side a quarter of the way up from the shortest
+  (the inside of an O; a square with rounded corners has four long
+  sides and keeps its corners).
+- A ring no longer than 10 px round is smooth when only one corner was
+  found on it, and in a picture with soft edges whatever was found.
+- Between two level or upright sides the wider rounding (1.4 times) is
+  also allowed when one of them is a straight side of 4 px or more that
+  does not bend on, whatever the other does (the corner where the stem
+  of a B meets its top).
+
+## Enlarged pictures
+
+`Settings::pixel_scale` says how many pixels of the picture make one
+pixel of the art: 1 for a picture traced as it is, 4 for one enlarged
+four times before the trace. Above 1:
+
+- every area the trace measures in pixels is in pixels of the art: the
+  smallest patch kept, the smallest dot, the glint and the gap of a
+  letter are `pixel_scale` squared times as many pixels;
+- soft-edge bands (fringes) may be `pixel_scale` times as thick;
+- the picture is put on a grid twice as fine at most, where its size
+  allows (`scale_for`, 2 at most): its edges are sharp already, and
+  half a pixel places a straight edge without the one-pixel steps a
+  grid of its own pixels leaves in it;
+- the corner finder and the smoothing work in pixels of the art times
+  0.875 (an enlarging model rounds corners a little less than blur
+  does), and the curves may stray half as far as in a picture traced
+  as it is (its edges are placed more exactly);
+- the gap of a small letter (one colour all round, 120 or more from
+  its own) stays from half a pixel of the art: the enlarging draws the
+  gap of an A five pixels high smaller than it was;
+- the darker rim enlarging leaves along the edge of a colour with a
+  lighter one is that colour's: an edge pixel whose colour lies beyond
+  the colour it is the edge of, seen from the colour across the edge,
+  keeps it, where it would be a line of the nearest darker colour of
+  the picture;
+- the place two sides meet may lie 0.4 times as far from the rounded
+  corner as in a picture traced as it is (the tip of a small A is where
+  the enlarging drew it, not well above the letter);
+- the round end of a thin stroke is squared off only when its two
+  corners would lie within a quarter of the end's width of the border
+  (a square end rounded to half a circle leaves them a fifth away): a
+  round end whose corners would lie further is a bend (of an S) and
+  stays round;
+- the curves come out in pixels of the picture given; whoever enlarged
+  it scales them back.
+
+At any scale, the pale inside of a small letter that opens onto the
+paper is paper: a patch of at most 40 px of the art, most of its edge
+against a colour 120 or more from its own, that also touches a colour
+within 48 of its own takes that colour (the inside of a small G or C,
+left a shade darker than the paper by blur or by enlarging, was a
+region of its own closing the letter).
+- The cleaning of edges, fringes and specks runs at every detail, 100
+  included.
+
+## Gradients
+
+In flat art, the bands the colour reduction cuts a blend into are one
+region again (`trace_blend.rs`, #2929). A patch is part of a blend when
+its colour changes by at least 0.25 levels a pixel (a plane fitted to
+its pixels, edge pixels left out); a patch under 12 pixels or one pixel
+wide joins a blend beside it. A single such patch with no blend beside
+it is a blend by itself when a linear blend leaves at most 0.35 of its
+colour variance. Two patches join when the colours two
+pixels either side of their border are within 18 at the middle border
+place. Flat colours never join, however soft the edge between them. The
+region takes one colour (the mean) and, when its pixels lie within 18
+(root mean square) of a blend along the direction its colour changes
+most and the two ends are at least 24 apart, a linear blend from the
+colour at one end to the colour at the other: drawn as a gradient in
+the preview and placed as a linear fountain fill. Recolouring a colour
+on the Colors tab makes its region flat.
+
+## Presets
+
+Logo: detail 75, smoothing 20, 16 colours (50, 25, 8 before: letters
+melted and slogans were lost). Detailed logo: detail 90, smoothing 15,
+32 colours (75, 20, 24 before).
+
 ## Best settings (Optimized, Best optimization)
 
-The detail that draws a picture best: each detail of 50, 60, 70, 80 and
-85 traces samples of the picture at its own size, its art alone (the
+The detail that draws a picture best: each detail of 50, 60, 70, 80,
+90 and 95, and the detail the settings have, traces samples of the picture at its own size, its art alone (the
 box of its opaque pixels) when no more than 400 pixels across, else the
 four squares of 200 pixels in it with the most edges (neighbouring
 pixels more than 60 apart), side by side a transparent pixel apart,
@@ -394,8 +599,10 @@ within a pixel (an edge a pixel off is not wrong; a lost dot or line, a
 region in another colour, a gap are). The detail with the lowest score
 wins: the share drawn wrong (percent) plus 0.3 per node per pixel of
 the samples' sides, so a finer detail is chosen while it draws the
-picture better for the nodes it adds, and no further. Above 85 the
-cleaning of edges and specks stops and the nodes multiply. On the
+picture better for the nodes it adds, and no further. The detail the
+settings have stays unless another scores better by more than 0.05, so
+the search never leaves a trace worse than the one it started from and
+a second search changes nothing (#2930). On the
 desktop the details are traced at once, a thread each; in the browser
 one after the other, and only 60, 70 and 80. A search whose picture or
 settings changed before it ended (another image type, a detail set by
@@ -534,10 +741,42 @@ width equal to the mean local thickness.
 - `trace::tests::edge_pixels_go_to_the_flat_colours_beside_them`,
   `trace::tests::close_colours_and_colour_counts_are_kept` (a 246 grey
   logo on white at the Logo preset and with two colours, a grey ramp at
-  96 colours), `trace::tests::the_highest_detail_keeps_thin_lines`,
+  96 colours), `trace::tests::the_blend_of_two_colours_is_no_shape_at_any_detail`,
   `trace::tests::dilation_grows_a_mask_by_a_square`.
 
 - Given a 200x200 image of a black circle on white, outline mode, 2
   colours, then one closed curve with area within 2% of the circle.
 - Given the same with "remove background", then the white region is not
   emitted.
+- `trace::tests::anti_aliased_art_is_fitted_at_the_highest_detail`
+  (#2925): at Detail 100 and Smoothing 0 an anti-aliased disc is at most
+  16 nodes within 0.25 px of its circle, and a square turned 30 degrees
+  is four straight lines with a node within 0.3 px of each corner.
+- `trace::tests::soft_small_capitals_have_straight_sides_and_sharp_corners`:
+  a blurred H and L seven pixels high are straight lines only, level or
+  upright, 18 corners.
+- `trace::tests::an_edge_between_colours_equally_bright_is_found`,
+  `trace::tests::a_single_shape_with_a_gradient_is_one_blend`,
+  `trace::tests::a_high_smoothing_keeps_the_size_of_a_round_shape`,
+  `trace::tests::single_pixels_are_specks_below_the_highest_detail`,
+  `trace_fine::tests::only_a_soft_picture_is_sharpened`.
+- `trace::tests::an_enlarged_picture_is_measured_in_pixels_of_the_art`,
+  `trace::tests::the_gap_of_a_letter_open_to_the_paper_is_paper`,
+  `trace_fine::tests::a_bowl_between_two_straight_sides_has_no_corner`,
+  `trace_fine::tests::a_round_ring_and_a_tiny_one_have_no_corner`,
+  `trace::tests::no_pale_line_is_left_round_a_letter_on_a_shaded_background`,
+  `trace::tests::the_gap_of_a_small_letter_in_an_enlarged_picture_stays`,
+  `trace::tests::the_dark_rim_of_an_enlarged_edge_is_no_line`,
+  `trace_fine::tests::the_bend_of_a_small_s_is_not_squared_off`.
+- `trace::tests::an_edge_is_traced_where_it_runs_inside_its_pixels`,
+  `ops2::tests::a_trace_lies_exactly_over_its_bitmap` (#2926).
+- `trace::tests::edge_pixels_make_no_ring_of_a_look_alike_colour`
+  (#2929), `trace::tests::a_gradient_is_one_region_with_a_blend`
+  (#2929: a red to yellow bar is one curve with a blend along it; two
+  flat colours with a soft edge stay two).
+- `trace::tests::thin_faint_strokes_keep_their_shape_and_take_the_full_colour`
+  (#2927): a ring 7 px across drawn a pixel wide in mid grey is a black
+  ring with its hole at the Logo, Detailed logo and Optimized presets.
+- `trace::tests::only_paper_is_removed_and_all_of_it` (#2928).
+- `trace::tests::the_search_keeps_the_detail_when_none_is_better`
+  (#2930).

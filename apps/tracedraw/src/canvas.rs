@@ -477,6 +477,61 @@ pub fn printable_rect(
     )
 }
 
+/// A rectangle drawn in dashes of 4 points, one pixel wide.
+fn dashed_rect(painter: &Painter, r: ERect, color: Color32) {
+    let dash = 4.0;
+    for (a, b) in [
+        (r.left_top(), r.right_top()),
+        (r.right_top(), r.right_bottom()),
+        (r.right_bottom(), r.left_bottom()),
+        (r.left_bottom(), r.left_top()),
+    ] {
+        let len = (b - a).length();
+        let n = (len / (dash * 2.0)).floor() as usize;
+        for k in 0..n {
+            let t0 = (k as f32 * dash * 2.0) / len;
+            let t1 = ((k as f32 * dash * 2.0) + dash) / len;
+            painter.line_segment(
+                [a + (b - a) * t0, a + (b - a) * t1],
+                EStroke::new(1.0, color),
+            );
+        }
+    }
+}
+
+/// The colour of the page margins' frame (#1660).
+pub const PAGE_MARGIN_COLOR: Color32 = Color32::from_rgb(0xC0, 0x3C, 0xC8);
+
+/// The boxes inside the page margins of the pages on the desktop, in the
+/// current page's coordinates (#1660): with facing pages the inside
+/// margin at the spine of each page of the spread.
+pub fn page_margin_boxes(app: &App) -> Vec<tracedraw_core::geometry::Rect> {
+    let doc = app.doc();
+    if doc.metadata.margins.is_none() {
+        return Vec::new();
+    }
+    app.shown_pages()
+        .into_iter()
+        .filter_map(|(id, r)| {
+            let index = doc.pages.iter().position(|p| p.id == id)?;
+            doc.margin_box(index, r)
+        })
+        .collect()
+}
+
+/// The page margins (Document Setup > Layout, #1660): a dashed frame on
+/// each page shown, over the drawing like the guides.
+fn draw_page_margins(app: &App, painter: &Painter) {
+    for b in page_margin_boxes(app) {
+        let r = app.view.rect_to_screen(b);
+        dashed_rect(
+            painter,
+            ERect::from_min_max(r.min.round(), r.max.round()),
+            PAGE_MARGIN_COLOR,
+        );
+    }
+}
+
 /// The window's background, the page with its shadow and border, bleed
 /// and printable area, the grids, and the objects rendered (`preview`
 /// moves the selection while it is dragged).
@@ -649,24 +704,7 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         // Printable area: the page minus the printer's hard margins, as
         // the system reports them, else a typical 5 mm (#1924).
         let r = view.rect_to_screen(printable_rect(app, shown));
-        let dash = 4.0;
-        for (a, b) in [
-            (r.left_top(), r.right_top()),
-            (r.right_top(), r.right_bottom()),
-            (r.right_bottom(), r.left_bottom()),
-            (r.left_bottom(), r.left_top()),
-        ] {
-            let len = (b - a).length();
-            let n = (len / (dash * 2.0)).floor() as usize;
-            for k in 0..n {
-                let t0 = (k as f32 * dash * 2.0) / len;
-                let t1 = ((k as f32 * dash * 2.0) + dash) / len;
-                painter.line_segment(
-                    [a + (b - a) * t0, a + (b - a) * t1],
-                    EStroke::new(1.0, Tokens::text_dim()),
-                );
-            }
-        }
+        dashed_rect(painter, r, Tokens::text_dim());
     }
 
     if app.show_grid {
@@ -713,6 +751,7 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         }
     }
 
+    draw_page_margins(app, painter);
     if app.mask_outside_page {
         mask_outside_pages(app, painter, rect, paper);
     }
@@ -792,8 +831,24 @@ pub(crate) fn backdrop_parts(rect: ERect, at: ERect, back_at: ERect) -> Vec<ERec
     if !(area.width() > 0.0 && area.height() > 0.0) {
         return Vec::new();
     }
-    // (A picture a hair short of the canvas's edge covers it.)
-    outside(area, &[at.expand(0.5)])
+    // The backdrop meets the picture edge to edge: a hole a half pixel
+    // wider than the picture left a thin line of bare paper around it
+    // while the view zoomed out (#2899). A picture a hair short of the
+    // canvas's edge still covers it.
+    let mut hole = at;
+    if hole.left() - area.left() < 0.5 {
+        hole.min.x = hole.min.x.min(area.left());
+    }
+    if hole.top() - area.top() < 0.5 {
+        hole.min.y = hole.min.y.min(area.top());
+    }
+    if area.right() - hole.right() < 0.5 {
+        hole.max.x = hole.max.x.max(area.right());
+    }
+    if area.bottom() - hole.bottom() < 0.5 {
+        hole.max.y = hole.max.y.max(area.bottom());
+    }
+    outside(area, &[hole])
 }
 
 /// The parts of `area` no rectangle of `holes` covers, as rectangles:
@@ -2925,6 +2980,12 @@ fn draw_nodes(app: &App, painter: &Painter) {
             }
         }
     }
+    // The control handle chosen by a click: a ring round its head, the
+    // one the arrow keys move (#2819).
+    if let Some(c) = app.chosen_handle_point() {
+        let r = prefs.size.handle_head() * 0.5 + 3.0;
+        painter.circle_stroke(view.to_screen(c), r, EStroke::new(1.5, main));
+    }
     // The spot clicked on a segment: a small round mark where Add Node
     // puts the node.
     if let Some((id, index, t)) = app.segment_spot {
@@ -4133,6 +4194,26 @@ mod tests {
         m.grid.baseline_start = 0.0;
         app.run(tracedraw_core::Command::SetMetadata { metadata: m });
         assert!((app.baseline_ys()[0] - page.y1).abs() < 1e-9);
+    }
+
+    /// While the view zooms out the old picture shows smaller and the
+    /// backdrop fills round it, edge to edge: no strip of bare paper
+    /// between the two, not even half a pixel wide (#2899). At rest a
+    /// picture a hair short of the canvas needs no backdrop.
+    #[test]
+    fn the_backdrop_meets_the_shrunk_picture_without_a_gap() {
+        let canvas = ERect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let back = canvas.expand(200.0);
+        let at = ERect::from_min_max(Pos2::new(200.3, 150.7), Pos2::new(600.2, 450.4));
+        let parts = backdrop_parts(canvas, at, back);
+        let covered: f32 = parts.iter().map(|r| r.area()).sum::<f32>() + at.area();
+        let whole = canvas.area();
+        assert!((covered - whole).abs() < 0.01, "{covered} of {whole}");
+        for r in &parts {
+            assert!(r.intersect(at).area() < 1e-3, "{r:?} over the picture");
+        }
+        let rest = ERect::from_min_max(Pos2::new(0.3, 0.2), Pos2::new(799.8, 599.6));
+        assert!(backdrop_parts(canvas, rest, back).is_empty());
     }
 }
 

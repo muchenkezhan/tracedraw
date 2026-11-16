@@ -454,151 +454,7 @@ pub(crate) fn add_color_style(app: &mut App, c: Color) {
 }
 
 fn color_styles(app: &mut App, ui: &mut Ui) {
-    // Objects dragged from the drawing and let go here become colour
-    // styles (#2625): where the docker is, and a frame while they are
-    // over it.
-    let area = ui.max_rect().intersect(ui.clip_rect());
-    app.color_styles_rect = Some(area);
-    if app.transforming() && app.color_styles_drop_target() {
-        ui.painter().rect_stroke(
-            area.shrink(1.0),
-            3.0,
-            egui::Stroke::new(2.0, Tokens::SELECTION),
-            egui::StrokeKind::Inside,
-        );
-    }
-    let styles = app.doc().color_styles.clone();
-    if styles.is_empty() {
-        dim(ui, tr("docker.cs_drop_hint"));
-    }
-    ui.horizontal(|ui| {
-        if ui
-            .button(tr("docker.new_from_selection"))
-            .rich_tip(crate::ui::tips::pair(
-                "docker.new_from_selection",
-                "docker.cs_new_from_selection_desc",
-            ))
-            .clicked()
-        {
-            let mut st = styles.clone();
-            for s in app.selected_shapes() {
-                if let Some(c) = s.fill.preview_color() {
-                    if !st.iter().any(|x| x.color == c) {
-                        st.push(tracedraw_core::ColorStyle {
-                            name: format!("Color {}", st.len() + 1),
-                            color: c,
-                            harmony: None,
-                        });
-                    }
-                }
-            }
-            app.run(Command::SetColorStyles { styles: st });
-        }
-        if ui
-            .button(tr("docker.new_color_style"))
-            .rich_tip(crate::ui::tips::keyed("docker.new_color_style"))
-            .clicked()
-        {
-            add_color_style(app, app.mixer_color);
-        }
-    });
-    let mut st = styles.clone();
-    let mut changed = false;
-    let mut remove = None;
-    for (i, cs) in st.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            changed |= color_button(ui, &mut cs.color);
-            let field = egui::Id::new(("color_style_name", i));
-            let (_, typed) = kept_text(ui, field, i, &cs.name.clone(), |ui, text| {
-                ui.add(egui::TextEdit::singleline(text).desired_width(90.0))
-                    .rich_tip(crate::ui::tips::keyed("docker.cs_name"))
-            });
-            if let Some(name) = typed {
-                cs.name = name;
-                changed = true;
-            }
-            if ui
-                .small_button(tr("docker.fill"))
-                .rich_tip(crate::ui::tips::pair("docker.fill", "docker.cs_fill_desc"))
-                .clicked()
-            {
-                app.apply_fill(Fill::Solid(cs.color));
-            }
-            if ui
-                .small_button(tr("docker.outline"))
-                .rich_tip(crate::ui::tips::pair(
-                    "docker.outline",
-                    "docker.cs_outline_desc",
-                ))
-                .clicked()
-            {
-                app.apply_outline_color(Some(cs.color));
-            }
-            if ui
-                .small_button("x")
-                .rich_tip(crate::ui::tips::keyed("docker.cs_delete"))
-                .clicked()
-            {
-                remove = Some(i);
-            }
-        });
-    }
-    if let Some(i) = remove {
-        st.remove(i);
-        changed = true;
-    }
-    if changed {
-        // Objects using the old colour follow the style.
-        let mut cmds = vec![Command::SetColorStyles { styles: st.clone() }];
-        for (old, new) in styles.iter().zip(st.iter()) {
-            if old.color != new.color {
-                let ids: Vec<ShapeId> = app
-                    .doc()
-                    .all_layers()
-                    .flat_map(|l| &l.shapes)
-                    .filter(|s| s.fill == Fill::Solid(old.color))
-                    .map(|s| s.id)
-                    .collect();
-                if !ids.is_empty() {
-                    cmds.push(Command::SetFill {
-                        shapes: ids,
-                        fill: Fill::Solid(new.color),
-                    });
-                }
-            }
-        }
-        let _ = app.engine.run_batch("Color Styles", &cmds);
-    }
-    ui.separator();
-    ui.strong(tr("docker.harmony_editor"));
-    ui.horizontal_wrapped(|ui| {
-        for h in crate::palette::Harmony::ALL {
-            if ui
-                .button(tr(h.key()))
-                .rich_tip_with(|| format!("{}\n{}", tr(h.key()), tr(&format!("{}_desc", h.key()))))
-                .clicked()
-            {
-                let base = app.mixer_color;
-                let mut st = app.doc().color_styles.clone();
-                let name = tr(h.key());
-                for (k, c) in h.colors(base).into_iter().enumerate() {
-                    st.push(tracedraw_core::ColorStyle {
-                        name: format!("{name} {}", k + 1),
-                        color: c,
-                        harmony: Some(name.clone()),
-                    });
-                }
-                app.run(Command::SetColorStyles { styles: st });
-            }
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.label(tr("docker.base_color"));
-        let mut c = app.mixer_color;
-        if color_button(ui, &mut c) {
-            app.mixer_color = c;
-        }
-    });
+    crate::ui::color_styles_docker::show(app, ui);
 }
 
 /// Object Styles: the default properties of new objects, then the styles
@@ -1333,6 +1189,17 @@ fn scripts(app: &mut App, ui: &mut Ui) {
         {
             let src = app.script_source.clone();
             app.install_script_filter(&src);
+        }
+        // A script that defines TraceDrawPlugin: its commands go to
+        // Tools > Plugins (#1802).
+        if !vba
+            && ui
+                .button(tr("docker.install_plugin"))
+                .rich_tip(crate::ui::tips::keyed("docker.install_plugin"))
+                .clicked()
+        {
+            let src = app.script_source.clone();
+            app.install_plugin(&src);
         }
     });
     if !app.settings.script_filters.is_empty() {
@@ -2142,6 +2009,7 @@ fn bevel(app: &mut App, ui: &mut Ui) {
         light_color,
         level,
         emboss_color,
+        directional,
     }) = &cur
     {
         {
@@ -2154,6 +2022,7 @@ fn bevel(app: &mut App, ui: &mut Ui) {
                 light_color: *light_color,
                 level: *level,
                 emboss_color: *emboss_color,
+                directional: *directional,
             };
             app.bevel_synced_to = app.selection.first().copied();
         }
@@ -2171,10 +2040,14 @@ fn bevel(app: &mut App, ui: &mut Ui) {
     use crate::ui::tips::{keyed, pair};
     let b = &mut app.bevel;
     let mut changed = false;
-    // The style: two equal buttons across the panel.
+    // The style: three equal buttons across the panel.
     ui.horizontal(|ui| {
-        let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-        for (style, key) in [(0, "docker.soft_edge"), (1, "docker.emboss")] {
+        let w = (ui.available_width() - ui.spacing().item_spacing.x * 2.0) / 3.0;
+        for (style, key) in [
+            (0, "docker.soft_edge"),
+            (1, "docker.emboss"),
+            (2, "docker.bevel_center"),
+        ] {
             let pick = ui
                 .add_sized(
                     [w, 26.0],
@@ -2223,6 +2096,10 @@ fn bevel(app: &mut App, ui: &mut Ui) {
         .add(crate::ui::Slider::new(&mut b.intensity, 0.0..=100.0).text(tr("docker.intensity")))
         .rich_tip(pair("docker.intensity", "extrude.light_intensity_desc"))
         .changed();
+    changed |= ui
+        .checkbox(&mut b.directional, tr("docker.bevel_smooth_light"))
+        .rich_tip(keyed("docker.bevel_smooth_light"))
+        .changed();
     section(ui, None);
     row(ui, &tr("docker.light_color"), |ui| {
         changed |= color_button(ui, &mut b.light_color);
@@ -2258,9 +2135,12 @@ fn bevel(app: &mut App, ui: &mut Ui) {
         light_color: bv.light_color,
         level: bv.level,
         emboss_color: bv.emboss_color,
+        directional: bv.directional,
     };
     let has = !app.selection.is_empty();
-    if cur.is_some() && changed {
+    // Live: a change shows on the selection at once, also before Apply
+    // (#1034); Remove takes it away.
+    if has && changed {
         app.push_effect(effect.clone(), true);
     }
     ui.horizontal(|ui| {
@@ -2723,7 +2603,7 @@ pub fn hyperlink_field_id() -> egui::Id {
 /// elsewhere), the text typed when it differs from `stored`. `of` names
 /// what the field shows the text of (the object selected), so text typed
 /// for one object is never shown or stored for another.
-fn kept_text(
+pub(crate) fn kept_text(
     ui: &mut Ui,
     field: egui::Id,
     of: impl std::hash::Hash + std::fmt::Debug,

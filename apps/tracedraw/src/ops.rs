@@ -554,7 +554,9 @@ impl App {
     /// The label and shortcut state of Break Apart for the menus: the
     /// drop shadow's, an effect group's, else plain Break Apart.
     pub fn break_apart_label(&self) -> &'static str {
-        if self.can_break_shadow_apart() {
+        if self.breaks_effect_shadow() {
+            "menu.object.break_shadows_apart"
+        } else if self.can_break_shadow_apart() {
             "menu.object.break_shadow_apart"
         } else {
             self.effect_group_to_break()
@@ -830,9 +832,21 @@ impl App {
             }
         });
         let planes = picture.planes;
+        // A JPEG whose pixels are the picture's (not turned by its Exif
+        // orientation, not CMYK) is kept, so a packed .tdraw saves the
+        // JPEG instead of a PNG two to three times its size (#2849).
+        let (w, h) = picture.rgba.dimensions();
+        let keep_jpeg = planes.is_none()
+            && tracedraw_core::jpeg_source::decodes_to(&bytes, w, h, picture.rgba.as_raw());
         let Some(id) = self.place_image_at(picture.rgba, name, dpi) else {
             return;
         };
+        if keep_jpeg {
+            if let Some(ShapeKind::Bitmap { png, .. }) = self.doc().find_shape(id).map(|s| &s.kind)
+            {
+                tracedraw_core::jpeg_source::remember(png, bytes.as_slice().into());
+            }
+        }
         if let Some(planes) = planes {
             // The pixels as the object keeps them, with the inks beside.
             let png = match self.doc().find_shape(id).map(|s| &s.kind) {
@@ -1835,10 +1849,22 @@ impl App {
             return;
         }
         let shapes = self.selection.clone();
-        if collapse && matches!(self.engine.undo_label(), Some("Drop Shadow")) {
+        // A drag or a field typed in again replaces the step it made, but
+        // only that step: the same objects, nothing done since. A shadow
+        // just given to another object was taken back when the next
+        // object got one (#2890).
+        let same_step = self.engine.at_recorded_step()
+            && self.shadow_step.as_ref().is_some_and(|(step, ids)| {
+                Some(*step) == self.engine.last_step_id() && *ids == shapes
+            });
+        if collapse && same_step && matches!(self.engine.undo_label(), Some("Drop Shadow")) {
             let _ = self.engine.undo();
         }
-        self.run(Command::SetShadow { shapes, shadow });
+        self.run(Command::SetShadow {
+            shapes: shapes.clone(),
+            shadow,
+        });
+        self.shadow_step = self.engine.last_step_id().map(|step| (step, shapes));
     }
 }
 
@@ -2041,7 +2067,12 @@ mod smoke_tests {
         app.create_box_shape(Point::new(50.0, 150.0), Point::new(80.0, 180.0));
         app.tool = Tool::Spiral;
         let r = Rect::new(10.0, 150.0, 40.0, 180.0);
-        let path = crate::tools2::spiral_path(r, app.spiral_revolutions, app.spiral_logarithmic);
+        let path = crate::tools2::spiral_path(
+            r,
+            app.spiral_revolutions,
+            app.spiral_logarithmic,
+            app.settings.spiral_expansion,
+        );
         app.new_shape(ShapeKind::Path {
             path,
             closed: false,

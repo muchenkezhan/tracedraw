@@ -243,6 +243,13 @@ pub enum Command {
         shape: ShapeId,
         name: Option<String>,
     },
+    /// Mark texts as headings of the tables of contents at `level`, 1 to
+    /// 3, or as no heading (`None`), #1660. Levels out of range read as
+    /// none.
+    SetTocLevel {
+        shapes: Vec<ShapeId>,
+        level: Option<u8>,
+    },
     /// A B-spline's control points (local space; two at least): the
     /// curve's outline becomes their spline, open or closed as the curve
     /// is, and the Shape tool edits them (see [`Shape::spline`]).
@@ -383,6 +390,12 @@ pub enum Command {
     Recolor {
         shapes: Vec<ShapeId>,
         recolor: crate::recolor::Recolor,
+    },
+    /// Change every use of the first colour of each pair in the drawing
+    /// to the second, all pairs at once (a swap needs no third colour):
+    /// objects follow a colour style that changes (#778).
+    ReplaceColors {
+        pairs: Vec<(crate::Color, crate::Color)>,
     },
     /// Move `shapes` directly in front of (or behind) `reference` in its layer.
     OrderRelative {
@@ -579,6 +592,7 @@ impl Command {
             Command::SwapColors { .. } => "Swap Colors",
             Command::SetShapeKind { .. } => "Edit Object",
             Command::SetShapeName { .. } => "Rename Object",
+            Command::SetTocLevel { .. } => "Table of Contents Heading",
             Command::SetSpline { .. } => "Edit B-Spline",
             Command::SetQrCode { .. } => "QR Code",
             Command::Reorder { .. } => "Order",
@@ -605,6 +619,7 @@ impl Command {
             Command::SetPictureInks { .. } => "Edit Object",
             Command::ConvertColors { .. } => "Convert Colors",
             Command::Recolor { .. } => "Recolor",
+            Command::ReplaceColors { .. } => "Color Styles",
             Command::ReplaceFontFamily { .. } => "Replace Font",
             Command::OrderRelative { in_front: true, .. } => "In Front Of",
             Command::OrderRelative { .. } => "Behind",
@@ -1005,6 +1020,15 @@ impl Command {
                 let keep = outline(&s.kind) && outline(kind);
                 let before =
                     keep.then(|| crate::geometry::Shape::bounding_box(&(parent * s.page_path())));
+                // A text with a mesh made over it: the mesh's box, to
+                // follow the text's new one (#2892, #2894).
+                let text_mesh_box = match (&s.kind, kind, &s.fill) {
+                    (ShapeKind::Text { .. }, ShapeKind::Text { .. }, Fill::Mesh(m)) => {
+                        let b = crate::geometry::Shape::bounding_box(&s.local_path());
+                        m.fits(b).then_some(b)
+                    }
+                    _ => None,
+                };
                 // Chosen node types follow node indices: a curve that
                 // gains or loses nodes drops them.
                 if !s.node_types.is_empty() && node_count(&s.kind) != node_count(kind) {
@@ -1017,6 +1041,17 @@ impl Command {
                 if let Some(before) = before {
                     let after = crate::geometry::Shape::bounding_box(&(parent * s.page_path()));
                     s.keep_paint_in_place(before, after);
+                }
+                // The text's mesh stretched from its old box to its new
+                // one: typed over with a wider letter (a T made a C), the
+                // part past the old box was left without fill, a block
+                // shadow showed through it along the mesh's straight edge
+                // and an inner shadow seemed to miss a piece.
+                if let Some(from) = text_mesh_box {
+                    let to = crate::geometry::Shape::bounding_box(&s.local_path());
+                    if let (Fill::Mesh(m), Some(t)) = (&mut s.fill, box_to_box(from, to)) {
+                        *m = m.transformed(t);
+                    }
                 }
                 keep_clip_frame_paint(doc, holder);
             }
@@ -1060,6 +1095,12 @@ impl Command {
                 any_mut(doc, *shape)?.node_types = types.clone()
             }
             Command::SetShapeName { shape, name } => any_mut(doc, *shape)?.name = name.clone(),
+            Command::SetTocLevel { shapes, level } => {
+                let level = level.filter(|l| (1..=crate::toc::MAX_LEVEL).contains(l));
+                for id in shapes {
+                    any_mut(doc, *id)?.toc_level = level;
+                }
+            }
             Command::SetQrCode { shape, qr } => any_mut(doc, *shape)?.qr = qr.clone(),
 
             Command::Reorder {
@@ -1284,6 +1325,9 @@ impl Command {
             }
             Command::ReplaceFontFamily { from, to } => {
                 doc.replace_font_family(from, to);
+            }
+            Command::ReplaceColors { pairs } => {
+                crate::color_convert::replace_colors(doc, pairs);
             }
             Command::OrderRelative {
                 shapes,
@@ -2292,6 +2336,26 @@ fn for_group_deep(shape: &mut Shape, f: &mut dyn FnMut(&mut Shape)) {
     }
 }
 
+/// The map taking box `from` onto box `to`, each side onto its side;
+/// `None` when either box has no width or height, or they are the same.
+fn box_to_box(
+    from: crate::geometry::Rect,
+    to: crate::geometry::Rect,
+) -> Option<crate::geometry::Affine> {
+    use crate::geometry::Affine;
+    let ok = |r: crate::geometry::Rect| {
+        r.width() > 1e-9 && r.height() > 1e-9 && r.x0.is_finite() && r.y0.is_finite()
+    };
+    if !(ok(from) && ok(to)) || from == to {
+        return None;
+    }
+    Some(
+        Affine::translate((to.x0, to.y0))
+            * Affine::scale_non_uniform(to.width() / from.width(), to.height() / from.height())
+            * Affine::translate((-from.x0, -from.y0)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     /// The Objects docker's moves (#2672): objects go next to an object
@@ -2742,6 +2806,66 @@ mod tests {
                 inks: None,
             })
             .is_err());
+    }
+
+    /// A text with a mesh made over it keeps the mesh over it when its
+    /// text changes: typed over with a wider letter (a T made a C), the
+    /// part past the old mesh had no fill and the shadows showed through
+    /// it (#2892, #2894). A mesh moved off its text's box stays put.
+    #[test]
+    fn a_texts_mesh_follows_the_text_when_it_is_typed_over() {
+        use crate::geometry::Point;
+        let text = |s: &str| ShapeKind::Text {
+            spans: vec![crate::TextSpan::new(s, "Any", 72.0)],
+            origin: Point::ZERO,
+            frame: None,
+            align: Default::default(),
+            para: Default::default(),
+            on_path: None,
+        };
+        let mesh_box = |m: &crate::Mesh| {
+            m.nodes.iter().fold(
+                crate::geometry::Rect::from_points(m.nodes[0].pos, m.nodes[0].pos),
+                |r, n| r.union_pt(n.pos),
+            )
+        };
+        for over in [true, false] {
+            let mut doc = Document::new("t", Size::new(200.0, 100.0));
+            let page = doc.pages[0].id;
+            let layer = doc.page(page).expect("page").layers[0].id;
+            let id = doc.ids_mut().shape();
+            let mut shape = Shape::new(id, text("T"));
+            let b = crate::geometry::Shape::bounding_box(&shape.local_path());
+            let grid = if over {
+                b
+            } else {
+                crate::geometry::Rect::new(b.x0, b.y0, b.x0 + b.width() / 2.0, b.y1)
+            };
+            shape.fill = Fill::Mesh(crate::Mesh::new(grid, 2, 2, Color::BLACK));
+            let mut eng = crate::Engine::new(doc);
+            eng.run(&Command::AddShape { layer, shape }).expect("added");
+            eng.run(&Command::SetShapeKind {
+                shape: id,
+                kind: text("CC"),
+            })
+            .expect("typed");
+            let s = eng.document().find_shape(id).expect("shape");
+            let wide = crate::geometry::Shape::bounding_box(&s.local_path());
+            assert!(wide.width() > b.width() * 1.5, "{wide:?} vs {b:?}");
+            let Fill::Mesh(m) = &s.fill else {
+                panic!("{:?}", s.fill)
+            };
+            let got = mesh_box(m);
+            let want = if over { wide } else { grid };
+            for (g, w) in [
+                (got.x0, want.x0),
+                (got.x1, want.x1),
+                (got.y0, want.y0),
+                (got.y1, want.y1),
+            ] {
+                assert!((g - w).abs() < 1e-9, "over {over}: {got:?} vs {want:?}");
+            }
+        }
     }
 
     #[test]
@@ -3360,6 +3484,7 @@ mod tests {
             to_center: false,
             fill_to: Color::WHITE,
             outline_to: None,
+            fill_end_to: None,
             color_blend: 0,
             corners: None,
             accel_objects: 0.0,
