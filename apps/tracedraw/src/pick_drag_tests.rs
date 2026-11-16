@@ -19471,7 +19471,10 @@ fn frame_times_of_the_trace_dialog_resting_on_the_quick_look() {
 #[test]
 fn the_trace_dialog_rests_once_the_trace_is_in() {
     for defer_full in [false, true] {
-        let n = 800;
+        // Keep the non-deferred full trace small enough for slower CI
+        // workers. The deferred case stays over its size threshold, so it
+        // still exercises the quick-look-only path.
+        let n = if defer_full { 700 } else { 320 };
         let img = image::RgbaImage::from_fn(n, n, |x, y| {
             let v = ((x + y) * 255 / (2 * n)) as u8;
             image::Rgba([v, v, v, 255])
@@ -19534,6 +19537,10 @@ fn the_trace_dialog_rests_once_the_trace_is_in() {
             frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
             std::thread::sleep(std::time::Duration::from_millis(3));
         }
+        assert!(
+            !app.trace_live.busy(),
+            "defer {defer_full}: the changed trace did not finish within 60 seconds"
+        );
         assert_eq!(app.trace_live.started, started + 1, "defer {defer_full}");
         for _ in 0..20 {
             trace_frame_asks_for_another(&ctx, &mut app);
