@@ -158,9 +158,19 @@ pub fn curves(painter: &Painter, r: Rect, scale: f32, nodes: &[f32]) {
 /// "TraceDraw" laid out in the bold face at `size`: "Trace" in white,
 /// "Draw" in the light blue accent.
 pub fn name_galley(painter: &Painter, size: f32) -> Arc<egui::Galley> {
+    name_galley_on(painter, size, Color32::WHITE, NAME_ACCENT)
+}
+
+/// The same wordmark on a themed surface, using its foreground and accent.
+pub fn name_galley_on(
+    painter: &Painter,
+    size: f32,
+    foreground: Color32,
+    accent: Color32,
+) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     let font = crate::theme::bold(size);
-    for (part, color) in [("Trace", Color32::WHITE), ("Draw", NAME_ACCENT)] {
+    for (part, color) in [("Trace", foreground), ("Draw", accent)] {
         job.append(
             part,
             0.0,
@@ -182,6 +192,25 @@ mod tests {
     fn the_embedded_icon_decodes() {
         let img = icon_image().expect("icon decodes");
         assert_eq!(img.size, [128, 128]);
+    }
+
+    #[test]
+    fn the_wordmark_keeps_its_name_and_surface_colours() {
+        let ctx = crate::theme::ui_context();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let original = name_galley(ui.painter(), 25.0);
+            assert_eq!(original.text(), "TraceDraw");
+            assert_eq!(original.job.sections[0].format.color, Color32::WHITE);
+            assert_eq!(original.job.sections[1].format.color, NAME_ACCENT);
+            let foreground = crate::theme::Tokens::text();
+            let accent = crate::theme::link_color();
+            let surface = name_galley_on(ui.painter(), 25.0, foreground, accent);
+            assert_eq!(surface.text(), "TraceDraw");
+            assert_eq!(surface.job.sections[0].format.color, foreground);
+            assert_eq!(surface.job.sections[1].format.color, accent);
+            assert_eq!(surface.size(), original.size());
+        });
+        out.textures_delta.clear();
     }
 
     #[test]

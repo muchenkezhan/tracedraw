@@ -2,11 +2,32 @@
 //! What's New, Learn, Templates.
 
 use crate::app::{App, WelcomeTab};
-use crate::i18n::{tr, trf};
+use crate::i18n::tr;
 use crate::theme::Tokens;
 use crate::ui::icons;
 use crate::ui::tips::RichTip;
 use egui::Ui;
+
+mod pages;
+use pages::{learn, news, templates, workspace};
+
+#[cfg(test)]
+mod layout_tests;
+
+#[cfg(test)]
+mod visual_tests;
+
+const MAX_CONTENT_WIDTH: f32 = 1240.0;
+const PAGE_MARGIN: f32 = 24.0;
+const SIDEBAR_WIDTH: f32 = 220.0;
+
+const TABS: [(WelcomeTab, &str); 5] = [
+    (WelcomeTab::GetStarted, "welcome.get_started"),
+    (WelcomeTab::Workspace, "welcome.workspace"),
+    (WelcomeTab::News, "welcome.whats_new"),
+    (WelcomeTab::Learn, "welcome.learn"),
+    (WelcomeTab::Templates, "welcome.templates"),
+];
 
 /// One release in the What's New history: its version, its release date
 /// and the language keys of its short title and its paragraph.
@@ -104,139 +125,254 @@ pub(crate) fn news_row_id(version: &str) -> egui::Id {
 }
 
 pub fn welcome_screen(app: &mut App, ui: &mut Ui) {
-    ui.add_space(8.0);
-    // The tabs go on to a second line on a narrow screen (#1691).
-    ui.horizontal_wrapped(|ui| {
+    let available = ui.available_rect_before_wrap();
+    ui.painter().rect_filled(available, 0.0, Tokens::field());
+    let width = available.width().min(MAX_CONTENT_WIDTH);
+    let shell = egui::Rect::from_min_size(
+        egui::pos2(available.center().x - width / 2.0, available.top()),
+        egui::vec2(width, available.height()),
+    );
+    #[cfg(test)]
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(egui::Id::new("welcome_shell_rect"), shell);
+    });
+    let margin = if width < 600.0 { 12.0 } else { PAGE_MARGIN };
+    let margin = margin.min((width / 2.0).max(0.0));
+    let vertical_margin = 20.0_f32.min((shell.height() / 2.0).max(0.0));
+    let content = shell.shrink2(egui::vec2(margin, vertical_margin));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+        ui.set_width(content.width());
+        header(app, ui);
         ui.add_space(24.0);
-        ui.heading(egui::RichText::new("TraceDraw").size(26.0));
-        ui.add_space(30.0);
-        for (tab, key) in [
-            (WelcomeTab::GetStarted, "welcome.get_started"),
-            (WelcomeTab::Workspace, "welcome.workspace"),
-            (WelcomeTab::News, "welcome.whats_new"),
-            (WelcomeTab::Learn, "welcome.learn"),
-            (WelcomeTab::Templates, "welcome.templates"),
-        ] {
-            if ui
-                .selectable_label(
-                    app.welcome_tab == tab,
-                    egui::RichText::new(tr(key)).size(14.0),
-                )
-                .clicked()
-            {
-                app.welcome_tab = tab;
-            }
+        if app.welcome_tab == WelcomeTab::GetStarted {
+            get_started(app, ui);
+        } else {
+            // Each page keeps its own scrolling position below the navigation.
+            egui::ScrollArea::vertical()
+                .id_salt(("welcome_page", format!("{:?}", app.welcome_tab)))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    match app.welcome_tab {
+                        WelcomeTab::GetStarted => {}
+                        WelcomeTab::Workspace => workspace(app, ui),
+                        WelcomeTab::News => {
+                            if let Some(url) = news(ui) {
+                                app.open_url(&url);
+                            }
+                        }
+                        WelcomeTab::Learn => learn(ui),
+                        WelcomeTab::Templates => templates(app, ui),
+                    }
+                    ui.add_space(12.0);
+                });
         }
     });
-    ui.separator();
-    // Get Started keeps its buttons in place: only its list of recent
-    // documents scrolls, in the window's remaining height (#1383).
-    if app.welcome_tab == WelcomeTab::GetStarted {
-        ui.add_space(12.0);
-        get_started(app, ui);
-        return;
-    }
-    // The page of the other tabs scrolls under the tab row (a small
-    // window), with the wheel and a scroll bar (#1288); each tab keeps its
-    // own place.
-    egui::ScrollArea::vertical()
-        .id_salt(("welcome_page", format!("{:?}", app.welcome_tab)))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.add_space(12.0);
-            match app.welcome_tab {
-                WelcomeTab::GetStarted => {}
-                WelcomeTab::Workspace => workspace(app, ui),
-                WelcomeTab::News => {
-                    if let Some(url) = news(ui) {
-                        app.open_url(&url);
-                    }
+}
+
+fn header(app: &mut App, ui: &mut Ui) {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::Vec2::splat(6.0);
+        let widgets = &mut ui.visuals_mut().widgets;
+        for visual in [
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+            &mut widgets.open,
+        ] {
+            // Button frames and their hidden inactive variant use the same padding.
+            visual.bg_stroke = egui::Stroke::NONE;
+            visual.expansion = 0.0;
+        }
+        let wide = ui.available_width() >= 900.0;
+        if wide {
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(220.0, 36.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    wordmark,
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 36.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        for &(tab, key) in TABS.iter().rev() {
+                            tab_button(app, ui, tab, key);
+                        }
+                    },
+                );
+            });
+        } else {
+            wordmark(ui);
+            ui.add_space(14.0);
+            ui.horizontal_wrapped(|ui| {
+                for (tab, key) in TABS {
+                    tab_button(app, ui, tab, key);
                 }
-                WelcomeTab::Learn => learn(ui),
-                WelcomeTab::Templates => templates(app, ui),
-            }
-            ui.add_space(12.0);
-        });
+            });
+        }
+    });
+    ui.add_space(12.0);
+    ui.painter().hline(
+        ui.max_rect().x_range(),
+        ui.cursor().top(),
+        egui::Stroke::new(1.0, Tokens::border()),
+    );
+}
+
+fn wordmark(ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
+        let icon = crate::ui::brand::icon(ui.ctx());
+        crate::ui::brand::paint_icon(ui.painter(), icon.as_ref(), rect);
+        let name = crate::ui::brand::name_galley_on(
+            ui.painter(),
+            25.0,
+            Tokens::text(),
+            crate::theme::link_color(),
+        );
+        ui.label(name);
+    });
+}
+
+fn tab_button(app: &mut App, ui: &mut Ui, tab: WelcomeTab, key: &str) {
+    let selected = app.welcome_tab == tab;
+    let response = ui
+        .add(
+            egui::Button::selectable(selected, egui::RichText::new(tr(key)).size(14.0))
+                .corner_radius(6.0),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked_by(egui::PointerButton::Primary) {
+        response.surrender_focus();
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(2.0),
+            4.0,
+            egui::Stroke::new(1.0, crate::theme::on_highlight()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if response.clicked() {
+        app.welcome_tab = tab;
+    }
 }
 
 fn big_button(ui: &mut Ui, icon: icons::Action, title: String, subtitle: String) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(240.0, 64.0), egui::Sense::click());
-    let bg = if resp.hovered() {
-        Tokens::tool_hover()
+    let width = ui.available_width();
+    let text_width = (width - 60.0).max(40.0);
+    let title_galley = ui.painter().layout(
+        title.clone(),
+        egui::FontId::proportional(14.0),
+        Tokens::text(),
+        text_width,
+    );
+    let subtitle_galley = ui.painter().layout(
+        subtitle.clone(),
+        egui::FontId::proportional(11.0),
+        Tokens::text_dim(),
+        text_width,
+    );
+    let text_height = title_galley.size().y
+        + if subtitle.is_empty() {
+            0.0
+        } else {
+            subtitle_galley.size().y + 4.0
+        };
+    let height = (text_height + 20.0).max(52.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &title)
+    });
+    let primary = icon == icons::Action::New;
+    let highlighted = resp.hovered() || primary;
+    let foreground = if highlighted {
+        crate::theme::on_highlight()
+    } else {
+        Tokens::text()
+    };
+    let secondary = if highlighted && crate::theme::theme() == crate::theme::Theme::HighContrast {
+        foreground
+    } else {
+        Tokens::text_dim()
+    };
+    let bg = if highlighted {
+        Tokens::selected_row()
     } else {
         Tokens::panel()
     };
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, bg);
-    painter.rect_stroke(
-        rect,
-        4.0,
-        egui::Stroke::new(1.0, Tokens::border()),
-        egui::epaint::StrokeKind::Inside,
-    );
-    let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 32.0, rect.center().y),
-        egui::vec2(28.0, 28.0),
-    );
-    icons::draw_action(painter, icon_rect, icon, Tokens::ACCENT);
-    let text_x = rect.left() + 64.0;
-    painter.text(
-        egui::pos2(
-            text_x,
-            rect.center().y - if subtitle.is_empty() { 0.0 } else { 9.0 },
-        ),
-        egui::Align2::LEFT_CENTER,
-        title,
-        egui::FontId::proportional(14.0),
-        Tokens::text(),
-    );
-    if !subtitle.is_empty() {
-        painter.text(
-            egui::pos2(text_x, rect.center().y + 10.0),
-            egui::Align2::LEFT_CENTER,
-            subtitle,
-            egui::FontId::proportional(11.0),
-            Tokens::text_dim(),
+    painter.rect_filled(rect, 6.0, bg);
+    if resp.has_focus() || resp.hovered() {
+        painter.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(
+                if resp.has_focus() { 2.0 } else { 1.0 },
+                crate::theme::link_color(),
+            ),
+            egui::epaint::StrokeKind::Inside,
         );
     }
-    resp.clicked()
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 25.0, rect.center().y),
+        egui::vec2(24.0, 24.0),
+    );
+    icons::draw_action(painter, icon_rect, icon, foreground);
+    let text_at = egui::pos2(rect.left() + 48.0, rect.center().y - text_height / 2.0);
+    painter.galley_with_override_text_color(text_at, title_galley.clone(), foreground);
+    if !subtitle.is_empty() {
+        painter.galley_with_override_text_color(
+            text_at + egui::vec2(0.0, title_galley.size().y + 4.0),
+            subtitle_galley,
+            secondary,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 fn get_started(app: &mut App, ui: &mut Ui) {
     // On a phone the recent documents go under the buttons and the page
     // scrolls: side by side they need some 700 points (#1301, #1691).
-    if crate::ui::phone::phone() {
+    if crate::ui::phone::phone() || ui.available_width() < 720.0 || ui.available_height() < 260.0 {
         egui::ScrollArea::vertical()
             .id_salt("welcome_get_started")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.add_space(12.0);
-                    ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 12.0);
-                        start_buttons(app, ui);
-                        // A browser keeps no recent documents.
-                        if !crate::files::WEB {
-                            ui.add_space(20.0);
-                            recent_documents(app, ui, true);
-                        }
-                    });
-                });
+                start_buttons(app, ui);
+                if !crate::files::WEB {
+                    ui.add_space(24.0);
+                    recent_documents(app, ui, true);
+                }
             });
         return;
     }
     ui.horizontal_top(|ui| {
-        ui.add_space(24.0);
-        ui.vertical(|ui| {
-            ui.set_width(260.0);
-            start_buttons(app, ui);
-        });
+        ui.spacing_mut().item_spacing.x = 28.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(SIDEBAR_WIDTH, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::new()
+                    .fill(Tokens::panel())
+                    .corner_radius(8.0)
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        ui.set_width(SIDEBAR_WIDTH - 24.0);
+                        start_buttons(app, ui);
+                    });
+            },
+        );
         // A browser keeps no recent documents.
         if crate::files::WEB {
             return;
         }
-        ui.add_space(40.0);
-        ui.vertical(|ui| recent_documents(app, ui, false));
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            recent_documents(app, ui, false);
+        });
     });
 }
 
@@ -264,7 +400,7 @@ fn start_buttons(app: &mut App, ui: &mut Ui) {
         ui,
         icons::Action::Open,
         tr("welcome.open_document"),
-        "Ctrl+O".into(),
+        crate::shortcuts::shown("Ctrl+O".into()),
     ) {
         app.open_dialog();
         if app.file.is_some() || app.doc().all_layers().any(|l| !l.shapes.is_empty()) {
@@ -288,21 +424,62 @@ fn start_buttons(app: &mut App, ui: &mut Ui) {
 /// The recent documents heading, list and Clear button; the list scrolls
 /// on its own except on a `phone`, whose whole page scrolls.
 fn recent_documents(app: &mut App, ui: &mut Ui, phone: bool) {
-    ui.strong(tr("welcome.recent_documents"));
-    let recent = app.settings.recent_files.clone();
+    let mut recent = app.settings.recent_files.clone();
+    let mut clear = false;
+    let compact = ui.available_width() < 480.0;
+    let heading_layout = if compact {
+        egui::Layout::top_down(egui::Align::Min)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), if compact { 0.0 } else { 28.0 }),
+        heading_layout,
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(tr("welcome.recent_documents"))
+                        .font(crate::theme::bold(18.0)),
+                )
+                .wrap(),
+            );
+            if !recent.is_empty() {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 28.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let widgets = &mut ui.visuals_mut().widgets;
+                        widgets.inactive.fg_stroke.color = Tokens::text_dim();
+                        widgets.hovered.fg_stroke.color = crate::theme::link_color();
+                        widgets.active.fg_stroke.color = crate::theme::link_color();
+                        clear = ui
+                            .add(
+                                egui::Button::new(tr("menu.file.clear_recent"))
+                                    .small()
+                                    .frame(false),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked();
+                    },
+                );
+            }
+        },
+    );
+    if clear {
+        app.settings.recent_files.clear();
+        app.settings.save();
+        crate::thumbnails::clear();
+        app.recent_thumbs.clear();
+        recent.clear();
+    }
+    ui.add_space(12.0);
     if recent.is_empty() {
         ui.label(egui::RichText::new(tr("welcome.no_recent")).color(Tokens::text_dim()));
     }
-    ui.add_space(4.0);
     // The list has a scroll area of its own, as tall as the window
-    // leaves under the heading, less the Clear button and a margin
+    // leaves under the heading and its Clear action, less a margin
     // (#1383); the heading, the button and the left column stay put. On
     // a phone the whole page scrolls instead.
-    let clear = if recent.is_empty() {
-        0.0
-    } else {
-        ui.spacing().interact_size.y + ui.spacing().item_spacing.y
-    };
     let mut actions = Vec::new();
     // With room, a table across the window: name, location, size and
     // the last edit (#1675); else (a phone, a narrow window) the name
@@ -319,7 +496,7 @@ fn recent_documents(app: &mut App, ui: &mut Ui, phone: bool) {
             table_header(ui);
         }
         let header = if table { TABLE_HEADER_H } else { 0.0 };
-        let height = (ui.available_height() - clear - 12.0 - header).max(RECENT_ROW.y);
+        let height = (ui.available_height() - 12.0 - header).max(RECENT_ROW.y);
         egui::ScrollArea::vertical()
             .id_salt("welcome_recent_list")
             .max_height(height)
@@ -339,14 +516,6 @@ fn recent_documents(app: &mut App, ui: &mut Ui, phone: bool) {
             }
             RecentAction::Remove => app.remove_recent(p),
         }
-    }
-    if !app.settings.recent_files.is_empty()
-        && ui.small_button(tr("menu.file.clear_recent")).clicked()
-    {
-        app.settings.recent_files.clear();
-        app.settings.save();
-        crate::thumbnails::clear();
-        app.recent_thumbs.clear();
     }
 }
 
@@ -371,15 +540,15 @@ pub(crate) fn remove_recent_id(path: &std::path::Path) -> egui::Id {
 }
 
 /// The size of a recent document's row (the narrow list's).
-const RECENT_ROW: egui::Vec2 = egui::vec2(380.0, 56.0);
+const RECENT_ROW: egui::Vec2 = egui::vec2(380.0, 64.0);
 /// The recent documents' thumbnail.
-const RECENT_THUMB: egui::Vec2 = egui::vec2(64.0, 48.0);
+const RECENT_THUMB: egui::Vec2 = egui::vec2(44.0, 44.0);
 /// The room the remove button takes at a row's right.
 const RECENT_X: f32 = 20.0;
 /// The width from which the recent documents show as a table (#1675).
 const TABLE_MIN_WIDTH: f32 = 560.0;
 /// The table's header row.
-const TABLE_HEADER_H: f32 = 20.0;
+const TABLE_HEADER_H: f32 = 26.0;
 /// The table's columns after the thumbnail: their keys and shares of the
 /// width.
 const TABLE_COLUMNS: [(&str, f32); 4] = [
@@ -416,10 +585,23 @@ fn table_header(ui: &mut Ui) {
         egui::Sense::hover(),
     );
     let painter = ui.painter();
-    for ((key, _), (x, w)) in TABLE_COLUMNS
-        .iter()
-        .zip(table_columns(rect.left(), rect.right()))
-    {
+    let columns = table_columns(rect.left(), rect.right());
+    let mut label_x = columns[0].0;
+    for key in ["welcome.col_name", "welcome.col_location"] {
+        let label = painter.layout_no_wrap(
+            tr(key),
+            egui::FontId::proportional(11.0),
+            Tokens::text_dim(),
+        );
+        let width = label.size().x;
+        painter.galley(
+            egui::pos2(label_x, rect.center().y - label.size().y / 2.0),
+            label,
+            Tokens::text_dim(),
+        );
+        label_x += width + 12.0;
+    }
+    for ((key, _), (x, w)) in TABLE_COLUMNS.iter().zip(columns).skip(2) {
         let clip = egui::Rect::from_min_max(
             egui::pos2(x, rect.top()),
             egui::pos2(x + w - 6.0, rect.bottom()),
@@ -432,11 +614,6 @@ fn table_header(ui: &mut Ui) {
             Tokens::text_dim(),
         );
     }
-    painter.hline(
-        rect.x_range(),
-        rect.bottom() - 0.5,
-        egui::Stroke::new(1.0, Tokens::border()),
-    );
 }
 
 /// One recent drawing: its thumbnail (a blank page when it has none), its
@@ -467,13 +644,24 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
     let on_row = ui.rect_contains_pointer(rect);
     let painter = ui.painter();
     if exists && on_row {
-        painter.rect_filled(rect, 2.0, Tokens::tool_hover());
+        painter.rect_filled(rect, 6.0, Tokens::hovered_row());
     }
-    let frame = egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 4.0), THUMB);
-    painter.rect_filled(frame, 0.0, egui::Color32::WHITE);
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(2.0, crate::theme::link_color()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let frame = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 4.0 + THUMB.x / 2.0, rect.center().y),
+        THUMB,
+    );
+    painter.rect_filled(frame, 6.0, Tokens::panel());
     if let Some(t) = &thumb {
         let size = t.size_vec2();
-        let scale = (THUMB.x / size.x.max(1.0)).min(THUMB.y / size.y.max(1.0));
+        let scale = ((THUMB.x - 4.0) / size.x.max(1.0)).min((THUMB.y - 4.0) / size.y.max(1.0));
         let r = egui::Rect::from_center_size(frame.center(), size * scale);
         painter.image(
             t.id(),
@@ -481,13 +669,35 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+    } else {
+        let page = frame.shrink2(egui::vec2(12.0, 8.0));
+        let ink = egui::Stroke::new(1.0, Tokens::text_dim());
+        let fold = 6.0;
+        painter.add(egui::Shape::closed_line(
+            vec![
+                page.left_bottom(),
+                page.left_top(),
+                page.right_top() - egui::vec2(fold, 0.0),
+                page.right_top() + egui::vec2(0.0, fold),
+                page.right_bottom(),
+            ],
+            ink,
+        ));
+        painter.line_segment(
+            [
+                page.right_top() - egui::vec2(fold, 0.0),
+                page.right_top() + egui::vec2(-fold, fold),
+            ],
+            ink,
+        );
+        painter.line_segment(
+            [
+                page.right_top() + egui::vec2(-fold, fold),
+                page.right_top() + egui::vec2(0.0, fold),
+            ],
+            ink,
+        );
     }
-    painter.rect_stroke(
-        frame,
-        0.0,
-        egui::Stroke::new(1.0, Tokens::border()),
-        egui::StrokeKind::Inside,
-    );
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -500,10 +710,27 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
         .unwrap_or_default();
     let text_x = frame.right() + 10.0;
     let color = if exists {
-        Tokens::text()
+        if on_row {
+            crate::theme::on_highlight()
+        } else {
+            Tokens::text()
+        }
     } else {
         Tokens::text_dim()
     };
+    let secondary =
+        if exists && on_row && crate::theme::theme() == crate::theme::Theme::HighContrast {
+            crate::theme::on_highlight()
+        } else {
+            Tokens::text_dim()
+        };
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            exists,
+            format!("{name}\n{folder}"),
+        )
+    });
     if look.table {
         // Each text kept to its column; size and date as the disk last
         // said (read on the worker thread that checks the file is
@@ -520,16 +747,27 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
             .modified
             .map(|t| crate::time_tracker::date_time(t, look.tz))
             .unwrap_or_default();
-        let cells = [
-            (name, 13.0, color),
-            (folder, 11.0, Tokens::text_dim()),
-            (size, 11.0, Tokens::text_dim()),
-            (date, 11.0, Tokens::text_dim()),
-        ];
-        for ((text, size, c), (x, w)) in cells
-            .into_iter()
-            .zip(table_columns(rect.left(), rect.right()))
-        {
+        let columns = table_columns(rect.left(), rect.right());
+        let names_right = columns[1].0 + columns[1].1 - 12.0;
+        let names = painter.with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(columns[0].0, rect.top()),
+            egui::pos2(names_right, rect.bottom()),
+        ));
+        names.text(
+            egui::pos2(columns[0].0, rect.top() + 12.0),
+            egui::Align2::LEFT_TOP,
+            &name,
+            crate::theme::bold(14.0),
+            color,
+        );
+        names.text(
+            egui::pos2(columns[0].0, rect.top() + 34.0),
+            egui::Align2::LEFT_TOP,
+            &folder,
+            egui::FontId::proportional(11.0),
+            secondary,
+        );
+        for (text, (x, w)) in [size, date].into_iter().zip(columns.into_iter().skip(2)) {
             let clip = egui::Rect::from_min_max(
                 egui::pos2(x, rect.top()),
                 egui::pos2(x + w - 6.0, rect.bottom()),
@@ -538,8 +776,8 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
                 egui::pos2(x, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 text,
-                egui::FontId::proportional(size),
-                c,
+                egui::FontId::proportional(11.0),
+                secondary,
             );
         }
     } else {
@@ -548,24 +786,24 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
             egui::Rect::from_min_max(rect.min, egui::pos2(rect.right() - X - 8.0, rect.bottom()));
         let texts = painter.with_clip_rect(clip);
         texts.text(
-            egui::pos2(text_x, frame.top() + 6.0),
+            egui::pos2(text_x, rect.top() + 12.0),
             egui::Align2::LEFT_TOP,
-            name,
-            egui::FontId::proportional(13.0),
+            &name,
+            crate::theme::bold(14.0),
             color,
         );
         texts.text(
-            egui::pos2(text_x, frame.top() + 26.0),
+            egui::pos2(text_x, rect.top() + 34.0),
             egui::Align2::LEFT_TOP,
-            folder,
+            &folder,
             egui::FontId::proportional(11.0),
-            Tokens::text_dim(),
+            secondary,
         );
     }
     let mut action = RecentAction::None;
     // The x shows only while the pointer is on the row; added after the
     // row, it takes the click before the row does.
-    if on_row {
+    if on_row || resp.has_focus() {
         let xr = egui::Rect::from_center_size(
             egui::pos2(rect.right() - X / 2.0 - 4.0, rect.center().y),
             egui::vec2(X, X),
@@ -573,6 +811,13 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
         let x = ui
             .interact(xr, remove_recent_id(path), egui::Sense::click())
             .rich_tip(crate::ui::tips::keyed("welcome.remove_recent"));
+        x.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                format!("{} {name}", tr("welcome.remove_recent")),
+            )
+        });
         let p = ui.painter();
         if x.hovered() {
             p.rect_filled(xr, 3.0, Tokens::border());
@@ -603,188 +848,13 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
         }
     });
     let resp = resp.rich_tip(path.display().to_string());
+    if exists {
+        resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
     if action == RecentAction::None && exists && resp.clicked() {
         action = RecentAction::Open;
     }
     action
-}
-
-fn workspace(app: &mut App, ui: &mut Ui) {
-    ui.horizontal_top(|ui| {
-        ui.add_space(24.0);
-        ui.vertical(|ui| {
-            ui.strong(tr("welcome.choose_workspace"));
-            for (ws, key, desc) in [
-                (
-                    crate::app::Workspace::Default,
-                    "menu.window.workspace_default",
-                    "welcome.ws_default_desc",
-                ),
-                (
-                    crate::app::Workspace::Lite,
-                    "menu.window.workspace_lite",
-                    "welcome.ws_lite_desc",
-                ),
-                (
-                    crate::app::Workspace::Classic,
-                    "menu.window.workspace_classic",
-                    "welcome.ws_classic_desc",
-                ),
-                (
-                    crate::app::Workspace::Illustration,
-                    "menu.window.workspace_illustration",
-                    "welcome.ws_illustration_desc",
-                ),
-                (
-                    crate::app::Workspace::PageLayout,
-                    "menu.window.workspace_page_layout",
-                    "welcome.ws_page_layout_desc",
-                ),
-                (
-                    crate::app::Workspace::Touch,
-                    "menu.window.workspace_touch",
-                    "welcome.ws_touch_desc",
-                ),
-            ] {
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(
-                            app.workspace == ws,
-                            egui::RichText::new(tr(key)).size(13.0),
-                        )
-                        .clicked()
-                    {
-                        app.set_workspace(ws);
-                        app.save_settings();
-                    }
-                    ui.label(
-                        egui::RichText::new(tr(desc))
-                            .color(Tokens::text_dim())
-                            .size(11.0),
-                    );
-                });
-            }
-            ui.add_space(12.0);
-            ui.strong(tr("options.language"));
-            let current = crate::i18n::language();
-            ui.horizontal_wrapped(|ui| {
-                for (code, name) in crate::i18n::LANGUAGES {
-                    if ui.selectable_label(current == code, name).clicked() {
-                        crate::i18n::set_language(code);
-                        app.settings.language = code.to_string();
-                        app.settings.save();
-                    }
-                }
-            });
-        });
-    });
-}
-
-/// The What's New history: a row per release, newest first and open, the
-/// others closed; a row opens to its paragraph and a link to its release
-/// page. Gives the address of a link clicked.
-fn news(ui: &mut Ui) -> Option<String> {
-    let mut open = None;
-    ui.horizontal_top(|ui| {
-        ui.add_space(24.0);
-        ui.vertical(|ui| {
-            ui.set_max_width(640.0);
-            for (i, r) in RELEASES.iter().take(HISTORY_LEN).enumerate() {
-                ui.add_space(4.0);
-                let heading = egui::RichText::new(news_heading(r)).strong().size(14.0);
-                egui::CollapsingHeader::new(heading)
-                    .id_salt(news_row_id(r.version))
-                    .default_open(i == 0)
-                    .show(ui, |ui| {
-                        ui.label(tr(r.body));
-                        ui.add_space(2.0);
-                        let url = release_page(r.version);
-                        if ui
-                            .link(tr("welcome.news.more"))
-                            .on_hover_text(&url)
-                            .clicked()
-                        {
-                            open = Some(url);
-                        }
-                    });
-            }
-        });
-    });
-    open
-}
-
-fn learn(ui: &mut Ui) {
-    ui.horizontal_top(|ui| {
-        ui.add_space(24.0);
-        ui.vertical(|ui| {
-            ui.set_max_width(640.0);
-            for (t, b) in [
-                ("welcome.learn_1_title", "welcome.learn_1_body"),
-                ("welcome.learn_2_title", "welcome.learn_2_body"),
-                ("welcome.learn_3_title", "welcome.learn_3_body"),
-                ("welcome.learn_4_title", "welcome.learn_4_body"),
-                ("welcome.learn_5_title", "welcome.learn_5_body"),
-            ] {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(tr(t)).strong().size(14.0));
-                ui.label(tr(b));
-            }
-        });
-    });
-}
-
-fn templates(app: &mut App, ui: &mut Ui) {
-    ui.horizontal_top(|ui| {
-        ui.add_space(24.0);
-        ui.vertical(|ui| {
-            ui.strong(tr("welcome.templates"));
-            let list = crate::templates::built_in();
-            if let Some(i) = crate::ui::template_dialog::strip(ui, &list) {
-                if let Some(t) = list.get(i) {
-                    let name = app.next_untitled_name();
-                    if let Some(doc) = crate::templates::document(t, &name) {
-                        app.open_document(doc, None);
-                    }
-                }
-            }
-            ui.add_space(6.0);
-            if ui.button(tr("tpl.more")).clicked() {
-                app.open_template_dialog();
-            }
-            ui.add_space(12.0);
-            ui.strong(tr("welcome.my_templates"));
-            if ui.button(tr("welcome.open_template")).clicked() {
-                crate::files::Dialog::new()
-                    .add_filter("TraceDraw template", &["tdt", "tdraw"])
-                    .pick_file(app, |app, p| app.open_as_template(p));
-            }
-            let dir = crate::settings::config_dir().map(|d| d.join("templates"));
-            if let Some(dir) = dir {
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    for e in rd.flatten() {
-                        let p = e.path();
-                        if p.extension().and_then(|x| x.to_str()) == Some("tdt") {
-                            let name = p
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            if ui.button(name).clicked() {
-                                app.open_as_template(p.clone());
-                            }
-                        }
-                    }
-                }
-                ui.label(
-                    egui::RichText::new(trf(
-                        "welcome.templates_folder",
-                        &[("d", &dir.display().to_string())],
-                    ))
-                    .color(Tokens::text_dim())
-                    .size(11.0),
-                );
-            }
-        });
-    });
 }
 
 #[cfg(test)]

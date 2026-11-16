@@ -45,7 +45,11 @@ impl Canvas {
         (y + 14).min(self.h)
     }
 
-    fn save(&self, path: &std::path::Path, (x0, y0, x1, y1): (usize, usize, usize, usize)) {
+    pub(crate) fn save(
+        &self,
+        path: &std::path::Path,
+        (x0, y0, x1, y1): (usize, usize, usize, usize),
+    ) {
         let mut img = image::RgbaImage::new((x1 - x0) as u32, (y1 - y0) as u32);
         for y in y0..y1 {
             for x in x0..x1 {

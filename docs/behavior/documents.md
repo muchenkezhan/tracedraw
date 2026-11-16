@@ -15,21 +15,41 @@ rulers:
   drawing to use this docker." instead of showing the hidden drawing's
   selection; Hints still shows (#482,
   `ui::palette::tests::the_palette_rests_on_the_welcome_screen`).
+- The Welcome Screen uses the embedded application logo and the shared
+  theme tokens (`theme.rs`, `ui/brand.rs`). Its contents are centred and
+  at most 1240 interface points wide, with 24 point side margins, reduced
+  to 12 in a narrow window. The five native selectable tabs wrap below
+  the wordmark when space is limited. Their focus and selected states
+  follow the active theme, including High Contrast.
+  Selection and hover use background fills with stable padding. The
+  pointer becomes a hand over a tab, and keyboard focus is drawn inside
+  its bounds.
 - The page under the Welcome Screen's own tabs (Get Started, Workspace,
   What's New, Learn, Templates) scrolls with the wheel and a scroll bar
   when it is taller than the window, each tab keeping its own place; the
   tab row stays put, so recent documents below the window are reached
   (#1288, `ui::welcome::tests::the_recent_documents_scroll_into_view`).
-- Get Started's recent documents are a table across the free width when
-  it is 560 points or more (#1675): a header row (Name, Location, Size,
-  Last edited) over rows with the thumbnail, the file name, its folder,
-  its size (KB or MB) and its last change as a local date and time, each
-  text kept to its column (32, 38, 12 and 18 % of the width after the
-  thumbnail). Size and date are read with the check that the file is
+- Get Started has a 220 point quick-action column beside its recent
+  documents. In a narrow or short content area these sections stack and
+  scroll together. With room, the actions, recent heading and Clear
+  action stay in place while the recent list scrolls.
+- The recent documents show metadata when their available width is 560
+  points or more (#1675). Each 64 point row has a thumbnail, its name
+  over its folder in the leading 70 percent of the text area, then size
+  (12 percent) and the local date and time of its last edit (18 percent).
+  The four field headings remain visible, with Name and Location grouped
+  above the stacked text. Size and date are read with the check that the file is
   there, on a worker thread (`file_presence::info`), so a slow share
   never holds the window; a missing file shows neither. A narrower
   window and a phone keep the list of name over folder
   (`ui::welcome::tests::the_recent_documents_are_a_table_with_size_and_date`).
+- Workspace arranges its six presets on two columns, reduced to one
+  below 600 points, with the languages in their own section. What's New
+  keeps its per-release disclosures and links. Learn groups its five
+  topics with the corresponding tool icons. Templates separates the
+  built-in previews from the user's files and keeps its existing creation
+  and browse actions. The user's template list refreshes on page entry
+  and when the application regains focus.
 - The Welcome Screen tab has a close button on hover (a middle click
   also closes it): the tab shrinks to its house alone (a 26 px square,
   the title as its tip) and the active drawing shows. With no drawing
