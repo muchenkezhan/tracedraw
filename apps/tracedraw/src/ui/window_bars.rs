@@ -15,6 +15,9 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 pub const BAR: f32 = 17.0;
 /// One click on a scroll arrow moves the view this many pixels.
 const LINE: f32 = 40.0;
+/// The painted thumb stays slim inside the full-width drag target.
+const THUMB_WIDTH: f32 = 4.0;
+const THUMB_HOVER_WIDTH: f32 = 5.0;
 
 /// Draw the scrollbars, the navigator row and the corner button around
 /// `canvas` inside `full`.
@@ -133,15 +136,7 @@ fn horizontal(app: &mut App, ui: &mut Ui, bar: Rect, canvas: Rect) {
     );
     let resp = ui.interact(track, egui::Id::new("hscroll"), Sense::click_and_drag());
     let hot = resp.dragged() || resp.hover_pos().is_some_and(|h| thumb.contains(h));
-    p.rect_filled(
-        thumb,
-        0.0,
-        if hot {
-            crate::theme::Tokens::control_border()
-        } else {
-            crate::theme::Tokens::slider_rail()
-        },
-    );
+    paint_scroll_thumb(&p, thumb, hot, false);
     if resp.dragged() {
         let d = resp.drag_delta().x / track.width() * w as f32;
         app.view.pan(Vec2::new(-d * app.view.zoom, 0.0));
@@ -192,15 +187,7 @@ fn vertical(app: &mut App, ui: &mut Ui, bar: Rect, canvas: Rect) {
     );
     let resp = ui.interact(track, egui::Id::new("vscroll"), Sense::click_and_drag());
     let hot = resp.dragged() || resp.hover_pos().is_some_and(|h| thumb.contains(h));
-    p.rect_filled(
-        thumb,
-        0.0,
-        if hot {
-            crate::theme::Tokens::control_border()
-        } else {
-            crate::theme::Tokens::slider_rail()
-        },
-    );
+    paint_scroll_thumb(&p, thumb, hot, true);
     if resp.dragged() {
         let d = resp.drag_delta().y / track.height() * h as f32;
         app.view.pan(Vec2::new(0.0, -d * app.view.zoom));
@@ -215,6 +202,35 @@ fn vertical(app: &mut App, ui: &mut Ui, bar: Rect, canvas: Rect) {
         }
     }
 }
+
+/// Painting is narrower than the hit target, so the thumb is easy to grab.
+fn paint_scroll_thumb(painter: &egui::Painter, thumb: Rect, hot: bool, upright: bool) {
+    let width = if hot { THUMB_HOVER_WIDTH } else { THUMB_WIDTH };
+    let size = if upright {
+        Vec2::new(width, thumb.height())
+    } else {
+        Vec2::new(thumb.width(), width)
+    };
+    let fill = if crate::theme::theme() == crate::theme::Theme::HighContrast {
+        // Preserve the system colours instead of blending away their contrast.
+        if hot {
+            Tokens::control_border()
+        } else {
+            Tokens::slider_rail()
+        }
+    } else {
+        Tokens::panel().lerp_to_gamma(Tokens::text_dim(), if hot { 0.85 } else { 0.6 })
+    };
+    painter.rect_filled(
+        Rect::from_center_size(thumb.center(), size),
+        width / 2.0,
+        fill,
+    );
+}
+
+#[cfg(test)]
+#[path = "window_bars/scrollbar_tests.rs"]
+mod scrollbar_tests;
 
 #[derive(Clone, Copy)]
 enum Dir {

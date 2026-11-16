@@ -44,8 +44,10 @@
 
 - The vertical scrollbar runs down the right edge between the ruler and
   the bottom row; the horizontal one fills the right part of the bottom
-  row. Both are 17 px: arrow buttons at the ends, a light track and a flat
-  grey thumb that darkens when hovered or dragged.
+  row. Both keep a 17 px interaction area with arrow buttons at the ends.
+  A centred, 4 px grey thumb has rounded ends. Hovering or dragging makes
+  it 5 px wide and more prominent. The wider area around it still accepts
+  drags. High Contrast keeps the system colours without blending them.
 - They cover the page plus one page size on every side, grown to include
   whatever is visible. Dragging the thumb pans; a click on the track pages
   by 90 % of the window towards the click; an arrow moves 40 px, then
