@@ -88,7 +88,7 @@ Lihat [Palet warna](../color/palettes.md).
 
 ## Menu konteks {#context-menus}
 
-Di Personalisasi, pilih [[options.context_menus]] untuk mengelola 31 lokasi menu konteks secara terpisah. Pilih lokasi dengan [[options.context_menu_scene]], lalu gunakan [[options.context_menu_search]] untuk mencari operasi dan hapus centang kotaknya untuk menyembunyikannya di lokasi tersebut. Operasi tetap ada dalam daftar ini meskipun pilihan saat ini tidak dapat menggunakannya.
+Di Personalisasi, pilih [[options.context_menus]] untuk mengelola 32 lokasi menu konteks secara terpisah. Pilih lokasi dengan [[options.context_menu_scene]], lalu gunakan [[options.context_menu_search]] untuk mencari operasi dan hapus centang kotaknya untuk menyembunyikannya di lokasi tersebut. Operasi tetap ada dalam daftar ini meskipun pilihan saat ini tidak dapat menggunakannya.
 
 Semua operasi ditampilkan secara default. Setiap lokasi memiliki pilihan sendiri: menyembunyikan operasi objek di kanvas tidak menyembunyikannya di panel Objek. Daftar dinamis seperti lapisan target serta koleksi font dikelola sebagai satu operasi, sehingga perubahan nama tidak mengatur ulang pilihan Anda.
 

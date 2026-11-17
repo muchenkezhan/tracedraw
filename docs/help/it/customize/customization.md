@@ -90,7 +90,7 @@ Vedi [Tavolozze dei colori](../color/palettes.md).
 
 ## Menu contestuali {#context-menus}
 
-In Personalizzazione, scegli [[options.context_menus]] per gestire separatamente le 31 posizioni dei menu contestuali. Seleziona una posizione con [[options.context_menu_scene]], poi usa [[options.context_menu_search]] per cercare un'operazione e deseleziona la casella per nasconderla in quella posizione. Le operazioni restano nell'elenco anche quando la selezione corrente non può usarle.
+In Personalizzazione, scegli [[options.context_menus]] per gestire separatamente le 32 posizioni dei menu contestuali. Seleziona una posizione con [[options.context_menu_scene]], poi usa [[options.context_menu_search]] per cercare un'operazione e deseleziona la casella per nasconderla in quella posizione. Le operazioni restano nell'elenco anche quando la selezione corrente non può usarle.
 
 Tutte le operazioni sono visibili per impostazione predefinita. Ogni posizione ha le proprie scelte: nascondere un'operazione degli oggetti nell'area di disegno non la nasconde nel pannello Oggetti. Gli elenchi dinamici, come i livelli di destinazione e le raccolte di caratteri, sono gestiti come una sola operazione, quindi cambiarne il nome non reimposta le scelte.
 

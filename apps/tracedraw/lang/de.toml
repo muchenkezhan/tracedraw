@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Seitenregister" # mt
 context_menu.objects_page = "Objekte-Panel: Seite" # mt
 context_menu.objects_layer = "Objekte-Panel: Ebene" # mt
 context_menu.objects_object = "Objekte-Panel: Objekt" # mt
+context_menu.objects_guide = "Objekte-Panel: Hilfslinie" # mt
 context_menu.objects_new_master = "Objekte-Panel: neue Masterebene" # mt
 context_menu.palette = "Farbpalette" # mt
 context_menu.palette_swatch = "Farbfeld" # mt

@@ -50,7 +50,7 @@
 
 ## 右键菜单 {#context-menus}
 
-在“自定义”中选择 [[options.context_menus]]，可以独立管理 31 个位置的右键菜单。
+在“自定义”中选择 [[options.context_menus]]，可以独立管理 32 个位置的右键菜单。
 使用 [[options.context_menu_scene]] 选择位置，再通过
 [[options.context_menu_search]] 查找操作，取消勾选即可在该位置隐藏。
 即使当前选区无法使用某项操作，它仍会显示在管理列表中。

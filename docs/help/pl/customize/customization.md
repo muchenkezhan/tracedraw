@@ -85,7 +85,7 @@ Zobacz [Palety kolorów](../color/palettes.md).
 
 ## Menu kontekstowe {#context-menus}
 
-W obszarze Dostosowywanie wybierz [[options.context_menus]], aby niezależnie zarządzać 31 miejscami menu kontekstowych. Wybierz miejsce za pomocą [[options.context_menu_scene]], następnie użyj [[options.context_menu_search]], aby znaleźć operację, i usuń zaznaczenie jej pola, aby ukryć ją w tym miejscu. Operacje pozostają na tej liście, nawet gdy bieżące zaznaczenie nie może ich użyć.
+W obszarze Dostosowywanie wybierz [[options.context_menus]], aby niezależnie zarządzać 32 miejscami menu kontekstowych. Wybierz miejsce za pomocą [[options.context_menu_scene]], następnie użyj [[options.context_menu_search]], aby znaleźć operację, i usuń zaznaczenie jej pola, aby ukryć ją w tym miejscu. Operacje pozostają na tej liście, nawet gdy bieżące zaznaczenie nie może ich użyć.
 
 Domyślnie wszystkie operacje są widoczne. Każde miejsce ma własne ustawienia: ukrycie operacji obiektu na obszarze rysunku nie ukrywa jej w panelu Obiekty. Listy dynamiczne, takie jak warstwy docelowe i kolekcje czcionek, są zarządzane jako jedna operacja, więc zmiana ich nazw nie resetuje wyboru.
 

@@ -7,7 +7,7 @@ full, row-by-row status.
 ## Unreleased
 
 - Options > Customization > Context Menus lets you show, hide and reorder
-  operations independently in 31 right-click menu locations. Expand submenus
+  operations independently in 32 right-click menu locations. Expand submenus
   to see their children, then drag a handle or use Move Up and Move Down to
   reorder items at the same level. Parent menus move with their children.
   Search keeps the parent path visible. Restore one or all menus to reset

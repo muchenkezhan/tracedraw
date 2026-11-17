@@ -91,7 +91,7 @@ Vea [Paletas de colores](../color/palettes.md).
 
 ## Menús contextuales {#context-menus}
 
-En Personalización, elija [[options.context_menus]] para administrar por separado las 31 ubicaciones de los menús contextuales. Seleccione una ubicación con [[options.context_menu_scene]], use [[options.context_menu_search]] para buscar una operación y quite la marca de su casilla para ocultarla allí. Las operaciones siguen apareciendo en esta lista aunque la selección actual no pueda utilizarlas.
+En Personalización, elija [[options.context_menus]] para administrar por separado las 32 ubicaciones de los menús contextuales. Seleccione una ubicación con [[options.context_menu_scene]], use [[options.context_menu_search]] para buscar una operación y quite la marca de su casilla para ocultarla allí. Las operaciones siguen apareciendo en esta lista aunque la selección actual no pueda utilizarlas.
 
 Todas las operaciones están visibles de forma predeterminada. Cada ubicación tiene sus propias opciones: ocultar una operación de objetos en el lienzo no la oculta en el panel Objetos. Las listas dinámicas, como las capas de destino y las colecciones de fuentes, se administran como una sola operación, de modo que cambiar sus nombres no restablece las opciones.
 

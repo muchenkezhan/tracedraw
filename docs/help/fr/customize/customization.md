@@ -93,7 +93,7 @@ Voir [Palettes de couleurs](../color/palettes.md).
 
 ## Menus contextuels {#context-menus}
 
-Dans Personnalisation, choisissez [[options.context_menus]] pour gérer séparément les 31 emplacements de menus contextuels. Sélectionnez un emplacement avec [[options.context_menu_scene]], puis utilisez [[options.context_menu_search]] pour trouver une opération et décochez sa case pour la masquer à cet emplacement. Les opérations restent dans cette liste même si la sélection actuelle ne peut pas les utiliser.
+Dans Personnalisation, choisissez [[options.context_menus]] pour gérer séparément les 32 emplacements de menus contextuels. Sélectionnez un emplacement avec [[options.context_menu_scene]], puis utilisez [[options.context_menu_search]] pour trouver une opération et décochez sa case pour la masquer à cet emplacement. Les opérations restent dans cette liste même si la sélection actuelle ne peut pas les utiliser.
 
 Toutes les opérations sont visibles par défaut. Chaque emplacement possède ses propres choix : masquer une opération d'objet sur le canevas ne la masque pas dans le panneau Objets. Les listes dynamiques, comme les calques cibles et les collections de polices, sont gérées comme une seule opération ; changer leur nom ne réinitialise donc pas vos choix.
 

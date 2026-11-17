@@ -1,7 +1,7 @@
 # Context menu customization
 
 Options > Customization > Context Menus controls the visibility and order of
-operations in 31 independently configured right-click menu locations. By
+operations in 32 independently configured right-click menu locations. By
 default, all operations are visible in their original order. Operations
 added by a later version are visible by default; in a customized sibling
 list they follow the saved items in their relative default order.

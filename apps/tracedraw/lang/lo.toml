@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "ແທັບໜ້າ" # mt
 context_menu.objects_page = "ແຜງວັດຖຸ: ໜ້າ" # mt
 context_menu.objects_layer = "ແຜງວັດຖຸ: ຊັ້ນ" # mt
 context_menu.objects_object = "ແຜງວັດຖຸ: ວັດຖຸ" # mt
+context_menu.objects_guide = "ແຜງວັດຖຸ: ເສັ້ນນຳທາງ" # mt
 context_menu.objects_new_master = "ແຜງວັດຖຸ: ຊັ້ນຫຼັກໃໝ່" # mt
 context_menu.palette = "ຈານສີ" # mt
 context_menu.palette_swatch = "ຕົວຢ່າງສີ" # mt

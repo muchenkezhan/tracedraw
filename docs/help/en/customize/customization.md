@@ -90,7 +90,7 @@ See [Color palettes](../color/palettes.md).
 
 ## Context Menus {#context-menus}
 
-Choose [[options.context_menus]] under Customization to manage 31 right-click
+Choose [[options.context_menus]] under Customization to manage 32 right-click
 menu locations independently. Select a location with [[options.context_menu_scene]], then use
 [[options.context_menu_search]] to find an operation and clear its checkbox
 to hide it there. Operations remain in this list when the current selection

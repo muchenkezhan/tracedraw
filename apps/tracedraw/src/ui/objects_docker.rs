@@ -1385,33 +1385,14 @@ fn guide_rows(
         }
         // Right-click: Delete, Cut, Copy, Paste, Lock or Unlock, Hide or
         // Show (#3012).
-        resp.context_menu(|ui| {
-            let can_paste = app.clipboard.as_ref().is_some_and(|c| !c.guides.is_empty());
-            let lock_key = if g.locked {
-                "guides.unlock"
-            } else {
-                "guides.lock"
-            };
-            let hide_key = if g.hidden {
-                "guides.show"
-            } else {
-                "menu.object.hide"
-            };
-            for (key, enabled, cmd) in [
-                ("menu.edit.delete", !g.locked, GuideCmd::Delete),
-                ("menu.edit.cut", !g.locked, GuideCmd::Cut),
-                ("menu.edit.copy", true, GuideCmd::Copy),
-                ("menu.edit.paste", can_paste, GuideCmd::Paste),
-                (lock_key, true, GuideCmd::Lock(!g.locked)),
-                (hide_key, true, GuideCmd::Hide(!g.hidden)),
-            ] {
-                if ui
-                    .add_enabled(enabled, egui::Button::new(tr(key)))
-                    .clicked()
-                {
-                    done = Some(GuideRowAct::Menu(cmd));
-                    ui.close();
-                }
+        crate::ui::context_menus::filter_popup(
+            egui::Popup::context_menu(&resp),
+            &app.settings.context_menus,
+            "objects_guide",
+        )
+        .show(|ui| {
+            if let Some(cmd) = guide_menu_items(app, ui, g) {
+                done = Some(GuideRowAct::Menu(cmd));
             }
         });
         if let Some(d) = done {
@@ -1421,6 +1402,62 @@ fn guide_rows(
             }
         }
     }
+}
+
+/// The row keeps its existing commands; preferences only choose their visibility
+/// and sibling order. Conditional lock and visibility actions use their own keys.
+fn guide_menu_items(
+    app: &App,
+    ui: &mut Ui,
+    guide: &tracedraw_core::document::Guide,
+) -> Option<GuideCmd> {
+    let _scope = crate::ui::context_menus::Scope::new(&app.settings.context_menus, "objects_guide");
+    let can_paste = app.clipboard.as_ref().is_some_and(|c| !c.guides.is_empty());
+    let lock_key = if guide.locked {
+        "guides.unlock"
+    } else {
+        "guides.lock"
+    };
+    let hide_key = if guide.hidden {
+        "guides.show"
+    } else {
+        "menu.object.hide"
+    };
+    let actions = [
+        ("menu.edit.delete", !guide.locked, GuideCmd::Delete),
+        ("menu.edit.cut", !guide.locked, GuideCmd::Cut),
+        ("menu.edit.copy", true, GuideCmd::Copy),
+        ("menu.edit.paste", can_paste, GuideCmd::Paste),
+        (lock_key, true, GuideCmd::Lock(!guide.locked)),
+        (hide_key, true, GuideCmd::Hide(!guide.hidden)),
+    ];
+    let keys = actions.map(|(key, _, _)| key);
+    let mut chosen = None;
+    for key in crate::ui::context_menu_filter::ordered_keys(&keys)
+        .iter()
+        .copied()
+    {
+        let Some(&(_, enabled, cmd)) = actions.iter().find(|(candidate, _, _)| *candidate == key)
+        else {
+            continue;
+        };
+        if !crate::ui::context_menus::show_item(ui, key) {
+            continue;
+        }
+        let response = ui.add_enabled(enabled, egui::Button::new(tr(key)));
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("objects_guide_menu_row", key)),
+                response.rect,
+            );
+        });
+        if response.clicked() {
+            chosen = Some(cmd);
+            ui.close();
+        }
+    }
+    chosen
 }
 
 /// A command of a guideline row's menu (#3012), on the selected
@@ -2629,7 +2666,8 @@ fn drag_rows(
         .data(|d| d.get_temp::<(ShapeId, Pos2, Option<PageId>)>(hold_id));
     let Some(dragged) = ui.ctx().data(|d| d.get_temp::<ShapeId>(id)) else {
         if !down {
-            ui.ctx().data_mut(|d| d.remove::<(ShapeId, Pos2, Option<PageId>)>(hold_id));
+            ui.ctx()
+                .data_mut(|d| d.remove::<(ShapeId, Pos2, Option<PageId>)>(hold_id));
             return held.filter(|_| released);
         }
         return None;
@@ -4696,5 +4734,182 @@ mod context_menu_settings_tests {
         };
         assert!(!draw(&mut app, true));
         assert!(draw(&mut app, false));
+    }
+}
+
+#[cfg(test)]
+mod guide_context_menu_settings_tests {
+    use super::*;
+    use tracedraw_core::document::Guide;
+
+    fn frame(
+        app: &App,
+        ctx: &egui::Context,
+        guide: &Guide,
+        events: Vec<egui::Event>,
+    ) -> Option<GuideCmd> {
+        let mut chosen = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 500.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| chosen = guide_menu_items(app, ui, guide),
+        );
+        output.textures_delta.clear();
+        chosen
+    }
+
+    fn row_rect(ctx: &egui::Context, key: &str) -> Rect {
+        ctx.data(|data| data.get_temp(egui::Id::new(("objects_guide_menu_row", key))))
+            .expect("drawn guideline menu row")
+    }
+
+    #[test]
+    fn context_menu_guide_defaults_retain_order_and_other_locations_are_independent() {
+        let mut app = App::headless();
+        let ctx = crate::theme::ui_context();
+        let guide = Guide::vertical(50.0);
+        app.settings.context_menus.set_order(
+            "canvas_guide",
+            "",
+            &["menu.object.properties", "menu.edit.delete"],
+        );
+        app.settings
+            .context_menus
+            .set_visible("canvas_guide", "menu.edit.delete", false);
+        assert!(frame(&app, &ctx, &guide, Vec::new()).is_none());
+        let keys = [
+            "menu.edit.delete",
+            "menu.edit.cut",
+            "menu.edit.copy",
+            "menu.edit.paste",
+            "guides.lock",
+            "menu.object.hide",
+        ];
+        for pair in keys.windows(2) {
+            assert!(row_rect(&ctx, pair[0]).bottom() <= row_rect(&ctx, pair[1]).top());
+        }
+        app.settings
+            .context_menus
+            .set_visible("objects_guide", "menu.edit.copy", false);
+        assert!(app
+            .settings
+            .context_menus
+            .is_visible("canvas_guide", "menu.edit.copy"));
+        assert!(!app
+            .settings
+            .context_menus
+            .is_visible("canvas_guide", "menu.edit.delete"));
+    }
+
+    #[test]
+    fn context_menu_guide_reordered_button_click_runs_its_original_command() {
+        let mut app = App::headless();
+        app.choose_master_guides(false);
+        app.add_guide(Guide::vertical(50.0));
+        app.settings.context_menus.set_order(
+            "objects_guide",
+            "",
+            &["guides.lock", "menu.edit.copy"],
+        );
+        let ctx = crate::theme::ui_context();
+        let guide = app.page_guides().first().expect("guide").clone();
+        assert!(frame(&app, &ctx, &guide, Vec::new()).is_none());
+        let lock = row_rect(&ctx, "guides.lock");
+        assert!(lock.bottom() <= row_rect(&ctx, "menu.edit.copy").top());
+        assert!(
+            row_rect(&ctx, "menu.edit.copy").bottom() <= row_rect(&ctx, "menu.edit.delete").top()
+        );
+        let at = lock.center();
+        let mut chosen = None;
+        for pressed in [true, false] {
+            chosen = frame(
+                &app,
+                &ctx,
+                &guide,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .or(chosen);
+        }
+        assert_eq!(chosen, Some(GuideCmd::Lock(true)));
+        guide_menu_command(&mut app, 0, chosen.expect("clicked command"));
+        assert!(app.page_guides().first().expect("guide").locked);
+    }
+
+    fn popup(app: &App, guide: &Guide) -> bool {
+        let ctx = crate::theme::ui_context();
+        let id = egui::Id::new("customized_guideline_menu");
+        egui::Popup::open_id(&ctx, id);
+        let mut shown = false;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let popup = egui::Popup::new(
+                id,
+                ctx.clone(),
+                egui::PopupAnchor::Position(egui::pos2(20.0, 20.0)),
+                ui.layer_id(),
+            )
+            .open_memory(None);
+            shown = crate::ui::context_menus::filter_popup(
+                popup,
+                &app.settings.context_menus,
+                "objects_guide",
+            )
+            .show(|ui| guide_menu_items(app, ui, guide))
+            .is_some();
+        });
+        output.textures_delta.clear();
+        assert_eq!(egui::Popup::is_id_open(&ctx, id), shown);
+        shown
+    }
+
+    #[test]
+    fn context_menu_guide_inapplicable_variants_close_empty_popups_but_disabled_rows_remain() {
+        let mut app = App::headless();
+        let definition = crate::ui::context_menus::CATALOG
+            .iter()
+            .find(|menu| menu.id == "objects_guide")
+            .expect("guide location");
+        for key in definition.items {
+            app.settings
+                .context_menus
+                .set_visible(definition.id, key, false);
+        }
+        app.settings
+            .context_menus
+            .set_visible(definition.id, "guides.unlock", true);
+        app.settings
+            .context_menus
+            .set_visible(definition.id, "guides.show", true);
+        let mut guide = Guide::vertical(50.0);
+        assert!(
+            !popup(&app, &guide),
+            "only unavailable conditional variants remain"
+        );
+        guide.locked = true;
+        assert!(popup(&app, &guide), "unlock is now offered");
+        app.settings
+            .context_menus
+            .set_visible(definition.id, "guides.unlock", false);
+        assert!(!popup(&app, &guide));
+        app.settings
+            .context_menus
+            .set_visible(definition.id, "menu.edit.delete", true);
+        assert!(
+            popup(&app, &guide),
+            "disabled Delete is still a visible operation"
+        );
     }
 }

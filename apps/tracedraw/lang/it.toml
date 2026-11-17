@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Schede delle pagine" # mt
 context_menu.objects_page = "Pannello Oggetti: pagina" # mt
 context_menu.objects_layer = "Pannello Oggetti: livello" # mt
 context_menu.objects_object = "Pannello Oggetti: oggetto" # mt
+context_menu.objects_guide = "Pannello Oggetti: guida" # mt
 context_menu.objects_new_master = "Pannello Oggetti: nuovo livello principale" # mt
 context_menu.palette = "Tavolozza colori" # mt
 context_menu.palette_swatch = "Campione di colore" # mt

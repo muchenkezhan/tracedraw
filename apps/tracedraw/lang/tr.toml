@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Sayfa sekmeleri" # mt
 context_menu.objects_page = "Nesneler paneli: sayfa" # mt
 context_menu.objects_layer = "Nesneler paneli: katman" # mt
 context_menu.objects_object = "Nesneler paneli: nesne" # mt
+context_menu.objects_guide = "Nesneler paneli: kılavuz" # mt
 context_menu.objects_new_master = "Nesneler paneli: yeni ana katman" # mt
 context_menu.palette = "Renk paleti" # mt
 context_menu.palette_swatch = "Renk örneği" # mt

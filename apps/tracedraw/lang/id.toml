@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Tab halaman" # mt
 context_menu.objects_page = "Panel objek: halaman" # mt
 context_menu.objects_layer = "Panel objek: lapisan" # mt
 context_menu.objects_object = "Panel objek: objek" # mt
+context_menu.objects_guide = "Panel objek: garis panduan" # mt
 context_menu.objects_new_master = "Panel objek: lapisan master baru" # mt
 context_menu.palette = "Palet warna" # mt
 context_menu.palette_swatch = "Swatch warna" # mt

@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Paginatabbladen" # mt
 context_menu.objects_page = "Objectenpaneel: pagina" # mt
 context_menu.objects_layer = "Objectenpaneel: laag" # mt
 context_menu.objects_object = "Objectenpaneel: object" # mt
+context_menu.objects_guide = "Objectenpaneel: hulplijn" # mt
 context_menu.objects_new_master = "Objectenpaneel: nieuwe hoofdlaag" # mt
 context_menu.palette = "Kleurenpalet" # mt
 context_menu.palette_swatch = "Kleurstaal" # mt

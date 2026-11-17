@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Guias de páginas" # mt
 context_menu.objects_page = "Painel Objetos: página" # mt
 context_menu.objects_layer = "Painel Objetos: camada" # mt
 context_menu.objects_object = "Painel Objetos: objeto" # mt
+context_menu.objects_guide = "Painel Objetos: guia" # mt
 context_menu.objects_new_master = "Painel Objetos: nova camada mestre" # mt
 context_menu.palette = "Paleta de cores" # mt
 context_menu.palette_swatch = "Amostra de cor" # mt

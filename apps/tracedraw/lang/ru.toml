@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Вкладки страниц" # mt
 context_menu.objects_page = "Панель объектов: страница" # mt
 context_menu.objects_layer = "Панель объектов: слой" # mt
 context_menu.objects_object = "Панель объектов: объект" # mt
+context_menu.objects_guide = "Панель объектов: направляющая" # mt
 context_menu.objects_new_master = "Панель объектов: новый мастер-слой" # mt
 context_menu.palette = "Палитра цветов" # mt
 context_menu.palette_swatch = "Образец цвета" # mt

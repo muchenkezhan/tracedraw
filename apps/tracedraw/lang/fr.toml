@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Onglets des pages" # mt
 context_menu.objects_page = "Panneau Objets : page" # mt
 context_menu.objects_layer = "Panneau Objets : calque" # mt
 context_menu.objects_object = "Panneau Objets : objet" # mt
+context_menu.objects_guide = "Panneau Objets : repère" # mt
 context_menu.objects_new_master = "Panneau Objets : nouveau calque maître" # mt
 context_menu.palette = "Palette de couleurs" # mt
 context_menu.palette_swatch = "Nuance de couleur" # mt

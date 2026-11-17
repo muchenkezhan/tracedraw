@@ -90,7 +90,7 @@ Zie [Kleurenpaletten](../color/palettes.md).
 
 ## Contextmenu's {#context-menus}
 
-Kies onder Aanpassing [[options.context_menus]] om de 31 locaties van contextmenu's afzonderlijk te beheren. Selecteer een locatie met [[options.context_menu_scene]], gebruik [[options.context_menu_search]] om een bewerking te zoeken en schakel het selectievakje uit om die bewerking op die locatie te verbergen. Bewerkingen blijven in deze lijst staan als de huidige selectie ze niet kan gebruiken.
+Kies onder Aanpassing [[options.context_menus]] om de 32 locaties van contextmenu's afzonderlijk te beheren. Selecteer een locatie met [[options.context_menu_scene]], gebruik [[options.context_menu_search]] om een bewerking te zoeken en schakel het selectievakje uit om die bewerking op die locatie te verbergen. Bewerkingen blijven in deze lijst staan als de huidige selectie ze niet kan gebruiken.
 
 Standaard zijn alle bewerkingen zichtbaar. Elke locatie heeft eigen keuzes: een objectbewerking op het canvas verbergen verbergt deze niet in het paneel Objecten. Dynamische lijsten, zoals doellagen en lettertypecollecties, worden als één bewerking beheerd, zodat gewijzigde namen uw keuzes niet terugzetten.
 

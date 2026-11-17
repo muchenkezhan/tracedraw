@@ -90,7 +90,7 @@ Bkz. [Renk paletleri](../color/palettes.md).
 
 ## Bağlam menüleri {#context-menus}
 
-Özelleştirme altında [[options.context_menus]] seçeneğini kullanarak 31 bağlam menüsü konumunu birbirinden bağımsız yönetin. [[options.context_menu_scene]] ile bir konum seçin, bir işlemi bulmak için [[options.context_menu_search]] alanını kullanın ve o konumda gizlemek için onay kutusunun işaretini kaldırın. Geçerli seçim kullanamasa bile işlemler bu listede kalır.
+Özelleştirme altında [[options.context_menus]] seçeneğini kullanarak 32 bağlam menüsü konumunu birbirinden bağımsız yönetin. [[options.context_menu_scene]] ile bir konum seçin, bir işlemi bulmak için [[options.context_menu_search]] alanını kullanın ve o konumda gizlemek için onay kutusunun işaretini kaldırın. Geçerli seçim kullanamasa bile işlemler bu listede kalır.
 
 Tüm işlemler varsayılan olarak görünür. Her konumun kendi seçenekleri vardır: tuvalde bir nesne işlemini gizlemek, Nesneler panelinde gizlemez. Hedef katmanlar ve yazı tipi koleksiyonları gibi dinamik listeler tek bir işlem olarak yönetilir; bu nedenle adlarını değiştirmek seçimlerinizi sıfırlamaz.
 

@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "পৃষ্ঠা ট্যাব" # mt
 context_menu.objects_page = "অবজেক্ট প্যানেল: পৃষ্ঠা" # mt
 context_menu.objects_layer = "অবজেক্ট প্যানেল: স্তর" # mt
 context_menu.objects_object = "অবজেক্ট প্যানেল: অবজেক্ট" # mt
+context_menu.objects_guide = "অবজেক্ট প্যানেল: গাইডলাইন" # mt
 context_menu.objects_new_master = "অবজেক্ট প্যানেল: নতুন মাস্টার স্তর" # mt
 context_menu.palette = "রঙের প্যালেট" # mt
 context_menu.palette_swatch = "রঙের সোয়াচ" # mt

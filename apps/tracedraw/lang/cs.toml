@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "Karty stránek" # mt
 context_menu.objects_page = "Panel objektů: stránka" # mt
 context_menu.objects_layer = "Panel objektů: vrstva" # mt
 context_menu.objects_object = "Panel objektů: objekt" # mt
+context_menu.objects_guide = "Panel objektů: vodítko" # mt
 context_menu.objects_new_master = "Panel objektů: nová hlavní vrstva" # mt
 context_menu.palette = "Paleta barev" # mt
 context_menu.palette_swatch = "Vzorek barvy" # mt

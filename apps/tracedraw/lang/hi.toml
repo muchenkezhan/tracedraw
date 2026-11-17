@@ -9160,6 +9160,7 @@ context_menu.page_tabs = "पृष्ठ टैब" # mt
 context_menu.objects_page = "ऑब्जेक्ट पैनल: पृष्ठ" # mt
 context_menu.objects_layer = "ऑब्जेक्ट पैनल: परत" # mt
 context_menu.objects_object = "ऑब्जेक्ट पैनल: ऑब्जेक्ट" # mt
+context_menu.objects_guide = "ऑब्जेक्ट पैनल: मार्गदर्शक रेखा" # mt
 context_menu.objects_new_master = "ऑब्जेक्ट पैनल: नई मास्टर परत" # mt
 context_menu.palette = "रंग पैलेट" # mt
 context_menu.palette_swatch = "रंग स्वैच" # mt

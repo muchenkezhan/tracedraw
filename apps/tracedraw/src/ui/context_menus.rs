@@ -432,6 +432,20 @@ pub(crate) const CATALOG: &[MenuDefinition] = &[
         items: &["docker.go_to_page", "docker.rename"],
     },
     MenuDefinition {
+        id: "objects_guide",
+        key: "context_menu.objects_guide",
+        items: &[
+            "menu.edit.delete",
+            "menu.edit.cut",
+            "menu.edit.copy",
+            "menu.edit.paste",
+            "guides.unlock",
+            "guides.lock",
+            "guides.show",
+            "menu.object.hide",
+        ],
+    },
+    MenuDefinition {
         id: "objects_layer",
         key: "context_menu.objects_layer",
         items: &[
@@ -680,7 +694,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(locations.len(), 31);
+        assert_eq!(locations.len(), 32);
     }
 
     #[test]

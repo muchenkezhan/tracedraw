@@ -95,7 +95,7 @@ Veja [Paletas de cores](../color/palettes.md).
 
 ## Menus de contexto {#context-menus}
 
-Em Personalização, escolha [[options.context_menus]] para gerenciar separadamente os 31 locais de menus de contexto. Selecione um local com [[options.context_menu_scene]], use [[options.context_menu_search]] para procurar uma operação e desmarque sua caixa para ocultá-la nesse local. As operações continuam nesta lista mesmo quando a seleção atual não pode usá-las.
+Em Personalização, escolha [[options.context_menus]] para gerenciar separadamente os 32 locais de menus de contexto. Selecione um local com [[options.context_menu_scene]], use [[options.context_menu_search]] para procurar uma operação e desmarque sua caixa para ocultá-la nesse local. As operações continuam nesta lista mesmo quando a seleção atual não pode usá-las.
 
 Todas as operações ficam visíveis por padrão. Cada local tem suas próprias escolhas: ocultar uma operação de objeto na tela de desenho não a oculta no painel Objetos. Listas dinâmicas, como camadas de destino e coleções de fontes, são gerenciadas como uma única operação, de modo que alterar seus nomes não redefine suas escolhas.
 

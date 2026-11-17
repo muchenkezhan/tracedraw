@@ -85,7 +85,7 @@ Viz [Barevné palety](../color/palettes.md).
 
 ## Kontextové nabídky {#context-menus}
 
-V části Přizpůsobení vyberte [[options.context_menus]] a spravujte 31 umístění kontextových nabídek samostatně. Vyberte umístění pomocí [[options.context_menu_scene]], potom pomocí [[options.context_menu_search]] vyhledejte operaci a zrušením jejího zaškrtnutí ji na tomto místě skryjte. Operace zůstávají v seznamu, i když je aktuální výběr nemůže použít.
+V části Přizpůsobení vyberte [[options.context_menus]] a spravujte 32 umístění kontextových nabídek samostatně. Vyberte umístění pomocí [[options.context_menu_scene]], potom pomocí [[options.context_menu_search]] vyhledejte operaci a zrušením jejího zaškrtnutí ji na tomto místě skryjte. Operace zůstávají v seznamu, i když je aktuální výběr nemůže použít.
 
 Ve výchozím nastavení jsou zobrazeny všechny operace. Každé umístění má vlastní volby: skrytí operace objektu na plátně neovlivní panel Objekty. Dynamické seznamy, například cílové vrstvy a kolekce písem, se spravují jako jedna operace, takže změna názvů volby neobnoví.
 
