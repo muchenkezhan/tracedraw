@@ -325,6 +325,12 @@ pub struct Settings {
     /// theme's icon colour.
     #[serde(default)]
     pub colored_icons: bool,
+    /// Appearance: the panel tabs at the window's sides show their
+    /// pictures alone, the name in the tab's tip. Off (the default) they
+    /// show the picture and the name, the column sliding when the tabs
+    /// do not fit (#2902).
+    #[serde(default)]
+    pub docker_tabs_icons_only: bool,
     /// Customization > Appearance > Theme: "light", "medium_light",
     /// "medium_dark" or "dark".
     #[serde(default)]
@@ -1123,6 +1129,19 @@ impl HandleSize {
         }
     }
 
+    /// How large the Shape tool's control handle heads are drawn, as a
+    /// share of their size for the node size: the largest (the default)
+    /// keeps them as they were, the smaller sizes draw them smaller. The
+    /// setting changed only the Pick tool's handles, so on the Nodes and
+    /// Handles page it seemed to do nothing (#3003).
+    pub fn head_scale(self) -> f32 {
+        match self {
+            HandleSize::Small => 0.6,
+            HandleSize::Medium => 0.8,
+            HandleSize::Large => 1.0,
+        }
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             HandleSize::Small => "options.node_small",
@@ -1228,8 +1247,14 @@ impl NodePrefs {
     /// 5/4 of its length) and a pixel more, so the whole head takes a
     /// press and the reach grows with the node size (#1643, #1935).
     pub fn handle_pick_px(&self) -> f64 {
-        let head = f64::from(self.size.handle_head());
+        let head = f64::from(self.control_head());
         self.pick_px().max(head * 1.25f64.sqrt() + 1.0)
+    }
+
+    /// Length of a control handle's arrow head, screen pixels: the node
+    /// size's, scaled by the handle size (#1643, #3003).
+    pub fn control_head(&self) -> f32 {
+        self.size.handle_head() * self.handles.head_scale()
     }
 
     /// The object click distance in screen pixels, kept sensible
@@ -1296,6 +1321,12 @@ pub struct PalettePrefs {
     /// [`SWATCH_STEP`] a notch. Preferences written before it existed
     /// keep the 20 px swatches.
     pub swatch_size: u8,
+    /// The side of a swatch of the document palette row, as
+    /// [`Self::swatch_size`] and set the same ways over that row, so
+    /// Ctrl+wheel over one palette leaves the other's size alone
+    /// (#2900). 0 (preferences written before it existed): the default
+    /// palette's, until either is sized.
+    pub document_swatch_size: u8,
     /// The room asked for the floating palette's swatches (points, the
     /// title left out): its rows or columns flow from it (see
     /// `ui::palette::floating_flow`).
@@ -1331,6 +1362,15 @@ impl PalettePrefs {
     /// [`Self::swatch_size`] brought into its range, as points.
     pub fn swatch_size(&self) -> f32 {
         f32::from(self.swatch_size.clamp(SWATCH_MIN, SWATCH_MAX))
+    }
+
+    /// The document palette row's swatch side setting: its own, or the
+    /// default palette's while it has none.
+    pub fn document_swatch(&self) -> u8 {
+        match self.document_swatch_size {
+            0 => self.swatch_size,
+            s => s,
+        }
     }
 }
 
@@ -1502,6 +1542,7 @@ impl Default for PalettePrefs {
             show_palette: true,
             rows: 1,
             swatch_size: SWATCH_DEFAULT,
+            document_swatch_size: 0,
             float_size: FLOAT_SIZE,
         }
     }
@@ -2132,6 +2173,7 @@ impl Default for Settings {
             center_dialogs: true,
             ui_shadows: true,
             colored_icons: false,
+            docker_tabs_icons_only: false,
             theme: String::new(),
             bars: crate::ui::bars::BarLayout::default(),
             bar_items: Default::default(),

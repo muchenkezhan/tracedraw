@@ -118,10 +118,10 @@ impl App {
             AlignTo::PageCenter => Rect::new(c.x, c.y, c.x, c.y),
         };
         let grid = self.doc().metadata.grid;
-        let rulers = self.doc().metadata.rulers.clone();
+        let origin = self.grid_origin();
         let on_grid = to == AlignTo::Grid && how != Align::CenterPage;
-        let gx = |v: f64| nearest_line(v, rulers.origin_x, grid.spacing_x);
-        let gy = |v: f64| nearest_line(v, rulers.origin_y, grid.spacing_y);
+        let gx = |v: f64| nearest_line(v, origin.x, grid.spacing_x);
+        let gy = |v: f64| nearest_line(v, origin.y, grid.spacing_y);
         let mut cmds = Vec::new();
         for s in &shapes {
             let b = self.align_box(s);
@@ -554,7 +554,9 @@ impl App {
     /// The label and shortcut state of Break Apart for the menus: the
     /// drop shadow's, an effect group's, else plain Break Apart.
     pub fn break_apart_label(&self) -> &'static str {
-        if self.can_break_shadow_apart() {
+        if self.breaks_effect_shadow() {
+            "menu.object.break_shadows_apart"
+        } else if self.can_break_shadow_apart() {
             "menu.object.break_shadow_apart"
         } else {
             self.effect_group_to_break()
@@ -830,9 +832,31 @@ impl App {
             }
         });
         let planes = picture.planes;
-        let Some(id) = self.place_image_at(picture.rgba, name, dpi) else {
+        // A JPEG whose pixels are the picture's (not turned by its Exif
+        // orientation, not CMYK) is kept, so a packed .tdraw saves the
+        // JPEG instead of a PNG two to three times its size (#2849).
+        let (w, h) = picture.rgba.dimensions();
+        let keep_jpeg = planes.is_none()
+            && tracedraw_core::jpeg_source::decodes_to(&bytes, w, h, picture.rgba.as_raw());
+        // A 1-bit, grayscale or indexed file keeps its colour mode; all
+        // came in as RGB (#3025).
+        let placed = if planes.is_none() && picture.mode != crate::bitmap_file::FileMode::Rgb {
+            match crate::bitmap_file::encode_as(&picture.rgba, picture.mode) {
+                Some(png) => self.place_png_at(png, w, h, name, dpi),
+                None => self.place_image_at(picture.rgba, name, dpi),
+            }
+        } else {
+            self.place_image_at(picture.rgba, name, dpi)
+        };
+        let Some(id) = placed else {
             return;
         };
+        if keep_jpeg {
+            if let Some(ShapeKind::Bitmap { png, .. }) = self.doc().find_shape(id).map(|s| &s.kind)
+            {
+                tracedraw_core::jpeg_source::remember(png, bytes.as_slice().into());
+            }
+        }
         if let Some(planes) = planes {
             // The pixels as the object keeps them, with the inks beside.
             let png = match self.doc().find_shape(id).map(|s| &s.kind) {
@@ -976,8 +1000,6 @@ impl App {
         name: Option<String>,
         dpi: Option<(f64, f64)>,
     ) -> Option<tracedraw_core::ShapeId> {
-        let (dpi_x, dpi_y) =
-            dpi.unwrap_or((crate::image_dpi::DEFAULT_DPI, crate::image_dpi::DEFAULT_DPI));
         let (w, h) = img.dimensions();
         let mut png = Vec::new();
         if let Err(e) = image::DynamicImage::ImageRgba8(img)
@@ -987,6 +1009,22 @@ impl App {
                 crate::i18n::trf("status.could_not_encode_image", &[("e", &e.to_string())]);
             return None;
         }
+        self.place_png_at(png, w, h, name, dpi)
+    }
+
+    /// Place a picture already encoded as the PNG a bitmap keeps (`w` by
+    /// `h` pixels) at the page centre, as [`App::place_image_at`] does:
+    /// a 1-bit, grayscale or indexed picture keeps its mode so (#3025).
+    pub fn place_png_at(
+        &mut self,
+        png: Vec<u8>,
+        w: u32,
+        h: u32,
+        name: Option<String>,
+        dpi: Option<(f64, f64)>,
+    ) -> Option<tracedraw_core::ShapeId> {
+        let (dpi_x, dpi_y) =
+            dpi.unwrap_or((crate::image_dpi::DEFAULT_DPI, crate::image_dpi::DEFAULT_DPI));
         let mm_w = w as f64 * 25.4 / dpi_x;
         let mm_h = h as f64 * 25.4 / dpi_y;
         let page = self.page_rect();
@@ -1835,10 +1873,22 @@ impl App {
             return;
         }
         let shapes = self.selection.clone();
-        if collapse && matches!(self.engine.undo_label(), Some("Drop Shadow")) {
+        // A drag or a field typed in again replaces the step it made, but
+        // only that step: the same objects, nothing done since. A shadow
+        // just given to another object was taken back when the next
+        // object got one (#2890).
+        let same_step = self.engine.at_recorded_step()
+            && self.shadow_step.as_ref().is_some_and(|(step, ids)| {
+                Some(*step) == self.engine.last_step_id() && *ids == shapes
+            });
+        if collapse && same_step && matches!(self.engine.undo_label(), Some("Drop Shadow")) {
             let _ = self.engine.undo();
         }
-        self.run(Command::SetShadow { shapes, shadow });
+        self.run(Command::SetShadow {
+            shapes: shapes.clone(),
+            shadow,
+        });
+        self.shadow_step = self.engine.last_step_id().map(|step| (step, shapes));
     }
 }
 

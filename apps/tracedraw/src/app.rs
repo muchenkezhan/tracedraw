@@ -723,6 +723,10 @@ pub struct CurveInProgress {
     /// was frozen (`None`: the segment arrives straight), no longer the
     /// mirror of their outgoing one.
     pub in_handles: std::collections::BTreeMap<usize, Option<Point>>,
+    /// Nodes made smooth (S while drawing, #2876): the length their
+    /// incoming handle keeps; it lies opposite the outgoing handle, which
+    /// can still be pulled longer or shorter on its own.
+    pub in_lengths: std::collections::BTreeMap<usize, f64>,
     /// A press on the first node closes the curve: while it is dragged,
     /// where the pointer is (it pulls the closing segment's handle at the
     /// first node; the first node's own outgoing handle stays).
@@ -740,7 +744,38 @@ impl CurveInProgress {
             return *h;
         }
         let (p, out) = *self.nodes.get(i)?;
+        if let (Some(len), Some(o)) = (self.in_lengths.get(&i), out) {
+            let d = o - p;
+            let n = d.hypot();
+            if n > 1e-12 {
+                return Some(p - d * (len / n));
+            }
+        }
         out.map(|o| p - (o - p))
+    }
+
+    /// The node keys while a curve is drawn (#2876), on the last node:
+    /// C a cusp (its handles move apart), S smooth (the incoming handle
+    /// keeps its length, opposite the outgoing one), Y symmetrical (the
+    /// incoming handle mirrors the outgoing one).
+    pub fn set_last_node_type(&mut self, ty: tracedraw_core::nodes::NodeType) {
+        use tracedraw_core::nodes::NodeType;
+        let Some(i) = self.nodes.len().checked_sub(1) else {
+            return;
+        };
+        match ty {
+            NodeType::Cusp => self.freeze_last_in(),
+            NodeType::Smooth => {
+                let p = self.nodes[i].0;
+                let len = self.in_handle(i).map_or(0.0, |h| (h - p).hypot());
+                self.in_handles.remove(&i);
+                self.in_lengths.insert(i, len);
+            }
+            _ => {
+                self.in_handles.remove(&i);
+                self.in_lengths.remove(&i);
+            }
+        }
     }
 
     /// Make the last node a cusp: its incoming handle stays as it is now
@@ -752,6 +787,7 @@ impl CurveInProgress {
         };
         let incoming = self.in_handle(i);
         self.in_handles.insert(i, incoming);
+        self.in_lengths.remove(&i);
         self.nodes[i].1 = None;
     }
 
@@ -763,6 +799,7 @@ impl CurveInProgress {
         };
         let incoming = self.in_handle(i);
         self.in_handles.insert(i, incoming);
+        self.in_lengths.remove(&i);
     }
 
     /// The handle the closing drag gives the first node for the closing
@@ -943,7 +980,7 @@ type BackupWritten = (String, (u64, u64), Result<(), String>);
 /// renamed when complete; the page's storage in a browser).
 fn write_backup(path: &std::path::Path, doc: &tracedraw_core::Document) -> Result<(), String> {
     crate::files::write_creating_with(path, |w| {
-        doc.write_json_version(w, tracedraw_core::document::TDRAW_FORMAT_VERSION)
+        doc.write_tdraw_version(w, tracedraw_core::document::TDRAW_FORMAT_VERSION)
             .map_err(std::io::Error::other)
     })
     .map_err(|e| e.to_string())
@@ -1057,9 +1094,6 @@ pub struct App {
     /// down (see `interaction::paste_without_text`).
     pub paste_seen: bool,
     pub curve: Option<CurveInProgress>,
-    /// Freehand by clicks: the input time at which the line ends unless
-    /// a double-click made the last click a corner first (#2339).
-    pub freehand_ends_at: Option<f64>,
     /// Undo and redo steps of `curve`, node by node.
     pub curve_steps: CurveSteps,
     /// The steps that made or changed a curve drawn with the Pen or
@@ -1080,6 +1114,9 @@ pub struct App {
     /// The Trace dialog's live preview: the trace of the selected bitmap
     /// worked out off the interface thread as the settings change.
     pub trace_live: crate::trace_preview::Live,
+    /// The trace of the selected bitmaps running off the interface
+    /// thread, shown in its progress window (`trace_job.rs`).
+    pub trace_job: Option<crate::trace_job::TraceJob>,
     /// The digits typed with Alt held while editing text, for a character
     /// by its number (#447; the system does it on Windows).
     pub alt_code: String,
@@ -1588,6 +1625,10 @@ pub struct App {
     /// The guideline whose values the Guidelines panel's fields hold
     /// (`sync_guide_form`); `None` with none or several selected.
     pub guide_form_for: Option<usize>,
+    /// The guideline the Guidelines panel's fields hold, as it was before
+    /// a value typed there moved it: Add puts it back and adds the new
+    /// one at the typed place (#3068).
+    pub guide_form_from: Option<(usize, tracedraw_core::document::Guide)>,
     /// Document Setup > Guidelines presets section.
     pub guide_presets: crate::ui::layout_options::PresetForm,
     /// Document Setup > Grid shows lines per unit instead of spacing.
@@ -1605,6 +1646,11 @@ pub struct App {
     /// a printer's spooler can take minutes and the window stays usable
     /// meanwhile (#810). The status it ends with.
     pub print_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// A large `.tdraw` being read off the interface's thread, with its
+    /// progress window (#2849).
+    pub opening: Option<crate::opening::Opening>,
+    /// What that read gave, for the open it finishes.
+    pub opened_read: Option<(PathBuf, crate::opening::OpenRead)>,
     /// Manual two-sided printing: the settings of a print whose fronts
     /// went out, while the prompt to turn the stack over shows.
     pub duplex_backs: Option<crate::ui::dialogs::PrintState>,
@@ -2101,6 +2147,14 @@ pub struct App {
     /// The revision, objects and effect kind of the last effect edit from
     /// a panel or bar, so a slider drag is one undo step.
     pub effect_edit_step: Option<(u64, Vec<ShapeId>, String)>,
+    /// The undo step a drop shadow was last set in and the objects it
+    /// went to: only that step is replaced by the next frame of a drag
+    /// (#2890).
+    pub shadow_step: Option<(u64, Vec<ShapeId>)>,
+    /// Command shortcuts (Ctrl+K...) pressed while a field had the
+    /// keyboard: the field gave it up and applied what was typed in it,
+    /// and they run in the next frame, on what the field changed.
+    pub deferred_keys: Vec<egui::Event>,
     /// What new blends take besides their steps: rotation (degrees) and
     /// the object and colour accelerations (-1 to 1).
     pub blend_rotation: f64,
@@ -2923,12 +2977,12 @@ impl App {
             pen_editing: false,
             paste_seen: false,
             curve: None,
-            freehand_ends_at: None,
             text_edit: None,
             ime_preedit: String::new(),
             text_clip: None,
             last_trace: None,
             trace_live: Default::default(),
+            trace_job: None,
             alt_code: String::new(),
             alt_composed: None,
             current_colors: (Color::BLACK, Color::WHITE),
@@ -3146,6 +3200,7 @@ impl App {
             guide_pivots: Vec::new(),
             guide_form: Default::default(),
             guide_form_for: None,
+            guide_form_from: None,
             guide_presets: Default::default(),
             grid_frequency: false,
             settings: crate::settings::Settings::default(),
@@ -3154,6 +3209,8 @@ impl App {
             print_preview: None,
             printer_fetch: None,
             print_job: None,
+            opening: None,
+            opened_read: None,
             duplex_backs: None,
             printers_seen: Vec::new(),
             printer_last: None,
@@ -3384,6 +3441,8 @@ impl App {
             recognize: Default::default(),
             sketch: Default::default(),
             effect_edit_step: None,
+            shadow_step: None,
+            deferred_keys: Vec::new(),
             blend_rotation: 0.0,
             fill_node: None,
             live_font: None,
@@ -5278,6 +5337,21 @@ impl App {
             .unwrap_or(paper::A4)
     }
 
+    /// The point the document grid's lines pass through: the ruler
+    /// origin, and while the origin is at its place on the page's bottom
+    /// edge, the page's top edge for the horizontal lines, so the grid
+    /// starts square at the top-left corner as in the reference program
+    /// and the part row falls at the bottom (#2990).
+    pub fn grid_origin(&self) -> Point {
+        let r = &self.doc().metadata.rulers;
+        let y = if r.origin_y == 0.0 {
+            self.page_size().height
+        } else {
+            r.origin_y
+        };
+        Point::new(r.origin_x, y)
+    }
+
     pub fn page_rect(&self) -> Rect {
         Rect::from_origin_size((0.0, 0.0), self.page_size())
     }
@@ -5287,7 +5361,9 @@ impl App {
     /// [`BACKDROP_REACH`] page sizes away. With the page alone, a
     /// drawing laid out around a small page came back piece by piece at
     /// every zoom out, the desktop bare around the page meanwhile
-    /// (#2354). Worked out once a change of the drawing, at `revision`.
+    /// (#2354). Shadows and glows count where they reach: one cast past
+    /// the page was cut off at its edge while the view moved (#2891).
+    /// Worked out once a change of the drawing, at `revision`.
     pub fn backdrop_area(&self, revision: u64) -> Rect {
         let page = self.page_rect();
         if let Some((r, p, b, area)) = self.backdrop_area.get() {
@@ -5300,7 +5376,7 @@ impl App {
             page.height() * BACKDROP_REACH,
         );
         let area = self
-            .drawing_bounds()
+            .drawing_reach_bounds()
             .map(|b| {
                 Rect::new(
                     b.x0.max(reach.x0),
@@ -5689,6 +5765,14 @@ impl App {
         }
     }
 
+    /// Commands run straight on the engine as one undo step, kept by a
+    /// macro being recorded too, as [`Self::run`] keeps its command.
+    pub(crate) fn note_recorded(&mut self, cmds: &[Command]) {
+        if let Some(rec) = &mut self.recording {
+            rec.extend(cmds.iter().cloned());
+        }
+    }
+
     /// Open the docker (or hide the column when it is already the active
     /// tab), as the docker shortcuts do.
     pub fn toggle_docker(&mut self, tab: DockerTab) {
@@ -5766,9 +5850,10 @@ impl App {
     }
 
     pub fn select(&mut self, mut ids: Vec<ShapeId>) {
-        // A locked object (or one inside a locked group) is never
-        // selected: neither by a click nor by the Objects docker nor when
-        // a file is imported. Imported objects locked in a .cdr came in
+        // A locked object (or one inside a locked group, or a group or
+        // clip frame holding one, #2901) is never selected: neither by a
+        // click nor by the Objects docker nor by Select All nor when a
+        // file is imported. Imported objects locked in a .cdr came in
         // selected and could then be moved and edited (#2347).
         if !ids.is_empty() {
             let locked = self.locked_ids();
@@ -5785,7 +5870,9 @@ impl App {
         self.rect_corners_selected.clear();
     }
 
-    /// The locked objects of the drawing and every object inside them.
+    /// The locked objects of the drawing, every object inside them, and
+    /// every group or clip frame holding one, which a move or a change
+    /// would carry along (#2901): none of them is ever selected.
     pub fn locked_ids(&self) -> std::collections::HashSet<ShapeId> {
         fn all(s: &Shape, out: &mut std::collections::HashSet<ShapeId>) {
             out.insert(s.id);
@@ -5798,18 +5885,26 @@ impl App {
                 _ => {}
             }
         }
-        fn walk(s: &Shape, out: &mut std::collections::HashSet<ShapeId>) {
+        // Whether `s` holds a locked object; it then joins `out` too.
+        fn walk(s: &Shape, out: &mut std::collections::HashSet<ShapeId>) -> bool {
             if s.locked {
-                return all(s, out);
+                all(s, out);
+                return true;
             }
-            match &s.kind {
-                ShapeKind::Group { children } => children.iter().for_each(|c| walk(c, out)),
-                ShapeKind::ClipFrame { frame, contents } => {
-                    walk(frame, out);
-                    contents.iter().for_each(|c| walk(c, out));
-                }
-                _ => {}
+            let holds = match &s.kind {
+                // Every child walked, not only up to the first locked one.
+                ShapeKind::Group { children } => children
+                    .iter()
+                    .fold(false, |held, c| walk(c, out) | held),
+                ShapeKind::ClipFrame { frame, contents } => contents
+                    .iter()
+                    .fold(walk(frame, out), |held, c| walk(c, out) | held),
+                _ => false,
+            };
+            if holds {
+                out.insert(s.id);
             }
+            holds
         }
         let mut out = std::collections::HashSet::new();
         for s in self.doc().all_layers().flat_map(|l| &l.shapes) {
@@ -6081,9 +6176,14 @@ impl App {
     /// The pointer as the next node of the curve being drawn would take
     /// it (`ctrl`, the constrain key: in steps of the constrain angle);
     /// `None` while a handle is pulled. The preview runs the curve to it.
+    /// A 2-point line dragged from its first node pulls no handle: its
+    /// second node follows the pen or finger to where it is let go. The
+    /// line showed nothing until the release, so on a touch screen the
+    /// second node could not be placed by eye (#2594).
     pub fn curve_preview_point(&self, ctrl: bool) -> Option<Point> {
         let c = self.curve.as_ref()?;
-        if c.dragging_handle {
+        let line_drag = self.tool == Tool::TwoPointLine && c.nodes.len() == 1;
+        if c.dragging_handle && !line_drag {
             return None;
         }
         self.pointer_page
@@ -7636,8 +7736,22 @@ impl App {
     }
 
     pub fn open_dialog(&mut self) {
+        Self::open_file_dialog().pick_file(self, |app, p| app.open_path(p));
+    }
+
+    /// File > Open's dialog. Pictures are among what it opens, each a new
+    /// drawing holding it (#2600); the dialog left them out, so a PNG or
+    /// JPG could not be chosen there and the window stayed on the empty
+    /// start screen (#2924).
+    pub(crate) fn open_file_dialog() -> crate::files::Dialog {
+        let all: Vec<&str> = OPEN_EXTENSIONS
+            .iter()
+            .chain(PICTURE_EXTENSIONS)
+            .copied()
+            .collect();
         crate::files::Dialog::new()
-            .add_filter(crate::i18n::tr("file.all_supported"), OPEN_EXTENSIONS)
+            .add_filter(crate::i18n::tr("file.all_supported"), &all)
+            .add_filter(crate::i18n::tr("file.images"), PICTURE_EXTENSIONS)
             .add_filter("HPGL plotter (*.plt, *.hpgl)", &["plt", "hpgl", "hgl"])
             .add_filter("Text (*.txt, *.rtf, *.docx)", &["txt", "rtf", "docx"])
             .add_filter(
@@ -7658,7 +7772,6 @@ impl App {
                 &crate::pmd_open::EXTENSIONS,
             )
             .add_filter("TraceDraw (*.tdraw)", &["tdraw"])
-            .pick_file(self, |app, p| app.open_path(p));
     }
 
     /// Open `path`, or show the drawing already open from it (read from
@@ -7801,6 +7914,27 @@ impl App {
             self.open_picture(&path);
             return;
         }
+        // A drawing read already off the interface's thread (#2849).
+        let opened_read = match self.opened_read.take() {
+            Some((p, read)) if p == path && ext == "tdraw" => Some(read),
+            _ => None,
+        };
+        // A large drawing is read off the interface's thread, with a
+        // window that shows how far it got (#2849); the open ends when
+        // it is read ([`App::poll_opening`]).
+        if ext == "tdraw" && opened_read.is_none() {
+            if let Some(size) = crate::opening::wants_background(&path) {
+                if let Some(old) = self.opening.take() {
+                    old.cancel();
+                }
+                self.opening = Some(crate::opening::Opening::start(
+                    path,
+                    password.to_string(),
+                    size,
+                ));
+                return;
+            }
+        }
         // A package's fonts, beside the drawing, before its text is laid
         // out (#852).
         if ext == "tdraw" {
@@ -7843,7 +7977,12 @@ impl App {
             crate::files::read(&path)
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| {
-                    tracedraw_io::psd::parse(&bytes, &mut tracedraw_core::id::IdSource::default())
+                    let mut imported = tracedraw_io::psd::parse(
+                        &bytes,
+                        &mut tracedraw_core::id::IdSource::default(),
+                    )?;
+                    crate::bitmap_file::keep_psd_mode(&bytes, &mut imported.shapes);
+                    Ok(imported)
                 })
                 .map(|imported| {
                     let title = path
@@ -8218,13 +8357,18 @@ impl App {
                     (doc, msg)
                 })
                 .map_err(|e| e.to_string())
+        } else if let Some(read) = opened_read {
+            read.map(|(d, known)| {
+                tdraw_version = Some(known);
+                (d, crate::i18n::tr("status.opened"))
+            })
         } else {
-            crate::files::read_to_string(&path)
+            crate::files::read(&path)
+                .and_then(|bytes| tracedraw_core::document::tdraw_text(&bytes))
                 .map_err(|e| e.to_string())
                 .and_then(|json| {
                     // A newer file saves back in the newest version known
-                    // here (while that is 0, the min is a no-op).
-                    #[allow(clippy::unnecessary_min_or_max)]
+                    // here.
                     let known = tracedraw_core::document::tdraw_text_version(&json)
                         .min(tracedraw_core::document::TDRAW_FORMAT_VERSION);
                     tdraw_version = Some(known);
@@ -8413,9 +8557,11 @@ impl App {
             // or pasted from them), and, with Embed fonts on, the
             // installed fonts the text uses whose licence allows it.
             self.backup_before_save(&path);
+            // A plain file of 0.46 or older saves packed (#2849).
             let version = self
                 .tdraw_version
-                .unwrap_or(tracedraw_core::document::TDRAW_FORMAT_VERSION);
+                .unwrap_or(tracedraw_core::document::TDRAW_FORMAT_VERSION)
+                .max(tracedraw_core::document::PACKED_VERSION);
             self.keep_saved_view();
             let fonts = tracedraw_text::fonts();
             let carried = fonts.with_carried_fonts(self.engine.document());
@@ -8427,7 +8573,7 @@ impl App {
             // Written to the file as it is made: the JSON of a large
             // drawing is several times its size.
             let result = crate::files::write_with(&path, |w| {
-                doc.write_json_version(w, version)
+                doc.write_tdraw_version(w, version)
                     .map_err(std::io::Error::other)
             })
             .map_err(|e| e.to_string());
@@ -8768,7 +8914,8 @@ impl App {
     pub fn recover(&mut self, found: &[crate::recovery::Found]) {
         let mut opened = Vec::new();
         for path in found.iter().flat_map(|f| &f.backups) {
-            let doc = crate::files::read_to_string(path)
+            let doc = crate::files::read(path)
+                .and_then(|bytes| tracedraw_core::document::tdraw_text(&bytes))
                 .map_err(|e| e.to_string())
                 .and_then(|json| {
                     tracedraw_core::Document::from_json(&json).map_err(|e| e.to_string())
@@ -9229,6 +9376,31 @@ impl App {
         self.print_job = Some(rx);
     }
 
+    /// A large drawing read off the interface's thread (#2849): once it
+    /// is read, finish opening it. Whether it is still being read.
+    pub fn poll_opening(&mut self) -> bool {
+        let Some(job) = &self.opening else {
+            return false;
+        };
+        let Some(read) = job.poll() else {
+            return true;
+        };
+        if let Some(job) = self.opening.take() {
+            self.opened_read = Some((job.path.clone(), read));
+            self.open_path_with_password(job.path, &job.password);
+            self.opened_read = None;
+        }
+        false
+    }
+
+    /// Stop reading the large drawing being opened.
+    pub fn cancel_opening(&mut self) {
+        if let Some(job) = self.opening.take() {
+            job.cancel();
+            self.status = crate::i18n::tr("status.open_cancelled");
+        }
+    }
+
     /// The outcome of the print on its way, once there is one, into the
     /// status bar. Returns whether a print is still on its way.
     pub fn poll_print_job(&mut self) -> bool {
@@ -9475,7 +9647,8 @@ impl App {
             // A package's fonts, beside the drawing, before its text is
             // laid out, as File > Open has them (#852).
             self.load_package_fonts(&path);
-            let read = crate::files::read_to_string(&path)
+            let read = crate::files::read(&path)
+                .and_then(|bytes| tracedraw_core::document::tdraw_text(&bytes))
                 .map_err(|e| e.to_string())
                 .and_then(|json| {
                     tracedraw_core::Document::from_json(&json).map_err(|e| e.to_string())
@@ -9603,7 +9776,11 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("Untitled")
             .to_string();
-        tracedraw_cdr::open_bytes(&bytes, &title).map_err(|e| e.to_string())
+        let (mut doc, report) =
+            tracedraw_cdr::open_bytes(&bytes, &title).map_err(|e| e.to_string())?;
+        // Clones saved by TraceDraw follow their masters again (#2879).
+        crate::object_clone::rebase_clone_links(&mut doc);
+        Ok((doc, report))
     }
 
     /// Read an SVG file (plain or gzip-compressed) as text.
@@ -9704,7 +9881,11 @@ impl App {
         let parsed = crate::files::read(path)
             .map_err(|e| e.to_string())
             .and_then(|bytes| {
-                tracedraw_io::psd::parse(&bytes, &mut tracedraw_core::id::IdSource::default())
+                let mut imported =
+                    tracedraw_io::psd::parse(&bytes, &mut tracedraw_core::id::IdSource::default())?;
+                // A 1-bit, grayscale or indexed file keeps its mode (#3025).
+                crate::bitmap_file::keep_psd_mode(&bytes, &mut imported.shapes);
+                Ok(imported)
             });
         match parsed {
             Ok(imported) => {
@@ -9968,7 +10149,7 @@ impl App {
             OpenView::FitPage => {}
             OpenView::FitObjects => {
                 if !self.multipage {
-                    if let Some(b) = self.doc().content_bounds(self.page).ok().flatten() {
+                    if let Some(b) = self.drawn_bounds() {
                         self.view.fit(
                             b.inflate(b.width() * 0.05 + 1.0, b.height() * 0.05 + 1.0),
                             canvas,
@@ -10072,7 +10253,7 @@ impl App {
             self.fit_pending = true;
             return;
         }
-        let Some(b) = self.doc().content_bounds(self.page).ok().flatten() else {
+        let Some(b) = self.drawn_bounds() else {
             self.fit_pending = true;
             return;
         };
@@ -10080,6 +10261,28 @@ impl App {
             b.inflate(b.width() * 0.05 + 1.0, b.height() * 0.05 + 1.0),
             self.canvas_rect,
         );
+    }
+
+    /// The bounds of what the current page draws: its objects with their
+    /// shadows, contours, extrusions and other live effects, so Zoom to
+    /// Fit leaves a margin round a shadow too, not only round the
+    /// objects' own outlines (#2898).
+    pub fn drawn_bounds(&self) -> Option<Rect> {
+        let page = self.doc().page(self.page).ok()?;
+        page.layers
+            .iter()
+            .flat_map(|l| &l.shapes)
+            .map(|s| {
+                let b = self.visual_bounds(s);
+                match s.shadow.filter(|sh| sh.opacity > 0.0) {
+                    Some(sh) => b.union(sh.bounds(s.shadow_box())),
+                    None => b,
+                }
+            })
+            .filter(|b| {
+                b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite()
+            })
+            .reduce(|a, b| a.union(b))
     }
 
     pub fn zoom_to_selection(&mut self) {
@@ -12555,8 +12758,8 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(saved, ["AutoBackup_of_art.tdraw"], "no .part left");
-        let back = std::fs::read_to_string(dir.join("auto").join(&saved[0])).unwrap();
-        assert!(tracedraw_core::Document::from_json(&back).is_ok());
+        let back = std::fs::read(dir.join("auto").join(&saved[0])).unwrap();
+        assert!(tracedraw_core::Document::from_tdraw_bytes(&back).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -55,6 +55,18 @@ change marked `TraceDraw:` in a comment.
   screen (#787). TraceDraw's tests include and run it
   (`splash::eframe_window_start::tests`). Check whether egui 0.37 still
   needs it before dropping the copy.
+- `native/wgpu_integration.rs` and `native/glow_integration.rs`
+  wait for the first Resumed when a window event arrives before app
+  creation. Android can send focus or configuration events at that point,
+  especially during consecutive resource-overlay relaunches. The existing
+  `app_creator` is present until initialization consumes it, so it
+  distinguishes startup from the state after `save_and_destroy` removes
+  the running app. Window events after that cleanup still return Exit.
+  TraceDraw's source contract test checks both renderer branches and the
+  creator's lifecycle
+  (`android_package::tests::window_events_wait_for_initial_resume_and_exit_after_shutdown`).
+  Device regression checks compare the original and patched APKs during
+  consecutive overlay changes on a single-core Android 30 emulator.
 - Change: in the browser, `dragover` and `drop` (`web/events.rs`,
   `install_drag_and_drop`) push a pointer move at the event's place
   before the hovered or dropped files (#1142): the browser sends no mouse
@@ -404,6 +416,17 @@ change marked `TraceDraw:` in a comment.
   whole multiples of 12 pixels, transparent beyond the image: without a
   viewport the cursor surface takes the output's integer buffer scale,
   and a buffer whose size it does not divide is a protocol error.
+- Change: a bitmap cursor looks the same on every start (#2871). On X11
+  (`platform_impl/linux/x11/util/cursor.rs`) the image's pixels go to
+  Xcursor premultiplied by their alpha, as it takes them; given straight,
+  the half transparent edge of a drawn pointer was a colour brighter than
+  its alpha. On Wayland without a viewport
+  (`platform_impl/linux/wayland/window/state.rs`, `apply_custom_cursor`)
+  the cursor buffer takes the window's scale, which the image is drawn
+  for, not the cursor surface's, which stays 1 until the compositor says
+  which output the pointer is on: the first pointer of a start could show
+  at twice its size. `src/cursor_pixels.rs` holds both, with tests that
+  TraceDraw's tests include and run (`winit_cursor_pixels::tests`).
 - The published crate's `examples/` and `tests/` stay as downloaded (the
   manifest lists them); they build in no gate.
 - Change: a picture dragged in from another program (#2349). winit 0.30

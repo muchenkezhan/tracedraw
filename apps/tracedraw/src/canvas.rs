@@ -316,7 +316,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
                 view.to_screen(*node),
                 view.to_screen(*h),
                 look.preview_color,
-                app.settings.nodes.size.handle_head(),
+                app.settings.nodes.control_head(),
             );
         }
         for (p, mark) in &look.nodes {
@@ -370,7 +370,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
             if let Some(o) = out {
                 let so = view.to_screen(*o);
                 let mirrored = sp - (so - sp);
-                let head = app.settings.nodes.size.handle_head();
+                let head = app.settings.nodes.control_head();
                 draw_control_handle(painter, sp, so, Tokens::SELECTION, head);
                 draw_control_handle(painter, sp, mirrored, Tokens::SELECTION, head);
             }
@@ -560,13 +560,17 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
             0
         };
     // Paragraph text being resized keeps its letters while the frame
-    // follows the drag (the drag outline shows the text flowed anew).
+    // follows the drag (the drag outline shows the text flowed anew); a
+    // text fitted to a path stays on it, its letters scaled on release
+    // (#2962).
     let preview_ids = preview.map(|t| {
         let ids: Vec<_> = app
             .selection
             .iter()
             .copied()
-            .filter(|id| !app.resizes_text_frame(*id, t))
+            .filter(|id| {
+                !app.resizes_text_frame(*id, t) && !app.resizes_fitted_text(*id, t, &app.selection)
+            })
             .collect();
         (ids, t)
     });
@@ -831,8 +835,24 @@ pub(crate) fn backdrop_parts(rect: ERect, at: ERect, back_at: ERect) -> Vec<ERec
     if !(area.width() > 0.0 && area.height() > 0.0) {
         return Vec::new();
     }
-    // (A picture a hair short of the canvas's edge covers it.)
-    outside(area, &[at.expand(0.5)])
+    // The backdrop meets the picture edge to edge: a hole a half pixel
+    // wider than the picture left a thin line of bare paper around it
+    // while the view zoomed out (#2899). A picture a hair short of the
+    // canvas's edge still covers it.
+    let mut hole = at;
+    if hole.left() - area.left() < 0.5 {
+        hole.min.x = hole.min.x.min(area.left());
+    }
+    if hole.top() - area.top() < 0.5 {
+        hole.min.y = hole.min.y.min(area.top());
+    }
+    if area.right() - hole.right() < 0.5 {
+        hole.max.x = hole.max.x.max(area.right());
+    }
+    if area.bottom() - hole.bottom() < 0.5 {
+        hole.max.y = hole.max.y.max(area.bottom());
+    }
+    outside(area, &[hole])
 }
 
 /// The parts of `area` no rectangle of `holes` covers, as rectangles:
@@ -2596,7 +2616,7 @@ pub fn grid_positions(a: f64, b: f64, origin: f64, step: f64) -> Vec<f64> {
 }
 
 /// The document grid over the whole drawing window, as lines or dots,
-/// passing through the ruler origin. Lines are thinned out when the zoom
+/// passing through the grid origin (App::grid_origin). Lines are thinned out when the zoom
 /// would crowd them, and fade in as they spread apart, so a dense grid
 /// is faint rather than a shimmering pattern (#2313). Each line or dot
 /// lands on one whole device pixel, also when the interface is scaled
@@ -2605,7 +2625,8 @@ pub fn grid_positions(a: f64, b: f64, origin: f64, step: f64) -> Vec<f64> {
 fn draw_grid(app: &App, painter: &Painter, rect: ERect) {
     let view = &app.view;
     let meta = &app.doc().metadata;
-    let (grid, rulers) = (meta.grid, meta.rulers.clone());
+    let grid = meta.grid;
+    let origin = app.grid_origin();
     let zoom = view.zoom as f64;
     let ppp = painter.ctx().pixels_per_point();
     let dots = grid.display == tracedraw_core::document::GridDisplay::Dots;
@@ -2618,12 +2639,12 @@ fn draw_grid(app: &App, painter: &Painter, rect: ERect) {
     let sy = grid.spacing_y.max(1e-6) * fy;
     let tl = view.to_page(rect.left_top());
     let br = view.to_page(rect.right_bottom());
-    let xs: Vec<f32> = grid_positions(tl.x, br.x, rulers.origin_x, sx)
+    let xs: Vec<f32> = grid_positions(tl.x, br.x, origin.x, sx)
         .into_iter()
         .map(|x| device_pixel(view.to_screen(Point::new(x, 0.0)).x, ppp))
         .filter(|x| *x >= rect.left() && *x < rect.right())
         .collect();
-    let ys: Vec<f32> = grid_positions(br.y, tl.y, rulers.origin_y, sy)
+    let ys: Vec<f32> = grid_positions(br.y, tl.y, origin.y, sy)
         .into_iter()
         .map(|y| device_pixel(view.to_screen(Point::new(0.0, y)).y, ppp))
         .filter(|y| *y >= rect.top() && *y < rect.bottom())
@@ -2760,6 +2781,18 @@ fn draw_pixel_grid(app: &App, painter: &Painter, rect: ERect) {
         }
     }
     px.paint(painter);
+}
+
+/// The middle of a control handle's head as `draw_control_handle` draws
+/// it: a triangle `head` pixels long, its tip on the handle, drawn back
+/// towards the node (and shortened on a handle shorter than that).
+fn handle_head_centre(node: Pos2, ctrl: Pos2, head: f32) -> Pos2 {
+    let d = ctrl - node;
+    let len = d.length();
+    if len < 0.5 {
+        return ctrl;
+    }
+    ctrl - d / len * (head.min(len) * 0.5)
 }
 
 /// One node marker: `shape` of side `size` around `p`.
@@ -2956,7 +2989,7 @@ fn draw_nodes(app: &App, painter: &Painter) {
                     );
                     if let (Some(a), Some(b)) = ends {
                         let sp = |q| view.to_screen(s.transform * q);
-                        let head = prefs.size.handle_head();
+                        let head = prefs.control_head();
                         draw_control_handle(painter, sp(a), sp(c1), main, head);
                         draw_control_handle(painter, sp(b), sp(c2), main, head);
                     }
@@ -2965,10 +2998,14 @@ fn draw_nodes(app: &App, painter: &Painter) {
         }
     }
     // The control handle chosen by a click: a ring round its head, the
-    // one the arrow keys move (#2819).
-    if let Some(c) = app.chosen_handle_point() {
-        let r = prefs.size.handle_head() * 0.5 + 3.0;
-        painter.circle_stroke(view.to_screen(c), r, EStroke::new(1.5, main));
+    // one the arrow keys move (#2819). The head is a triangle drawn back
+    // from the tip towards the node, so the ring is centred half a head
+    // back from the tip, not on the tip (#3041).
+    if let Some((node, tip)) = app.chosen_handle_ends() {
+        let head = prefs.control_head();
+        let centre = handle_head_centre(view.to_screen(node), view.to_screen(tip), head);
+        let r = head * 0.5 + 3.0;
+        painter.circle_stroke(centre, r, EStroke::new(1.5, main));
     }
     // The spot clicked on a segment: a small round mark where Add Node
     // puts the node.
@@ -3174,7 +3211,7 @@ fn draw_nodes(app: &App, painter: &Painter) {
             if selected {
                 for c in [n.ctrl_in, n.ctrl_out].into_iter().flatten() {
                     let cp = view.to_screen(s.transform * c);
-                    draw_control_handle(painter, p, cp, main, prefs.size.handle_head());
+                    draw_control_handle(painter, p, cp, main, prefs.control_head());
                 }
             }
             let shape = match nodes::node_type_of_with(&n, &s.node_types) {
@@ -3932,6 +3969,21 @@ pub fn draw_effect_nodes(app: &App, painter: &Painter) {
 mod tests {
     use super::*;
 
+    /// The ring round a chosen control handle sits on the handle's head,
+    /// half a head back from its tip towards the node, not on the tip
+    /// (#3041); on a handle shorter than a head, halfway along it.
+    #[test]
+    fn the_handle_ring_sits_on_the_head() {
+        let c = handle_head_centre(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0), 12.0);
+        assert!((c - egui::pos2(94.0, 0.0)).length() < 1e-4, "{c:?}");
+        let c = handle_head_centre(egui::pos2(10.0, 10.0), egui::pos2(10.0, 50.0), 12.0);
+        assert!((c - egui::pos2(10.0, 44.0)).length() < 1e-4, "{c:?}");
+        let c = handle_head_centre(egui::pos2(0.0, 0.0), egui::pos2(8.0, 0.0), 12.0);
+        assert!((c - egui::pos2(4.0, 0.0)).length() < 1e-4, "{c:?}");
+        let c = handle_head_centre(egui::pos2(5.0, 5.0), egui::pos2(5.0, 5.0), 12.0);
+        assert_eq!(c, egui::pos2(5.0, 5.0));
+    }
+
     /// An empty clip frame's crossing lines stay inside its outline: an
     /// ellipse's run corner to corner of its box no more (#2702); a
     /// rectangle's still go corner to corner.
@@ -4178,6 +4230,26 @@ mod tests {
         m.grid.baseline_start = 0.0;
         app.run(tracedraw_core::Command::SetMetadata { metadata: m });
         assert!((app.baseline_ys()[0] - page.y1).abs() < 1e-9);
+    }
+
+    /// While the view zooms out the old picture shows smaller and the
+    /// backdrop fills round it, edge to edge: no strip of bare paper
+    /// between the two, not even half a pixel wide (#2899). At rest a
+    /// picture a hair short of the canvas needs no backdrop.
+    #[test]
+    fn the_backdrop_meets_the_shrunk_picture_without_a_gap() {
+        let canvas = ERect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let back = canvas.expand(200.0);
+        let at = ERect::from_min_max(Pos2::new(200.3, 150.7), Pos2::new(600.2, 450.4));
+        let parts = backdrop_parts(canvas, at, back);
+        let covered: f32 = parts.iter().map(|r| r.area()).sum::<f32>() + at.area();
+        let whole = canvas.area();
+        assert!((covered - whole).abs() < 0.01, "{covered} of {whole}");
+        for r in &parts {
+            assert!(r.intersect(at).area() < 1e-3, "{r:?} over the picture");
+        }
+        let rest = ERect::from_min_max(Pos2::new(0.3, 0.2), Pos2::new(799.8, 599.6));
+        assert!(backdrop_parts(canvas, rest, back).is_empty());
     }
 }
 

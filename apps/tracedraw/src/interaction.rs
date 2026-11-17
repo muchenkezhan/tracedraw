@@ -467,6 +467,84 @@ impl App {
         }
     }
 
+    /// A Text tool click at `p` on the container `id`: the text inside it
+    /// there (see [`Self::text_inside_at`]) is edited, the caret by the
+    /// letter clicked, through a warp too (#3010); whether there was one.
+    pub fn edit_text_inside(&mut self, id: ShapeId, p: Point) -> bool {
+        let Some((text, warped)) = self.text_inside_at(id, p) else {
+            return false;
+        };
+        self.begin_text_edit(text);
+        let at = if warped {
+            self.unwarped_text_point(id, text, p)
+        } else {
+            Some(p)
+        };
+        if let Some(idx) = at.and_then(|q| self.text_hit_char(q)) {
+            self.text_set_caret_at(idx, false);
+        }
+        true
+    }
+
+    /// Where a click at `p` on the text `text`, drawn through a warp on
+    /// the container `id` (an envelope, a perspective), falls among its
+    /// letters as they are laid out (#3010): a grid of points over the
+    /// text is drawn through the same warp beside it, and the grid point
+    /// drawn nearest `p` is taken. `None` when the warp loses the grid.
+    pub fn unwarped_text_point(&self, id: ShapeId, text: ShapeId, p: Point) -> Option<Point> {
+        use tracedraw_core::geometry::{BezPath, PathEl};
+        const N: usize = 48;
+        let (_, s) = self.doc().shape(id).ok()?;
+        let t = self.doc().find_shape(text)?;
+        let bb = t.page_path().bounding_box();
+        if !(bb.width() > 0.0 && bb.height() > 0.0) {
+            return None;
+        }
+        let step = Vec2::new(bb.width() / (N - 1) as f64, bb.height() / (N - 1) as f64);
+        let tiny = Vec2::new(step.x * 1e-3, 0.0);
+        let mut grid = Vec::with_capacity(N * N);
+        let mut marks = BezPath::new();
+        for j in 0..N {
+            for i in 0..N {
+                let q = Point::new(bb.x0 + step.x * i as f64, bb.y0 + step.y * j as f64);
+                marks.move_to(q);
+                marks.line_to(q + tiny);
+                grid.push(q);
+            }
+        }
+        let marker = ShapeId(u64::MAX);
+        let mut probe = tracedraw_core::Shape::new(
+            marker,
+            ShapeKind::Path {
+                path: marks,
+                closed: false,
+            },
+        );
+        probe.fill = tracedraw_core::Fill::None;
+        let mut copy = s.clone();
+        if !insert_beside(&mut copy, text, &probe, 0) {
+            return None;
+        }
+        let drawn = drawn_path_of(&copy, marker, 0)?;
+        let starts: Vec<Point> = drawn
+            .elements()
+            .iter()
+            .filter_map(|e| match e {
+                PathEl::MoveTo(q) => Some(*q),
+                _ => None,
+            })
+            .collect();
+        if starts.len() != grid.len() {
+            return None;
+        }
+        let nearest = starts
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.distance_squared(p).total_cmp(&b.1.distance_squared(p)))?
+            .0;
+        Some(grid[nearest])
+    }
+
     fn leaf_at(
         &self,
         s: &tracedraw_core::Shape,
@@ -1188,6 +1266,10 @@ impl App {
     /// Add `id` to the selection, taking out the groups holding it and the
     /// objects inside it, so nothing is selected twice over.
     pub fn select_add(&mut self, id: ShapeId) {
+        // Shift+click adds no locked object either (#2901).
+        if self.locked_ids().contains(&id) {
+            return;
+        }
         let above = self.doc().ancestors(id);
         let doc = self.doc();
         let keep: Vec<ShapeId> = self
@@ -1731,7 +1813,6 @@ impl App {
     }
 
     pub fn canvas_input(&mut self, response: &Response, mods: Modifiers) {
-        self.freehand_end_tick(&response.ctx);
         self.snap_mark.set(None);
         self.clear_live_guides();
         self.pointer_screen = response.ctx.pointer_latest_pos();
@@ -1880,7 +1961,11 @@ impl App {
             && ((self.tool == Tool::Zoom && self.settings.zoom_right_click_out)
                 || (self.tool == Tool::Pan && self.settings.pan_right_click_out))
         {
-            self.view.zoom_at(screen, 0.5);
+            if self.tool == Tool::Zoom {
+                self.zoom_tool_click(screen, 0.5);
+            } else {
+                self.view.zoom_at(screen, 0.5);
+            }
             self.end_zoom_one_shot();
             return;
         }
@@ -2060,7 +2145,11 @@ impl App {
             }
             Tool::Text => self.text_input(response, p, mods),
             Tool::ColorEyedropper | Tool::AttributesEyedropper => {
-                if response.clicked() {
+                // A press let go counts as a click also when the pointer
+                // moved a little (a pen, a shaky hand) or the button was
+                // held a moment, which the window takes for a drag: such
+                // a click sampled or applied nothing (#2897).
+                if response.clicked() || response.drag_stopped_by(PointerButton::Primary) {
                     let attrs = self.tool == Tool::AttributesEyedropper;
                     // Ctrl samples again in Apply mode (#1302).
                     self.eyedropper_click(p, attrs, mods.shift, mods.ctrl);
@@ -3001,13 +3090,7 @@ impl App {
             let hit = self.hit_test(p);
             // A text inside a group or a grouped blend, warped by an
             // envelope or a perspective on the group or not (#2169).
-            if let Some((text, warped)) = hit.and_then(|id| self.text_inside_at(id, p)) {
-                self.begin_text_edit(text);
-                if !warped {
-                    if let Some(idx) = self.text_hit_char(p) {
-                        self.text_set_caret_at(idx, false);
-                    }
-                }
+            if hit.is_some_and(|id| self.edit_text_inside(id, p)) {
                 return;
             }
             match hit {
@@ -3047,10 +3130,23 @@ impl App {
             }
         }
         if response.clicked_by(PointerButton::Primary) {
-            self.view
-                .zoom_at(screen, if mods.shift { 0.5 } else { 2.0 });
+            self.zoom_tool_click(screen, if mods.shift { 0.5 } else { 2.0 });
             self.end_zoom_one_shot();
         }
+    }
+
+    /// A click of the Zoom tool: the zoom changes by `factor` and the
+    /// point clicked comes to the middle of the window, so a click near
+    /// the page's edge brings that edge into view with room round it,
+    /// as the reference program does; before, the point stayed under
+    /// the pointer and the page's top edge, at the window's edge after
+    /// a zoom to fit, could not be zoomed into (#2898).
+    pub(crate) fn zoom_tool_click(&mut self, screen: egui::Pos2, factor: f32) {
+        let p = self.view.to_page(screen);
+        self.view.zoom_at(screen, factor);
+        let c = self.canvas_rect.center();
+        let at = self.view.to_screen(p);
+        self.view.pan(c - at);
     }
 
     /// After a zoom with the Zoom tool picked by F2, the tool before it
@@ -3195,27 +3291,6 @@ impl App {
         }
     }
 
-    /// A Freehand line of clicks ends once the double-click time after
-    /// its last click has passed with no double-click (which makes that
-    /// node a corner and goes on) and no button held (#2339). It is
-    /// dropped when the line or the tool went another way meanwhile.
-    fn freehand_end_tick(&mut self, ctx: &egui::Context) {
-        let Some(at) = self.freehand_ends_at else {
-            return;
-        };
-        if self.curve.is_none() || self.tool != Tool::Freehand {
-            self.freehand_ends_at = None;
-            return;
-        }
-        let (now, held) = ctx.input(|i| (i.time, i.pointer.primary_down()));
-        if now >= at && !held {
-            self.freehand_ends_at = None;
-            self.finish_curve();
-        } else {
-            ctx.request_repaint_after_secs((at - now).max(0.0) as f32 + 0.01);
-        }
-    }
-
     fn freehand_input(&mut self, response: &Response, p: Point, mods: Modifiers) {
         // Resting before the first click: the pointer shows the point the
         // line would start at, as it does for the next node once the line
@@ -3227,27 +3302,30 @@ impl App {
         {
             let _ = self.snap_point(p);
         }
-        // A click, then another: a straight line between them (Ctrl keeps
-        // it to steps of the constrain angle); Esc drops the first click.
-        // As in CorelDRAW, a double-click instead of the second click
-        // makes a corner and the line goes on to the next click; a single
-        // click ends it (#2339). The line ends once the double-click time
-        // has passed (see `freehand_end_tick`).
+        // Clicks draw straight segments, one to each click (Ctrl keeps
+        // each to steps of the constrain angle), and a double-click ends
+        // the line where it is (#2339): the first click of the pair
+        // placed that node. Esc drops a lone first click; Space, Enter
+        // and Esc end a longer line at its last node.
         // (egui counts the pair as a triple click when the click before
         // it came less than two double-click times earlier.)
+        // A quick click somewhere else is the next node, not the end:
+        // egui counts clicks as a pair by time alone.
         let double = response.double_clicked_by(PointerButton::Primary)
             || response.triple_clicked_by(PointerButton::Primary);
-        if double && self.tool == Tool::Freehand {
-            // The first click of the pair placed the node: it stays.
-            self.freehand_ends_at = None;
+        let on_last = self
+            .curve
+            .as_ref()
+            .and_then(|c| c.nodes.last())
+            .is_some_and(|n| {
+                let q = self.curve_point(self.snap_point(p), self.constrain_held(&mods));
+                (n.0 - p).hypot().min((n.0 - q).hypot()) * self.view.zoom as f64 <= 6.0
+            });
+        if double && on_last && self.tool == Tool::Freehand {
+            self.finish_curve();
             return;
         }
         if response.clicked_by(PointerButton::Primary) && self.tool == Tool::Freehand {
-            // A click while the line waits to end: it ends, and this
-            // click starts the next one.
-            if self.freehand_ends_at.take().is_some() {
-                self.finish_curve();
-            }
             let p = self.curve_point(self.snap_point(p), self.constrain_held(&mods));
             let c = self.curve.get_or_insert_with(|| CurveInProgress {
                 nodes: Vec::new(),
@@ -3257,19 +3335,11 @@ impl App {
                 ..Default::default()
             });
             c.nodes.push((p, None));
-            if c.nodes.len() >= 2 {
-                let now = response.ctx.input(|i| i.time);
-                let delay = response
-                    .ctx
-                    .options(|o| o.input_options.max_double_click_delay);
-                self.freehand_ends_at = Some(now + delay);
-                response.ctx.request_repaint_after_secs(delay as f32);
-            }
             return;
         }
         if response.drag_started_by(PointerButton::Primary) {
-            // A line of clicks still waiting to end ends before the drag.
-            if self.freehand_ends_at.take().is_some() {
+            // A line of clicks ends before a drag draws freehand.
+            if self.curve.as_ref().is_some_and(|c| c.nodes.len() >= 2) {
                 self.finish_curve();
             }
             self.curve = None;
@@ -4134,20 +4204,18 @@ impl App {
             Drag::Freehand { points } => {
                 // Smoothing (Options > Tools > Curves, the property bar)
                 // sets how far the stroke may be simplified, on screen.
+                // Corners and straight stretches (Options > Tools >
+                // Curves, #1436); as few nodes as fit (#2887).
                 let tol = self.settings.curves.freehand_tolerance_px() / self.view.zoom as f64;
-                let pts = tracedraw_core::geometry::simplify(&points, tol.max(0.02));
-                if pts.len() >= 2 {
-                    // Corners and straight stretches (Options > Tools >
-                    // Curves, #1436).
-                    let c = self.settings.curves;
-                    let px = 1.0 / self.view.zoom as f64;
-                    let path = crate::tools2::fit_freehand(
-                        &points,
-                        &pts,
-                        c.corner_turn_deg(),
-                        (c.straight_threshold > 0)
-                            .then(|| (f64::from(c.straight_threshold.min(10)) * px, 20.0 * px)),
-                    );
+                let c = self.settings.curves;
+                let px = 1.0 / self.view.zoom as f64;
+                if let Some(path) = crate::tools2::freehand_path(
+                    &points,
+                    tol,
+                    c.corner_turn_deg(),
+                    (c.straight_threshold > 0)
+                        .then(|| (f64::from(c.straight_threshold.min(10)) * px, 20.0 * px)),
+                ) {
                     // Drawn with a pen: the outline follows its pressure
                     // along the stroke (#850); the mouse keeps it even.
                     let widths = self
@@ -4464,6 +4532,45 @@ impl App {
             && self.table_keyboard(ctx)
         {
             return;
+        }
+        // Command shortcuts the field gave up last frame run now, on
+        // what the field applied.
+        if !self.deferred_keys.is_empty() {
+            let keys = std::mem::take(&mut self.deferred_keys);
+            ctx.input_mut(|i| i.events.extend(keys));
+        }
+        // A command shortcut (Ctrl+K, Ctrl+G...) pressed while a field of
+        // a bar or a docker has the keyboard: the field applies what was
+        // typed in it and gives the keyboard back to the drawing, and the
+        // command runs in the next frame, on what the field changed. The
+        // video of #2893 typed in the bar, then pressed Ctrl+K, and
+        // nothing happened. The keys that edit the field's text stay its
+        // own (see `field_editing_key`).
+        if !dialog_open && ctx.egui_wants_keyboard_input() {
+            let commands: Vec<egui::Event> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| match e {
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => modifiers.command && !modifiers.alt && !field_editing_key(*key),
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect()
+            });
+            if !commands.is_empty() {
+                if let Some(id) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+                ctx.input_mut(|i| i.events.retain(|e| !commands.contains(e)));
+                self.deferred_keys = commands;
+                ctx.request_repaint();
+                return;
+            }
         }
         // A field with the keyboard (the font search field of the
         // property bar, a docker's box) keeps what is typed in it, even
@@ -5245,6 +5352,29 @@ impl App {
                 };
             }
         }
+        // While a curve with handles is drawn (Bezier, Pen) C, S and Y
+        // set the last node's type, as with the Shape tool, and pick no
+        // tool: S and Y switched to the Sketch and Polygon tools and the
+        // curve was dropped (#2876).
+        if self
+            .curve
+            .as_ref()
+            .is_some_and(|c| c.smooth && !c.bspline && !c.nodes.is_empty())
+        {
+            use tracedraw_core::nodes::NodeType;
+            for (k, ty) in [
+                (Key::C, NodeType::Cusp),
+                (Key::S, NodeType::Smooth),
+                (Key::Y, NodeType::Symmetrical),
+            ] {
+                if pressed(k, Modifiers::NONE) {
+                    if let Some(c) = &mut self.curve {
+                        c.set_last_node_type(ty);
+                    }
+                    return;
+                }
+            }
+        }
         // The Shape tool with nodes chosen: C makes them cusp, S smooth
         // and Y symmetrical (before the alignment and tool letters).
         // Each key names one type: C used to turn a cusp node smooth
@@ -5413,4 +5543,88 @@ impl App {
             }
         }
     }
+}
+
+/// A key that, with Ctrl (Command on macOS), edits the text of a field:
+/// select all, copy, cut, paste, undo, redo, and the moves and deletes by
+/// word. A field with the keyboard keeps these; other Ctrl shortcuts are
+/// commands for the drawing.
+fn field_editing_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::A
+            | Key::C
+            | Key::V
+            | Key::X
+            | Key::Z
+            | Key::Y
+            | Key::Backspace
+            | Key::Delete
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::ArrowUp
+            | Key::ArrowDown
+            | Key::Home
+            | Key::End
+            | Key::Insert
+            | Key::Enter
+            | Key::Tab
+    )
+}
+
+/// Put `probe` next to the object `text` inside the container `s` (in
+/// the same group or clip frame, so the same warps draw it); whether
+/// `text` was found.
+fn insert_beside(
+    s: &mut tracedraw_core::Shape,
+    text: ShapeId,
+    probe: &tracedraw_core::Shape,
+    depth: usize,
+) -> bool {
+    if depth > MAX_HIT_DEPTH {
+        return false;
+    }
+    let list = match &mut s.kind {
+        ShapeKind::Group { children } => children,
+        ShapeKind::ClipFrame { contents, .. } => contents,
+        _ => return false,
+    };
+    if let Some(i) = list.iter().position(|c| c.id == text) {
+        list.insert(i + 1, probe.clone());
+        return true;
+    }
+    list.iter_mut()
+        .any(|c| insert_beside(c, text, probe, depth + 1))
+}
+
+/// The page outline of the part `id` of `s` as `s` draws it, through the
+/// warps on `s` and on the containers inside it.
+fn drawn_path_of(
+    s: &tracedraw_core::Shape,
+    id: ShapeId,
+    depth: usize,
+) -> Option<tracedraw_core::geometry::BezPath> {
+    if depth > MAX_HIT_DEPTH {
+        return None;
+    }
+    let drawn;
+    let s = if s.effects.iter().any(|e| e.warps_outline()) {
+        drawn = tracedraw_core::live::evaluate(s).main;
+        &drawn
+    } else {
+        s
+    };
+    if s.id == id {
+        return Some(s.page_path());
+    }
+    let list = match &s.kind {
+        ShapeKind::Group { children } => children,
+        ShapeKind::ClipFrame { contents, .. } => contents,
+        _ => return None,
+    };
+    list.iter().find_map(|c| {
+        let mut c = c.clone();
+        c.transform_by(s.transform);
+        drawn_path_of(&c, id, depth + 1)
+    })
 }

@@ -122,6 +122,7 @@ pub mod text_docker;
 pub mod text_path_bar;
 pub mod time_tracker;
 pub mod trace_dialog;
+pub mod trace_progress;
 pub mod tracecut;
 pub mod tracecut_cut;
 pub mod tracecut_make;
@@ -768,11 +769,14 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
             }
         };
         if show_doc_palette {
-            let r = side(panel("document_palette"), palette::row_h(app))
-                .frame(palette_frame)
-                .show(ui, |ui| palette::document_palette_row(app, ui))
-                .response
-                .rect;
+            let r = side(
+                panel("document_palette"),
+                palette::thickness(app, palette::Row::Document),
+            )
+            .frame(palette_frame)
+            .show(ui, |ui| palette::document_palette_row(app, ui))
+            .response
+            .rect;
             let d = if palette_dock == Dock::Top {
                 Dock::Top
             } else {

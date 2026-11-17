@@ -149,6 +149,7 @@ mod object_thumbs;
 mod offset_shadow_handle;
 mod ops;
 mod ops2;
+mod opening;
 mod package;
 mod page_drop;
 mod page_names;
@@ -182,6 +183,8 @@ mod select_region;
 mod select_similar;
 mod settings;
 mod shadow_tool;
+#[cfg(test)]
+mod shadow_split_tests;
 mod shape_builder;
 mod shape_tool;
 #[cfg(test)]
@@ -224,6 +227,7 @@ mod text_effect_tests;
 mod text_frames;
 mod text_nodes;
 mod text_path;
+mod toc;
 #[cfg(test)]
 mod text_wrap_tests;
 mod textflow;
@@ -239,7 +243,15 @@ mod touch_bars;
 mod touch_modifiers;
 mod touch_taps;
 mod trace;
+mod trace_blend;
+mod trace_fine;
+mod trace_fit;
+mod trace_fonts;
+mod trace_job;
 mod trace_preview;
+mod trace_progress;
+mod trace_strokes;
+mod trace_text;
 mod tracecut;
 mod tracecut_cut;
 mod tracecut_make;
@@ -247,6 +259,9 @@ mod tracecut_nest;
 mod tracecut_send;
 mod ui;
 mod updates;
+mod upscale;
+#[cfg(not(target_arch = "wasm32"))]
+mod upscale_net;
 mod variable_outline;
 mod vector_mosaic;
 mod view;
@@ -274,6 +289,10 @@ mod winit_pen_pressure;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../../../vendor/winit/src/size_bounds.rs"]
 mod winit_size_bounds;
+// The pointer pixels and scale of the same copy on Linux (#2871).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../../../vendor/winit/src/cursor_pixels.rs"]
+mod winit_cursor_pixels;
 // The pen pressure of the patched eframe's web layer, with its tests
 // (vendor/README.md, #1410), so that the gate runs them.
 #[cfg(test)]
@@ -1070,6 +1089,11 @@ impl eframe::App for Shell {
         #[cfg(not(target_arch = "wasm32"))]
         if app.sync_mcp_link(ui.ctx()) {
             ui.ctx().request_repaint();
+        }
+        // A large drawing being opened off the interface's thread (#2849).
+        if app.poll_opening() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
         // An answer from GitHub (File > GitHub).
         if app.poll_github() {

@@ -5,6 +5,27 @@ from, so that anyone can check that the format support was written
 independently. The details of each layout, and whether a file confirmed
 it, live in `docs/cdr-format.md` and in the pages of `docs/behavior/`.
 
+## Saved Gaussian blur observation
+
+Format observation, 2026-11-15: a contributor-owned version 27 CDR with
+two original rectangles stores the upper vector object's Gaussian blur
+in argument 201 JSON under `StackedBitmapEffects.GaussianBlurEffect`.
+`Radius` is `1500` while the contributor's screenshot shows 15.0;
+`Resampled` is `0`, with sibling deletion `0`, visibility `1` and stack
+index `0`. Read using TraceDraw's own inspector and a ZIP reader. The
+original drawing and screenshots are not bundled; tests and sample assets
+are original synthetic rectangles built from the observed keys and this
+repository's existing container/geometry layouts. No program, third-party
+reader code or proprietary documentation was inspected or copied. Exact
+blur-kernel equivalence and unobserved versions/states are not asserted.
+The contributor subsequently exported the same drawing as a 300 dpi PNG
+(also not bundled). Its normalized white-edge spread is about 13.5 pixels,
+consistent with a Gaussian using radius as sigma and a cutoff near two
+sigma. This rendering convention is inferred from pixels, not confirmed
+by a specification; the implementation preserves it as an internal native
+effect parameter and uses the same code in the desktop and CLI.
+Details: `docs/cdr-format.md`, "Version 27 saved Gaussian blur".
+
 ## Rules
 
 - No program is ever decompiled or disassembled, and no decompiled code,
@@ -45,6 +66,7 @@ it, live in `docs/cdr-format.md` and in the pages of `docs/behavior/`.
 
 | Date | Finding | Source |
 |---|---|---|
+| 2026-11-15 | `.cdr` modern saved states (#2850, consolidating #2862): byte-1 bit 0 hides object (type 0x08), group (0x10) and layer (0x98) records. Hidden/visible text flags are [0, 3, 0, 8]/[0, 2, 0, 8]. Layer byte-0 bits 0x10 and 0x08 mark locked and excluded layers. Modern layer `loda` kinds identify ordinary 0, grid 11, guides 12 and desktop 17; exclusion bit 0x08 alone does not make an ordinary layer a desktop layer. Existing object lock bit 0x10 and hidden argument 16016 are preserved | contributor-owned version 27 drawings inspected locally, not uploaded or committed: the original group alternatives and the reporter's progressively expanded minimal state sample, compared with their screenshots; original synthetic rectangles generated from TraceDraw layouts; no other program or implementation inspected or copied; earlier versions and independent object exclusion not established by these files |
 | 2026-11-10 | `.cdr` text before version 12 (#2047): text in a font recorded with the Arabic character set can be Latin text in Windows-1252 (a version 10 file's "Economía" read in Windows-1256 shows an Arabic letter for byte 0xED); the reader now takes a run whose words mix Latin letters with the set's script as Windows-1252; which field of the file names the set is not known (assumed) | the reporter's screenshot and description in issue #2047 (the file itself did not reach the issue); the published Windows-1252 and Windows-1256 code page tables; a test file built by hand; no program looked at, no code read or copied |
 | 2026-11-09 | Reading CMYK JPEG files (#2163): the frame header's component count, the Adobe `APP14` segment ("Adobe", version, two flag words, the transform byte), four channels stored inverted under transform 0 and as Y, Cb, Cr of the inverted C, M, Y with an inverted K under transform 2 (YCCK), the JFIF YCbCr equations; the Exif orientation tag (274) | ITU-T T.81 annex B, Adobe Technical Note 5116, ITU-T T.871 and CIPA DC-008; test files written by our own CMYK JPEG writer and by a general-purpose imaging library (checked in under `apps/tracedraw/testdata/`); the JPEG library the app already depends on decodes the entropy-coded data, its handling of four-component files looked up in its source only to find why the colours were off; no code of any other implementation ported |
 | 2026-11-07 | PDF overprint: objects whose fill or outline overprints are drawn under an ExtGState with `/op` (non-stroking) and `/OP` (stroking) and nonzero overprint mode `/OPM 1` | ISO 32000-1, section 8.6.7 (overprint control) and table 58 (graphics state parameters); no other implementation read or ported |
@@ -231,3 +253,4 @@ it, live in `docs/cdr-format.md` and in the pages of `docs/behavior/`.
 | 2026-11-15 | Desktop publishing `.pmd` files (#2822): text lies in them as runs of plain Windows-1252 characters (paragraphs ended by a carriage return) and pictures as whole picture files, among the program's own names (paths, fonts, styles) set in lists; only these are recovered, nothing of the layout | one public sample file from an open-source project's test data (not committed), read with hex dumps and a compound file lister; the [MS-CFB] specification; no program looked at, no code of any other reader read or ported |
 | 2026-11-15 | `.cdr` version 16+ graded transparency whose `startTransparency` / `endTransparency` run from 1 down to 0 taken as the reversed transparency (#2736); line spacing in points or percent of the size (`spacingMethod` 1 and 2, interval unit 1) kept as such rather than as a share of a 1.15 line (#2676) | the reporters' descriptions and screenshots in issues #2736 and #2676 (no file attached); the transparency sections of the `.cdr` files attached to other issues, read as text; the reversed encoding is assumed, not confirmed by a file; no program looked at, no code of any other reader read or copied |
 | 2026-11-15 | ZIP `.cdr` document rating is an unsigned property with format id `64440492-4c8b-11d1-8b70-080036b11a03`, property id 9 and value 0, 1, 25, 50, 75 or 99 for zero through five stars. Versions 14 and 15 use `Properties/Property` with plain attributes and the value as text. Versions 16+ use `OpenMetadata/rdf:Bag/rdf:li` with namespaced attributes including `value` | contributor-owned drawings written by TraceDraw in versions 14, 15, 16 and 27, copied and rated through the public Windows `IPropertyStore` API, then compared member by member with the originals. The installed Windows property reader reported 99 for the five-star copies. All observations came from the owned files and public APIs. The key and ranges follow the [System.Rating documentation](https://learn.microsoft.com/en-us/windows/win32/properties/props-system-rating). |
+| 2026-11-17 | `.cdr` embedded objects whose `\x01Ole10Native` stream is a package (a whole file wrapped by Windows' Object Packager, #3083): after the u32 size, a u16 2, the label (the file's name) and its path, each ANSI and ended by a NUL, then the file; no presentation stream comes with it, so the object is kept as a grey box named after the label | the `.cdr` file the reporter attached to issue #3083 (not committed): its `ole2` chunk listed and its streams dumped with our own short Python scripts following the public compound file specification (MS-CFB); no program looked at, no code of any other reader read or copied |

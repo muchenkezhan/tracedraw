@@ -733,6 +733,7 @@ fn menu_pic(key: &str) -> Option<crate::ui::propbar::Pic> {
         "menu.object.combine" => Pic::Combine,
         "menu.object.break_apart"
         | "menu.object.break_shadow_apart"
+        | "menu.object.break_shadows_apart"
         | "menu.object.break_contour_apart"
         | "menu.object.break_blend_apart"
         | "menu.object.break_extrude_apart" => Pic::BreakApart,
@@ -2394,6 +2395,10 @@ pub fn menu_bar(app: &mut App, ui: &mut Ui) {
     // instead of opening a menu; while Options waits for a shortcut's keys
     // no menu opens either.
     let capturing = app.shortcut_editor.capture.is_some();
+    // Alt+E edits the selected object's symmetry (Object > Symmetry,
+    // run before the menu bar is drawn, so also while it is edited);
+    // with no symmetry selected it opens the Edit menu (#2881).
+    let symmetry_e = app.selected_symmetry().is_some();
     let user_alt_keys: Vec<egui::Key> = app
         .settings
         .shortcuts
@@ -2402,8 +2407,11 @@ pub fn menu_bar(app: &mut App, ui: &mut Ui) {
         .filter(|(m, _)| m.alt && !(m.ctrl || m.command || m.shift))
         .map(|(_, k)| k)
         .collect();
-    let blocked =
-        move |c: char| capturing || access::key_of(c).is_some_and(|k| user_alt_keys.contains(&k));
+    let blocked = move |c: char| {
+        capturing
+            || (symmetry_e && c == 'e')
+            || access::key_of(c).is_some_and(|k| user_alt_keys.contains(&k))
+    };
     egui::MenuBar::new()
         .style(menu_bar_style)
         .config(egui::containers::menu::MenuConfig::new().style(menu_popup_style))
@@ -2556,8 +2564,10 @@ pub fn menu_bar(app: &mut App, ui: &mut Ui) {
 }
 
 /// Alt+letter used by commands (symmetry, Alt+Q, Alt+Z): they keep it
-/// over opening a menu.
-const ALT_TAKEN: [char; 5] = ['e', 's', 'x', 'q', 'z'];
+/// over opening a menu. Alt+E opens the Edit menu, as on every Windows
+/// program (Alt+E, N clones); it edits a symmetry only while an object
+/// with one is selected (#2881).
+const ALT_TAKEN: [char; 4] = ['s', 'x', 'q', 'z'];
 
 /// Alt and a title's access key open that menu (closing another one),
 /// unless `blocked` keeps that letter for something else.
@@ -4088,9 +4098,6 @@ fn bitmaps_menu(app: &mut App, ui: &mut Ui) {
     // Black and white, duotone and paletted open their dialogs; the
     // others convert at once.
     sub(ui, "menu.bitmaps.mode", |ui| {
-        if item(ui, "menu.bitmaps.mode_bw", "", has_bitmap) {
-            app.dialog = Dialog::BitmapBw(Default::default());
-        }
         // Grayscale, RGB and CMYK are the bitmaps' colour mode: the mode
         // of every selected bitmap is ticked (#1254); a grayscale PNG is
         // a grayscale bitmap (#2330), as the status bar names it.
@@ -4110,6 +4117,17 @@ fn bitmaps_menu(app: &mut App, ui: &mut Ui) {
         let all_cmyk = all(crate::bitmap_fx::ColorMode::Cmyk);
         let all_paletted = all(crate::bitmap_fx::ColorMode::Paletted);
         let all_lab = all(crate::bitmap_fx::ColorMode::Lab);
+        // A 1-bit bitmap is ticked Black and White (#2922).
+        let all_bw = all(crate::bitmap_fx::ColorMode::BlackWhite);
+        if mark_item_if(
+            ui,
+            "menu.bitmaps.mode_bw",
+            "",
+            Mark::Check(all_bw),
+            has_bitmap,
+        ) {
+            app.dialog = Dialog::BitmapBw(Default::default());
+        }
         if mark_item_if(
             ui,
             "menu.bitmaps.mode_grayscale",
@@ -4413,6 +4431,26 @@ fn text_menu(app: &mut App, ui: &mut Ui) {
         }
         if item(ui, "menu.text.chinese_pinyin", "", is_text) {
             app.add_pinyin();
+        }
+    });
+    // Headings and a table of contents listing them (#1660).
+    sub(ui, "menu.text.toc", |ui| {
+        if item(ui, "menu.text.toc_insert", "", true) {
+            app.insert_toc();
+        }
+        sep(ui);
+        let level = app.selected_toc_level();
+        for (n, key) in [
+            (1, "menu.text.toc_heading_1"),
+            (2, "menu.text.toc_heading_2"),
+            (3, "menu.text.toc_heading_3"),
+        ] {
+            if check(ui, key, "", level == Some(Some(n))) {
+                app.set_toc_level(Some(n));
+            }
+        }
+        if item(ui, "menu.text.toc_not_heading", "", is_text) {
+            app.set_toc_level(None);
         }
     });
     sep(ui);

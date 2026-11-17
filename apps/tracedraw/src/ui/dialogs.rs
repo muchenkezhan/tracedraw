@@ -1271,6 +1271,9 @@ pub use crate::ui::palette_editor::PaletteEditorState;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dialog {
     None,
+    /// The window of a trace running off the interface thread
+    /// (`ui/trace_progress.rs`); the trace itself is `App::trace_job`.
+    Tracing,
     /// Edit Line Style: custom dash patterns.
     LineStyle(crate::ui::line_style::State),
     /// File > New From Template.
@@ -1984,6 +1987,8 @@ pub fn show(app: &mut App, ctx: &Context) {
     // Manual two-sided printing: the fronts went out, the backs wait for
     // the stack to be turned over.
     duplex_backs_prompt(app, ctx);
+    // A large drawing being opened: how far it got, and Cancel (#2849).
+    crate::opening::window(app, ctx);
     // A shape of My shapes asks for its name (#2360).
     crate::ui::toolbar::my_shape_name_dialog(app, ctx);
     crate::ui::chrome::set_center_dialogs(ctx, app.settings.center_dialogs);
@@ -2034,6 +2039,10 @@ pub fn show(app: &mut App, ctx: &Context) {
     {
         app.end_bitmap_effect_preview();
     }
+    // A trace running shows its window, whatever closed it.
+    if app.trace_job.is_some() && matches!(app.dialog, Dialog::None) {
+        app.dialog = Dialog::Tracing;
+    }
     let mut dialog = std::mem::replace(&mut app.dialog, Dialog::None);
     app.dialog_help = crate::help::dialog_topic(&dialog, app.options_page);
     if !matches!(dialog, Dialog::None) {
@@ -2054,6 +2063,7 @@ pub fn show(app: &mut App, ctx: &Context) {
     let mut close = false;
     match &mut dialog {
         Dialog::None => {}
+        Dialog::Tracing => crate::ui::trace_progress::dialog(app, ctx, &mut close),
         Dialog::LineStyle(st) => crate::ui::line_style::dialog(app, ctx, st, &mut close),
         Dialog::BitmapBw(s) => crate::ui::bitmap_dialogs::bw_dialog(app, ctx, s, &mut close),
         Dialog::RemoveBackground(st) => {

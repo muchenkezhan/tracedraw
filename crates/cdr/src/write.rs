@@ -188,6 +188,10 @@ pub fn document_to_cdr_version_with(doc: &Document, version: u16, previews: &Pre
     if let Some(b) = crate::kept_effects::encode(&w.effects) {
         own.push((crate::kept_effects::MEMBER, b));
     }
+    // Object data, a clone's link to its master among it (#2879).
+    if let Some(b) = crate::kept_data::encode(doc, &w.static_ids) {
+        own.push((crate::kept_data::MEMBER, b));
+    }
     let out = if v.redirects() {
         let (root, files) = pack_redirected(v, &tree);
         zip_v16(
@@ -2926,6 +2930,14 @@ fn stlt(v: Ver, uses: StyleUses) -> Vec<u8> {
     t.done()
 }
 
+/// A picture written as a `bmp ` record: its bytes, the box size in mm
+/// (as bits) it was written at, and the record's id and pixel size.
+struct WrittenImage {
+    png: SharedBytes,
+    size_mm: (u64, u64),
+    record: (u32, u32, u32),
+}
+
 /// `bmp `: a 24-bit image: id, a file-like header ("UI" block size, the
 /// "RI" block with its size and pixel offset), colour model 1, size,
 /// bits, row stride, pixel bytes, resolution, then rows bottom-up in
@@ -3140,10 +3152,16 @@ fn curve_coords_typed(
             PathEl::LineTo(p) => {
                 // A line of no length (a file of an earlier version read
                 // back: a curve to the start, then the closing line) is
-                // left out.
-                let q = (units(p.x), units(p.y));
+                // left out. A subpath that is only such a line (the
+                // extension lines of a dimension, as files have them)
+                // keeps a line of one unit instead: left out, the object
+                // was lost on saving.
+                let mut q = (units(p.x), units(p.y));
                 if pts.len() > last_start && pts.last() == Some(&q) {
-                    continue;
+                    if pts.len() > last_start + 1 {
+                        continue;
+                    }
+                    q.0 = q.0.saturating_add(1);
                 }
                 pts.push(q);
                 types.push(0x40 | node_bits(i));
@@ -3836,6 +3854,10 @@ struct Writer<'a> {
     /// Bitmap pattern fills already written, matched by their picture's
     /// content (the pointer first, then the bytes) and size.
     bitmap_fills: Vec<(SharedBytes, u32, u32, u64, u32)>,
+    /// Images already written as `bmp ` records, matched the same way
+    /// (picture, then the box size in mm as bits): the id and pixel size.
+    /// The same picture placed many times is stored once (#2923).
+    bitmap_images: Vec<WrittenImage>,
     /// Static ids (`usdn`), object ids (argument 100), next fill, outline
     /// and bitmap ids.
     next_usdn: u32,
@@ -4029,6 +4051,7 @@ impl<'a> Writer<'a> {
             next_outline: 1,
             next_bitmap: 1,
             bitmap_fills: Vec::new(),
+            bitmap_images: Vec::new(),
             next_spnd: 1,
             text_formats: Vec::new(),
             guid_seed: seed,
@@ -4193,13 +4216,29 @@ impl<'a> Writer<'a> {
         id
     }
 
-    /// A new `bmp ` record for `png`: its id and the image's size in
-    /// pixels.
-    fn bitmap_id(&mut self, png: &[u8], size_mm: (f64, f64)) -> Option<(u32, u32, u32)> {
+    /// The `bmp ` record for `png`: its id and the image's size in
+    /// pixels. A picture already written at the same box size reuses its
+    /// record, as files of the program that reads them share one image
+    /// among its copies; writing it once per object made a 17 MB file
+    /// with repeated pictures hundreds of MB (#2923).
+    fn bitmap_id(&mut self, png: &SharedBytes, size_mm: (f64, f64)) -> Option<(u32, u32, u32)> {
+        let key = (size_mm.0.to_bits(), size_mm.1.to_bits());
+        if let Some(found) = self
+            .bitmap_images
+            .iter()
+            .find(|b| b.size_mm == key && b.png == *png)
+        {
+            return Some(found.record);
+        }
         let id = self.next_bitmap;
         let (rec, w, h) = bmp_record(id, png, size_mm)?;
         self.next_bitmap += 1;
         self.bitmaps.push(rec);
+        self.bitmap_images.push(WrittenImage {
+            png: png.clone(),
+            size_mm: key,
+            record: (id, w, h),
+        });
         Some((id, w, h))
     }
 
@@ -5213,9 +5252,10 @@ impl<'a> Writer<'a> {
         // number among the drawing's bitmap objects' images (1, 2, ...,
         // in order of first use: files never hold 0 there), the image id,
         // then 0, 0, -1, 0, 0. The program that wrote the samples shows
-        // no image when the pixel size is left at zero. Every image is
-        // written once per object here, so the number is the image id
-        // (from version 14; before it 0, as written before #1226).
+        // no image when the pixel size is left at zero. Images get their
+        // ids in order of first use and copies share them (#2923), so the
+        // number is the image id (from version 14; before it 0, as
+        // written before #1226).
         let corners = |c: &mut Buf| {
             c.i32(units(local.x0))
                 .i32(units(local.y1))
@@ -5614,6 +5654,19 @@ impl<'a> Writer<'a> {
             );
         if !s.visible && !keeps_hidden {
             return none();
+        }
+        // Bitmap filters keep their source and settings in our member,
+        // with a picture other readers can show without a filter engine.
+        if let Some(picture) = s.drawn_as() {
+            return self.drawn_as(s, vec![picture], 0, None, centre, depth);
+        }
+        if let Some(fx) = &s.raster_fx {
+            if fx.effects.iter().any(|e| e.visible) && fx.png.is_empty() {
+                log::warn!("bitmap effect picture unavailable; .cdr keeps the source without its filter picture");
+            }
+            let mut plain = s.clone();
+            plain.raster_fx = None;
+            return self.drawn_as(s, vec![plain], 0, None, centre, depth);
         }
         // An object with live effects goes out as what they draw, and its
         // drop shadow as a picture of it beneath it (the caller's, or one
@@ -6045,22 +6098,26 @@ impl<'a> Writer<'a> {
             }
             _ => {
                 let coords = match &s.kind {
-                    // Before version 16 no file seen holds a fill rule: a
-                    // curve that fills nonzero (#1919) goes out as the
+                    // A curve that fills nonzero (#1919) goes out as the
                     // outline of the area it covers, which fills the same
-                    // under the even-odd rule those versions draw with.
+                    // under the even-odd rule: before version 16 no file
+                    // seen holds a fill rule, and from 16 the program that
+                    // reads the files still filled such curves even-odd,
+                    // with holes where their parts overlap, although
+                    // their style strings hold `winding` "1" (#2733). The
+                    // winding stays in the style string, so TraceDraw
+                    // reads the curve back as nonzero.
                     ShapeKind::Path { path, .. }
-                        if v.0 < 16
-                            && s.fill_rule == tracedraw_core::shaping::FillRule::NonZero
+                        if s.fill_rule == tracedraw_core::shaping::FillRule::NonZero
                             && !matches!(s.fill, Fill::None) =>
                     {
                         curve_coords(&tracedraw_core::shaping::nonzero_as_even_odd(path))
                     }
                     ShapeKind::Path { path, .. } => curve_coords_typed(path, &s.node_types),
-                    // The outline of a text fitted to a path fills nonzero
-                    // as the text does (#2733): before 16 as the area it
-                    // covers, from 16 with the style string's winding.
-                    ShapeKind::Text { .. } if v.0 < 16 => curve_coords(
+                    // The outline of a text fitted to a path, or bent,
+                    // fills nonzero as the text does (#2733): written as
+                    // the area it covers, in every version.
+                    ShapeKind::Text { .. } => curve_coords(
                         &tracedraw_core::shaping::nonzero_as_even_odd(&s.local_path()),
                     ),
                     _ => curve_coords(&s.local_path()),

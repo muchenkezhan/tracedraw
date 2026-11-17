@@ -98,7 +98,8 @@ never moves the pages before it
   per spread; formats of one page write a file per spread
   (`export::tests::facing_pages_export_spreads_or_pages_with_the_spine_crossing`).
 - Printing prints pages as before, each with what reaches over the
-  spine onto it; not for the selection alone, nor with Fit to page.
+  spine onto it, with Fit to page too (#2678); not for the selection
+  alone.
   Booklet and other impositions work on these pages.
 
 ## `.cdr` files
@@ -142,8 +143,9 @@ single pages, each object where it shows on its page.
 
 ## Not done
 
-- A table of contents and an advanced booklet window asked for in
-  #1660 are separate features.
+- An advanced booklet window asked for in #1660 is a separate
+  feature. The table of contents asked for there is Text > Table of
+  Contents (see `table-of-contents.md`).
 - The Page Sorter shows pages one by one, not in spreads.
 
 ## Formula

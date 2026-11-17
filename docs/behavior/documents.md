@@ -30,6 +30,8 @@ rulers:
   never holds the window; a missing file shows neither. A narrower
   window and a phone keep the list of name over folder
   (`ui::welcome::tests::the_recent_documents_are_a_table_with_size_and_date`).
+  The table and its scroll bar stop 24 points short of the window's right
+  edge, as far as the New and Open buttons stand from its left (#2867).
 - The Welcome Screen tab has a close button on hover (a middle click
   also closes it): the tab shrinks to its house alone (a 26 px square,
   the title as its tip) and the active drawing shows. With no drawing
@@ -42,6 +44,13 @@ rulers:
   document name when it has never been saved, followed by `*` while it has
   unsaved changes. A close button shows on the hovered tab; a middle click
   also closes.
+- A drawing's tab dragged along the strip moves the drawing among the
+  tabs, as a page tab does: while it is held the other tabs slide aside
+  to show where it will land, an outline marks that place and the tab
+  follows the pointer; let go, the drawing takes that place and the same
+  drawing stays active. A plain click still switches (#2903,
+  `ui::tabs::tests::a_drawing_tab_dragged_along_the_strip_moves_the_drawing`,
+  `ui::tabs::tests::move_document_keeps_the_active_window`).
 - The New tab after the last one (a grey plus on a 26 px square) runs
   File > New.
 - More tabs than the strip is wide: the strip slides as an overflowing
