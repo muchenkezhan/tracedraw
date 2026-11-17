@@ -6000,6 +6000,9 @@ impl App {
         }
         if only.is_some() {
             self.status = crate::i18n::tr("docker.range_no_current_page");
+        }
+    }
+
     /// Commands run straight on the engine as one undo step, kept by a
     /// macro being recorded too, as [`Self::run`] keeps its command.
     pub(crate) fn note_recorded(&mut self, cmds: &[Command]) {
