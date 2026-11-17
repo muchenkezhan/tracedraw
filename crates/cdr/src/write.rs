@@ -1714,6 +1714,12 @@ fn fountain_type(kind: FountainKind) -> u8 {
     }
 }
 
+/// [`fild`] for the reader's tests: a fill record of version `v`.
+#[cfg(test)]
+pub(crate) fn fild_of_version(v: u16, id: u32, fill: &Fill) -> Vec<u8> {
+    fild(Ver(v), id, fill)
+}
+
 /// `fild`: a fill record. See `docs/cdr-format.md` for both layouts.
 fn fild(v: Ver, id: u32, fill: &Fill) -> Vec<u8> {
     let fill = match fill {
@@ -6104,11 +6110,19 @@ impl<'a> Writer<'a> {
                     // their style strings hold `winding` "1" (#2733). The
                     // winding stays in the style string, so TraceDraw
                     // reads the curve back as nonzero.
+                    // A curve the merge leaves as it is (no contours
+                    // overlapping one turning the same way) keeps its
+                    // chosen node types, as any other curve.
                     ShapeKind::Path { path, .. }
                         if s.fill_rule == tracedraw_core::shaping::FillRule::NonZero
                             && !matches!(s.fill, Fill::None) =>
                     {
-                        curve_coords(&tracedraw_core::shaping::nonzero_as_even_odd(path))
+                        let merged = tracedraw_core::shaping::nonzero_as_even_odd(path);
+                        if merged == *path {
+                            curve_coords_typed(path, &s.node_types)
+                        } else {
+                            curve_coords(&merged)
+                        }
                     }
                     ShapeKind::Path { path, .. } => curve_coords_typed(path, &s.node_types),
                     // The outline of a text fitted to a path, or bent,
