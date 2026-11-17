@@ -48,6 +48,18 @@ pub(crate) const HISTORY_LEN: usize = 10;
 /// version being built.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.48.0",
+        date: "2026-11-16",
+        title: "welcome.news.v0_48_0_title",
+        body: "welcome.news.v0_48_0_body",
+    },
+    Release {
+        version: "0.47.0",
+        date: "2026-11-16",
+        title: "welcome.news.v0_47_0_title",
+        body: "welcome.news.v0_47_0_body",
+    },
+    Release {
         version: "0.46.0",
         date: "2026-11-14",
         title: "welcome.news.v0_46_0_title",
@@ -94,18 +106,6 @@ pub(crate) const RELEASES: &[Release] = &[
         date: "2026-11-08",
         title: "welcome.news.v0_43_title",
         body: "welcome.news.v0_43_body",
-    },
-    Release {
-        version: "0.42.1",
-        date: "2026-11-08",
-        title: "welcome.news.v0_42_1_title",
-        body: "welcome.news.v0_42_1_body",
-    },
-    Release {
-        version: "0.42.0",
-        date: "2026-11-08",
-        title: "welcome.news.v0_42_title",
-        body: "welcome.news.v0_42_body",
     },
 ];
 
@@ -365,12 +365,22 @@ fn get_started(app: &mut App, ui: &mut Ui) {
                     });
             },
         );
+        ui.add_space(WELCOME_SIDE_MARGIN);
+        ui.vertical(|ui| {
+            ui.set_width(260.0);
+            start_buttons(app, ui);
+        });
         // A browser keeps no recent documents.
         if crate::files::WEB {
             return;
         }
         ui.vertical(|ui| {
             ui.set_width(ui.available_width());
+        ui.add_space(40.0);
+        // As far from the window's right edge as the buttons are from its
+        // left, so the table and its scroll bar do not touch it (#2867).
+        ui.vertical(|ui| {
+            ui.set_max_width((ui.available_width() - WELCOME_SIDE_MARGIN).max(0.0));
             recent_documents(app, ui, false);
         });
     });
@@ -539,6 +549,9 @@ pub(crate) fn remove_recent_id(path: &std::path::Path) -> egui::Id {
     egui::Id::new(("welcome_recent_remove", path))
 }
 
+/// The room left of the start buttons and right of the recent documents
+/// on a desktop (#2867).
+const WELCOME_SIDE_MARGIN: f32 = 24.0;
 /// The size of a recent document's row (the narrow list's).
 const RECENT_ROW: egui::Vec2 = egui::vec2(380.0, 64.0);
 /// The recent documents' thumbnail.
@@ -954,6 +967,12 @@ mod tests {
             .expect("the row")
             .rect;
         assert!(row.width() > 600.0, "{row:?}");
+        // #2867: and stop short of the window's right edge, as far from
+        // it as the buttons are from the left.
+        assert!(
+            row.right() <= 1200.0 - WELCOME_SIDE_MARGIN,
+            "the table touches the right edge: {row:?}"
+        );
         // The size and date stand in their columns, right of the name.
         let cols = table_columns(row.left(), row.right());
         assert!(cols[2].0 > cols[1].0 && cols[3].0 > cols[2].0);

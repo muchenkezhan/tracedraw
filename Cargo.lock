@@ -2333,6 +2333,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrixmultiply"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f607c237553f086e7043417a51df26b2eb899d3caff94e6a67592ff992fedc7"
+dependencies = [
+ "autocfg",
+ "rawpointer",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3321,6 +3331,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawpointer"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
+
+[[package]]
 name = "read-fonts"
 version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4266,7 +4282,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tracedraw"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -4288,6 +4304,7 @@ dependencies = [
  "kurbo",
  "log",
  "lopdf",
+ "matrixmultiply",
  "pollster 0.4.0",
  "qrcode",
  "rfd",
@@ -4328,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-cdr"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "encoding_rs",
  "flate2",
@@ -4345,7 +4362,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-cdr-format"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "flate2",
  "log",
@@ -4356,7 +4373,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-cli"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "env_logger",
  "flate2",
@@ -4372,7 +4389,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-core"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4388,7 +4405,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-io"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -4419,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-render"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "log",
  "tiny-skia",
@@ -4428,7 +4445,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-text"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "encoding_rs",
  "fontconfig-parser",
@@ -4445,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-thumbnailer"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "tracedraw-core",
  "tracedraw-render",
@@ -4456,7 +4473,7 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-tracecut"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "serde",
  "tracedraw-core",
@@ -4464,14 +4481,14 @@ dependencies = [
 
 [[package]]
 name = "tracedraw-vba"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "boa_engine",
 ]
 
 [[package]]
 name = "tracedraw-vba-project"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "cfb",
  "chardetng",

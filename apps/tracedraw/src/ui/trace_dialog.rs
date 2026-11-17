@@ -114,10 +114,23 @@ impl TraceState {
     /// of `shape`: only the settings that change the traced curves
     /// count, so ticking Group by color or Delete original image, or
     /// editing a colour, traces nothing again.
-    fn request_key(&self, shape: tracedraw_core::ShapeId, copy_key: u64) -> u64 {
+    /// `enlarge` is [`enlarge_key`]'s.
+    fn request_key(&self, shape: tracedraw_core::ShapeId, copy_key: u64, enlarge: u64) -> u64 {
         settings_key(&self.settings.traced_part())
             ^ copy_key.rotate_left(13)
             ^ shape.raw().rotate_left(29)
+            ^ enlarge.rotate_left(41)
+    }
+}
+
+/// What of "Enlarge small pictures first" changes the trace: whether it
+/// is ticked, and whether the AI model does the enlarging (once it is
+/// downloaded, the preview traces again with it).
+fn enlarge_key(app: &App) -> u64 {
+    if app.settings.tracing.enlarge {
+        1 | (crate::upscale::model_ready() as u64) << 1
+    } else {
+        0
     }
 }
 
@@ -132,6 +145,93 @@ pub const VIEWS: [View; 5] = [
     View::Large,
     View::Overlay,
 ];
+
+/// Above this many screen pixels per pixel of the preview copy, the
+/// result is drawn again at the screen's pixels (#2951).
+const SHARP_FROM: f32 = 1.25;
+/// The most screen pixels a sharp result is drawn with, each way.
+const SHARP_MAX_SIDE: f32 = 2500.0;
+
+/// The part of the result `view` shows of each pane, drawn sharp at the
+/// screen's pixels when the preview is zoomed in past its copy's pixels
+/// (#2951: zoomed in, "After" showed the copy's pixels, not curves): one
+/// entry per pane of [`before_after::layout`], `None` where the picture
+/// is drawn as it is.
+fn sharp_result(
+    ctx: &Context,
+    view: &ViewState,
+    area: Rect,
+    size: Vec2,
+    shown: Option<&crate::trace_preview::Shown>,
+) -> Vec<Option<(egui::TextureId, Rect)>> {
+    let panes = before_after::layout(area, view, size);
+    let mut out = vec![None; panes.len()];
+    let (Some(shown), Some(i)) = (shown, before_after::result_pane(view.view)) else {
+        return out;
+    };
+    // Panning redraws every frame: the copy's pixels until let go.
+    if !view.turns.is_multiple_of(4) || ctx.input(|i| i.pointer.any_down()) {
+        return out;
+    }
+    let Some(&(pane, img)) = panes.get(i) else {
+        return out;
+    };
+    let ppp = ctx.pixels_per_point();
+    let k = img.width() / size.x.max(1.0);
+    if k * ppp <= SHARP_FROM {
+        return out;
+    }
+    let visible = img.intersect(pane);
+    if visible.width() < 1.0 || visible.height() < 1.0 {
+        return out;
+    }
+    let px = visible.size() * ppp;
+    // Very large panes come out a little soft rather than slow.
+    let fit = (SHARP_MAX_SIDE / px.x.max(px.y)).min(1.0);
+    let (w, h) = (
+        (px.x * fit).round().max(1.0) as u32,
+        (px.y * fit).round().max(1.0) as u32,
+    );
+    let trace_w = shown.trace_size.0.max(1) as f32;
+    let scale = size.x / trace_w * k * ppp * fit;
+    let origin = (visible.min - img.min) * ppp * fit;
+    let wire = view.view == View::Overlay;
+    let key = settings_key(&(
+        shown.key,
+        shown.look,
+        shown.done,
+        wire,
+        (w, h),
+        scale.to_bits(),
+        (origin.x.round() as i64, origin.y.round() as i64),
+    ));
+    let cache = egui::Id::new("trace_preview_sharp");
+    let kept: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(cache));
+    let tex = match kept {
+        Some((k, t)) if k == key => t,
+        _ => {
+            let pic = crate::trace::render_traced_view(
+                &shown.traced,
+                (w, h),
+                scale,
+                (origin.x, origin.y),
+                (!wire).then_some(shown.stroke_px),
+            );
+            let t = ctx.load_texture(
+                "trace_preview_sharp",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [pic.width() as usize, pic.height() as usize],
+                    pic.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            ctx.data_mut(|d| d.insert_temp(cache, (key, t.clone())));
+            t
+        }
+    };
+    out[i] = Some((tex.id(), visible));
+    out
+}
 
 #[cfg(test)]
 pub use crate::ui::before_after::rects;
@@ -208,6 +308,7 @@ pub fn trace_dialog(app: &mut App, ctx: &Context, st: &mut TraceState, close: &m
     let mut help = false;
     let mut options = false;
     let mut best = false;
+    let mut with_ai = false;
     let dragging = ctx.input(|i| i.pointer.any_down());
     // Best optimization's settings, once found: the detail it chose, as
     // a step of its own the arrows undo. Only while the picture and the
@@ -257,6 +358,18 @@ pub fn trace_dialog(app: &mut App, ctx: &Context, st: &mut TraceState, close: &m
                 if optimizing {
                     ui.spinner();
                 }
+                // The vectorization service, from here too (set up in
+                // Options > AI > Service; until then the button opens
+                // that page).
+                let r = ui
+                    .add_enabled(
+                        selected_bitmap(app).is_some() && !app.ai_vectorize.busy(),
+                        egui::Button::new(tr("dialog.trace_with_ai"))
+                            .min_size(Vec2::new(120.0, 27.0)),
+                    )
+                    .rich_tip(crate::ui::tips::keyed("dialog.trace_with_ai"));
+                mark(ui, "trace_with_ai", r.rect);
+                with_ai = r.clicked();
                 ok = super::dialogs::ok_cancel_at_right(ui, close);
             });
         });
@@ -310,6 +423,20 @@ pub fn trace_dialog(app: &mut App, ctx: &Context, st: &mut TraceState, close: &m
     if help {
         app.open_dialog_help();
     }
+    if with_ai {
+        if app.ai_vectorize_ready() {
+            // The service's curves are placed as they come in.
+            *close = true;
+            app.ai_vectorize();
+        } else {
+            // Options > AI > Service, then back here.
+            app.options_page = crate::ui::options::OptionsPage::AiService;
+            app.dialog_return = Some(Box::new(super::dialogs::Dialog::Trace(st.clone())));
+            app.dialog = super::dialogs::Dialog::Options;
+            *close = true;
+        }
+        return;
+    }
     if options {
         // Options > Global > Bitmap Tracing, then back here.
         app.options_page = crate::ui::options::OptionsPage::BitmapTracing;
@@ -323,13 +450,13 @@ pub fn trace_dialog(app: &mut App, ctx: &Context, st: &mut TraceState, close: &m
         // The whole picture's trace from the preview, when it is in.
         let ready = selected_bitmap(app).and_then(|(shape, _, _)| {
             let copy = copy_of(app, ctx, &Source::Shown, PREVIEW_SIDE)?;
-            let key = st.request_key(shape, copy.key);
+            let key = st.request_key(shape, copy.key, enlarge_key(app));
             app.trace_live
                 .full(key, crate::trace_preview::look_key(&st.settings))
                 .filter(|s| s.shape == shape)
                 .map(|s| (s.shape, s.traced.clone(), s.stroke_px))
         });
-        app.trace_bitmaps_using(&settings, ready);
+        app.trace_bitmaps_in_background(&settings, ready);
         app.last_trace = Some((st.preset, settings));
     }
 }
@@ -360,7 +487,7 @@ fn preview_column(app: &mut App, ui: &mut Ui, st: &mut TraceState, dragging: boo
     };
     // The trace of these settings, asked for once; results come in as
     // they are ready.
-    let key = st.request_key(shape, copy.key);
+    let key = st.request_key(shape, copy.key, enlarge_key(app));
     if let Some(image) = app.trace_live.image(shape, &png) {
         app.trace_live.want(
             &ctx,
@@ -371,6 +498,7 @@ fn preview_column(app: &mut App, ui: &mut Ui, st: &mut TraceState, dragging: boo
                 settings: st.settings.clone(),
                 image,
                 copy_scale: copy.scale,
+                enlarge: app.settings.tracing.enlarge,
             },
             dragging,
         );
@@ -382,11 +510,13 @@ fn preview_column(app: &mut App, ui: &mut Ui, st: &mut TraceState, dragging: boo
         .as_ref()
         .filter(|s| s.shape == shape)
         .cloned();
+    let size = Vec2::new(copy.img.width() as f32, copy.img.height() as f32);
     let pics = Pictures {
         before: Some(copy.tex.id()),
         after: shown.as_ref().map(|s| s.after.id()),
         overlay: shown.as_ref().map(|s| s.wire.id()),
-        size: Vec2::new(copy.img.width() as f32, copy.img.height() as f32),
+        size,
+        sharp: sharp_result(&ctx, &st.view, area, size, shown.as_ref()),
     };
     let out = before_after::view(ui, id, &mut st.view, area, &pics, st.picking);
     if let Some(at) = out.picked {
@@ -421,6 +551,16 @@ fn preview_column(app: &mut App, ui: &mut Ui, st: &mut TraceState, dragging: boo
             // Where the quick look is all the preview shows (the browser,
             // a large picture), say so: the trace placed on OK is the
             // whole picture's, finer than the preview.
+            if let (false, Some(p)) = (s.done, crate::upscale::enlarging()) {
+                ui.label(
+                    egui::RichText::new(trf(
+                        "dialog.trace_enlarging",
+                        &[("pct", &format!("{:.0}", p * 100.0))],
+                    ))
+                    .color(Tokens::text_dim()),
+                );
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
             if s.done && s.stage == crate::trace_preview::Stage::Quick {
                 let red = ui.visuals().error_fg_color;
                 ui.label(egui::RichText::new(tr("dialog.trace_reduced_preview")).color(red))
@@ -490,6 +630,63 @@ fn preset_name(p: Preset) -> String {
         .to_string()
 }
 
+/// "Enlarge small pictures first", with the AI model's state: ready,
+/// a button to download it (with its progress, or why it failed), or,
+/// in a browser, the sharpened enlargement only.
+fn enlarge_section(app: &mut App, ui: &mut Ui) {
+    let r = ui
+        .checkbox(
+            &mut app.settings.tracing.enlarge,
+            tr("dialog.trace_enlarge"),
+        )
+        .rich_tip(crate::ui::tips::keyed("dialog.trace_enlarge"));
+    mark(ui, "enlarge", r.rect);
+    if !app.settings.tracing.enlarge || !crate::upscale::ai_offered() {
+        return;
+    }
+    let dim = |ui: &mut Ui, text: String| {
+        ui.label(
+            egui::RichText::new(text)
+                .color(Tokens::text_dim())
+                .size(11.0),
+        );
+    };
+    ui.indent("enlarge_model", |ui| {
+        if crate::upscale::model_ready() {
+            dim(ui, tr("dialog.trace_enlarge_ai_ready"));
+        } else if let Some(p) = crate::upscale::downloading() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                dim(
+                    ui,
+                    trf(
+                        "dialog.trace_enlarge_downloading",
+                        &[("pct", &format!("{:.0}", p * 100.0))],
+                    ),
+                );
+            });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        } else {
+            dim(ui, tr("dialog.trace_enlarge_sharpen"));
+            let r = ui
+                .button(tr("dialog.trace_enlarge_download"))
+                .rich_tip(crate::ui::tips::keyed("dialog.trace_enlarge_download"));
+            mark(ui, "enlarge_download", r.rect);
+            if r.clicked() {
+                crate::upscale::start_download();
+            }
+            if let Some(e) = crate::upscale::download_failed() {
+                ui.label(
+                    egui::RichText::new(trf("dialog.trace_enlarge_failed", &[("e", &e)]))
+                        .color(ui.visuals().error_fg_color)
+                        .size(11.0),
+                );
+            }
+        }
+    });
+}
+
 fn settings_tab(app: &mut App, ui: &mut Ui, st: &mut TraceState) {
     let prefs = app.settings.tracing.clone();
     let w = 180.0;
@@ -536,6 +733,7 @@ fn settings_tab(app: &mut App, ui: &mut Ui, st: &mut TraceState) {
             );
             ui.end_row();
         });
+    enlarge_section(app, ui);
     before_after::rule(ui);
     // The Optimized image type chooses the detail for each picture: the
     // slider is greyed (Best optimization puts the detail it finds in).
@@ -820,6 +1018,123 @@ fn colors_tab(app: &mut App, ui: &mut Ui, st: &mut TraceState) {
 mod tests {
     use super::*;
 
+    /// A black triangle on a 10 x 10 trace: its slanted edge crosses
+    /// every row.
+    fn triangle() -> Vec<crate::trace::Traced> {
+        use tracedraw_core::geometry::{BezPath, Point};
+        let mut path = BezPath::new();
+        path.move_to(Point::new(0.0, 0.0));
+        path.line_to(Point::new(10.0, 10.0));
+        path.line_to(Point::new(0.0, 10.0));
+        path.close_path();
+        vec![crate::trace::Traced {
+            path,
+            color: tracedraw_core::Color::rgb8(0, 0, 0),
+            closed: true,
+            blend: None,
+        }]
+    }
+
+    /// Pixels neither empty nor fully covered in a row: the soft edge.
+    fn soft(img: &image::RgbaImage, y: u32) -> usize {
+        (0..img.width())
+            .filter(|&x| {
+                let a = img.get_pixel(x, y)[3];
+                a > 16 && a < 239
+            })
+            .count()
+    }
+
+    /// #2951: zoomed in, the result is drawn again at the screen's
+    /// pixels, so a curve's edge stays one pixel soft; the copy's
+    /// picture blown up 8 times would be about 8 pixels soft. A part of
+    /// it drawn from an origin is the same part of the whole.
+    #[test]
+    fn the_zoomed_result_is_drawn_sharp_at_the_screens_pixels() {
+        let traced = triangle();
+        let whole = crate::trace::render_traced_view(&traced, (80, 80), 8.0, (0.0, 0.0), Some(1.0));
+        for y in [5, 20, 41, 63, 77] {
+            assert!(soft(&whole, y) <= 2, "row {y}: {}", soft(&whole, y));
+        }
+        let part =
+            crate::trace::render_traced_view(&traced, (30, 30), 8.0, (24.0, 40.0), Some(1.0));
+        for (x, y) in [(0, 0), (10, 5), (29, 29), (20, 2)] {
+            assert_eq!(
+                part.get_pixel(x, y),
+                whole.get_pixel(x + 24, y + 40),
+                "{x},{y}"
+            );
+        }
+        let wire = crate::trace::render_traced_view(&traced, (80, 80), 8.0, (0.0, 0.0), None);
+        assert!(
+            wire.get_pixel(40, 40)[3] > 0,
+            "the wire runs along the edge"
+        );
+        assert_eq!(wire.get_pixel(10, 60)[3], 0, "inside is not filled");
+    }
+
+    /// The sharp result comes only once zoomed in past the copy's
+    /// pixels, in the pane that shows the result, over the part of the
+    /// picture that pane shows; at the fit zoom the copy is drawn.
+    #[test]
+    fn the_sharp_result_shows_only_when_zoomed_in() {
+        let ctx = Context::default();
+        let blank = egui::ColorImage::new([4, 4], vec![egui::Color32::TRANSPARENT; 16]);
+        let tex = ctx.load_texture("t", blank, egui::TextureOptions::LINEAR);
+        let shown = crate::trace_preview::Shown {
+            key: 1,
+            look: 2,
+            shape: tracedraw_core::ShapeId(1),
+            stage: crate::trace_preview::Stage::Full,
+            raw: std::sync::Arc::new(triangle()),
+            traced: std::sync::Arc::new(triangle()),
+            colors: std::sync::Arc::new(Vec::new()),
+            stroke_px: 1.0,
+            trace_size: (10, 10),
+            stats: Default::default(),
+            after: tex.clone(),
+            wire: tex,
+            done: true,
+        };
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        let size = Vec2::new(100.0, 100.0);
+        let mut view = ViewState {
+            view: View::After,
+            ..Default::default()
+        };
+        // Fitting, 4 points per copy pixel: already past it.
+        let fit = sharp_result(&ctx, &view, area, size, Some(&shown));
+        assert!(fit[0].is_some());
+        view.zoom = Some(1.0);
+        let one = sharp_result(&ctx, &view, area, size, Some(&shown));
+        assert!(
+            one[0].is_none(),
+            "at the copy's pixels it is drawn as it is"
+        );
+        view.zoom = Some(20.0);
+        let near = sharp_result(&ctx, &view, area, size, Some(&shown));
+        let (_, at) = near[0].expect("sharp when zoomed in");
+        let (pane, img) = before_after::layout(area, &view, size)[0];
+        assert_eq!(at, img.intersect(pane));
+        assert!(at.width() < img.width(), "only the part shown");
+        view.view = View::SideBySide;
+        let two = sharp_result(&ctx, &view, area, size, Some(&shown));
+        assert!(
+            two[0].is_none() && two[1].is_some(),
+            "only the result's pane"
+        );
+        view.view = View::Before;
+        assert!(sharp_result(&ctx, &view, area, size, Some(&shown))
+            .iter()
+            .all(Option::is_none));
+        view.view = View::After;
+        view.turns = 1;
+        assert!(sharp_result(&ctx, &view, area, size, Some(&shown))[0].is_none());
+        assert!(sharp_result(&ctx, &ViewState::default(), area, size, None)
+            .iter()
+            .all(Option::is_none));
+    }
+
     /// Only the settings that change the traced curves change the
     /// request's key: grouping, deleting the original, a colour edit and
     /// the background of a trace that removes none trace nothing again.
@@ -827,18 +1142,18 @@ mod tests {
     fn only_settings_that_change_the_trace_change_its_key() {
         let st = TraceState::with_settings(Preset::Logo, Preset::Logo.settings());
         let id = tracedraw_core::ShapeId(3);
-        let key = st.request_key(id, 11);
+        let key = st.request_key(id, 11, 0);
         let mut same = st.clone();
         same.settings.delete_original = !same.settings.delete_original;
         same.settings.group_by_color = !same.settings.group_by_color;
         same.settings.recolored = vec![([0, 0, 0], [10, 20, 30])];
         same.settings.remove = Remove::None;
-        let key_none = same.request_key(id, 11);
+        let key_none = same.request_key(id, 11, 0);
         same.settings.background = Some([1, 2, 3]);
-        assert_eq!(same.request_key(id, 11), key_none);
+        assert_eq!(same.request_key(id, 11, 0), key_none);
         same.settings.remove = st.settings.remove;
         same.settings.background = st.settings.background;
-        assert_eq!(same.request_key(id, 11), key);
+        assert_eq!(same.request_key(id, 11, 0), key);
         for change in [
             |s: &mut Settings| s.detail += 5.0,
             |s: &mut Settings| s.colors += 1,
@@ -847,9 +1162,13 @@ mod tests {
         ] {
             let mut other = st.clone();
             change(&mut other.settings);
-            assert_ne!(other.request_key(id, 11), key);
+            assert_ne!(other.request_key(id, 11, 0), key);
         }
-        assert_ne!(st.request_key(id, 12), key, "another copy");
-        assert_ne!(st.request_key(tracedraw_core::ShapeId(4), 11), key);
+        assert_ne!(st.request_key(id, 12, 0), key, "another copy");
+        assert_ne!(st.request_key(tracedraw_core::ShapeId(4), 11, 0), key);
+        // "Enlarge small pictures first" traces again (and again once the
+        // AI model is in).
+        assert_ne!(st.request_key(id, 11, 1), key);
+        assert_ne!(st.request_key(id, 11, 3), st.request_key(id, 11, 1));
     }
 }

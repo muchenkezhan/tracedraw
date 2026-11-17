@@ -28,15 +28,57 @@ pub struct ViewTransform {
     /// Pixel position of the page origin (bottom-left corner) inside the target.
     pub origin_x: f64,
     pub origin_y: f64,
+    /// The vertical pixels per millimetre as a share of `zoom`: 1 but for
+    /// an exported picture, whose rounded width and height each take the
+    /// page edge to edge (#2866), a hair apart.
+    pub stretch_y: f64,
 }
 
 impl ViewTransform {
+    /// A page of `width` by `height` mm at `zoom` pixels per mm as a
+    /// picture of whole pixels: the page's size rounded up, as the
+    /// export dialog counts it, and the zoom made a hair larger each way
+    /// so the page fills every one of them. At the zoom asked, the page left a
+    /// row and a column partly empty above it and to its right, a light
+    /// line on the edge of an exported picture (#2866). Returns the
+    /// picture's width, height and the view.
+    pub fn whole_page(width: f64, height: f64, zoom: f64) -> (u32, u32, ViewTransform) {
+        let px = |mm: f64| {
+            let v = (mm * zoom).ceil();
+            // A size that is not a number asks for a picture too large
+            // to make, as before (no picture rather than a wrong one).
+            if v.is_nan() {
+                u32::MAX
+            } else {
+                v.clamp(1.0, f64::from(u32::MAX)) as u32
+            }
+        };
+        let (w, h) = (px(width), px(height));
+        // Each way its own: one zoom for both took the larger of the two
+        // and cut up to a pixel or so off the other side (the top of an
+        // A4 page), more on a long strip.
+        let ok = |z: f64| z.is_finite() && z > 0.0;
+        let (zx, zy) = (f64::from(w) / width, f64::from(h) / height);
+        let zoom = if ok(zx) { zx } else { zoom };
+        let stretch_y = if ok(zy) && ok(zoom) { zy / zoom } else { 1.0 };
+        (
+            w,
+            h,
+            ViewTransform {
+                zoom,
+                origin_x: 0.0,
+                origin_y: f64::from(h),
+                stretch_y,
+            },
+        )
+    }
+
     pub fn affine(&self) -> Affine {
         Affine::new([
             self.zoom,
             0.0,
             0.0,
-            -self.zoom,
+            -self.zoom * self.stretch_y,
             self.origin_x,
             self.origin_y,
         ])
@@ -101,6 +143,7 @@ impl Default for RenderOptions {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 0.0,
+                stretch_y: 1.0,
             },
             preview: None,
             wireframe: false,
@@ -1401,10 +1444,21 @@ impl Renderer<'_> {
                         m[4] as f32,
                         m[5] as f32,
                     );
+                    // A black and white (1-bit) picture blown up keeps
+                    // its pixels' hard edges, black or white, as it
+                    // prints; smoothed, its dots grew grey rims (#2922).
+                    let quality = if level == 0
+                        && png_is_black_white(png)
+                        && m[0].hypot(m[1]).min(m[2].hypot(m[3])) > 1.0
+                    {
+                        tiny_skia::FilterQuality::Nearest
+                    } else {
+                        tiny_skia::FilterQuality::Bilinear
+                    };
                     paint.shader = tiny_skia::Pattern::new(
                         Pixmap::as_ref(&img),
                         SpreadMode::Pad,
-                        tiny_skia::FilterQuality::Bilinear,
+                        quality,
                         1.0,
                         t,
                     );
@@ -5057,6 +5111,7 @@ pub fn render_fill_image(fill: &Fill, bounds: Rect, dpi: f64) -> Option<Pixmap> 
         zoom,
         origin_x: -bounds.x0 * zoom,
         origin_y: bounds.y1 * zoom,
+        stretch_y: 1.0,
     };
     let screen = view.affine();
     let page_path = tracedraw_core::geometry::rect_path(bounds, 0.0);
@@ -5099,6 +5154,7 @@ pub fn render_fill_image_in(fill: &Fill, path: &BezPath, dpi: f64) -> Option<Pix
         zoom,
         origin_x: -bounds.x0 * zoom,
         origin_y: bounds.y1 * zoom,
+        stretch_y: 1.0,
     }
     .affine();
     let rect = to_sk_path(&(screen * tracedraw_core::geometry::rect_path(bounds, 0.0)))?;
@@ -5213,6 +5269,7 @@ pub fn render_area_image(doc: &Document, page: PageId, area: Rect, dpi: f64) -> 
         zoom,
         origin_x: -area.x0 * zoom,
         origin_y: h as f64 + area.y0 * zoom,
+        stretch_y: 1.0,
     };
     let objects = render_page(
         doc,
@@ -5292,7 +5349,27 @@ pub fn render_page_image_with(
         zoom,
         origin_x: 0.0,
         origin_y: h as f64,
+        stretch_y: 1.0,
     };
+    page_image_in(doc, page, (w, h, view), opts)
+}
+
+/// [`render_page_image`] for a picture file (#2866): the page fills
+/// every pixel of it (see [`ViewTransform::whole_page`]), with no light
+/// row above it or column to its right.
+pub fn render_page_export_image(doc: &Document, page: PageId, dpi: f64) -> Option<Pixmap> {
+    let p = doc.page(page).ok()?;
+    let fit = ViewTransform::whole_page(p.size.width, p.size.height, dpi / 25.4);
+    page_image_in(doc, page, fit, &RenderOptions::default())
+}
+
+/// `page` drawn `w` by `h` pixels through `view`, on white.
+fn page_image_in(
+    doc: &Document,
+    page: PageId,
+    (w, h, view): (u32, u32, ViewTransform),
+    opts: &RenderOptions,
+) -> Option<Pixmap> {
     let mut objects = render_page(
         doc,
         page,
@@ -5323,8 +5400,60 @@ pub fn render_page_image_with(
     Some(out)
 }
 
+/// Whether `png` is a black and white (1-bit) picture: a grey PNG of one
+/// bit per pixel, or one marked "TraceDraw color mode" = "BlackWhite" in a
+/// `tEXt` chunk before its pixels (#2922).
+fn png_is_black_white(png: &[u8]) -> bool {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if png.get(..8) != Some(SIGNATURE) || png.get(12..16) != Some(b"IHDR".as_slice()) {
+        return false;
+    }
+    if png.get(24) == Some(&1) && png.get(25) == Some(&0) {
+        return true;
+    }
+    let mut at = 8usize;
+    while let Some(len) = png
+        .get(at..at + 4)
+        .and_then(|b| b.try_into().ok())
+        .map(|b: [u8; 4]| u32::from_be_bytes(b) as usize)
+    {
+        let (Some(ty), Some(data)) = (png.get(at + 4..at + 8), png.get(at + 8..at + 8 + len))
+        else {
+            return false;
+        };
+        if ty == b"IDAT" {
+            return false;
+        }
+        if ty == b"tEXt" && data == b"TraceDraw color mode\0BlackWhite" {
+            return true;
+        }
+        at += 12 + len;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn one_bit_pictures_are_known_by_their_png() {
+        // #2922: blown up, they keep hard edges.
+        let mut one_bit = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        one_bit.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 4, 1, 0, 0, 0, 0]);
+        assert!(super::png_is_black_white(&one_bit));
+        let mut gray8 = one_bit.clone();
+        gray8[24] = 8;
+        assert!(!super::png_is_black_white(&gray8));
+        let mut marked = gray8.clone();
+        marked.extend_from_slice(&[0, 0, 0, 0]); // the IHDR CRC
+        let text = b"TraceDraw color mode\0BlackWhite";
+        marked.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        marked.extend_from_slice(b"tEXt");
+        marked.extend_from_slice(text);
+        marked.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(super::png_is_black_white(&marked));
+        assert!(!super::png_is_black_white(b"not a png"));
+    }
     /// A text and the warped outline of one fill with the nonzero rule,
     /// so letters an envelope pushes together stay filled where they
     /// overlap (#647); other curves fill even-odd.
@@ -5523,6 +5652,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -5664,6 +5794,7 @@ mod tests {
                 zoom: 3.0,
                 origin_x: 10.0,
                 origin_y: 170.0,
+                stretch_y: 1.0,
             },
             anti_alias: true,
             ..RenderOptions::default()
@@ -5860,6 +5991,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -5891,6 +6023,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -5937,6 +6070,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -5980,6 +6114,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -6029,6 +6164,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -6077,6 +6213,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -6147,6 +6284,7 @@ mod tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -7150,6 +7288,7 @@ mod tests {
                     zoom,
                     origin_x: 0.0,
                     origin_y: h as f64,
+                    stretch_y: 1.0,
                 },
                 draft: true,
                 ..Default::default()
@@ -7205,6 +7344,7 @@ mod tests {
                 zoom: 7.0,
                 origin_x: 20.0,
                 origin_y: 1280.0,
+                stretch_y: 1.0,
             },
             ..Default::default()
         };
@@ -7268,6 +7408,7 @@ mod tests {
                 zoom: 100.0,
                 origin_x: 0.0,
                 origin_y: 1080.0,
+                stretch_y: 1.0,
             },
             draft: true,
             ..Default::default()
@@ -7304,6 +7445,7 @@ mod tests {
                     zoom: 100.0,
                     origin_x: 0.0,
                     origin_y: 1080.0,
+                    stretch_y: 1.0,
                 },
                 draft: true,
                 ..Default::default()
@@ -7996,6 +8138,7 @@ mod tests {
                 zoom: 6.0,
                 origin_x: -100.0,
                 origin_y: 1500.0,
+                stretch_y: 1.0,
             },
             draft,
             ..Default::default()
@@ -8338,6 +8481,7 @@ mod tests {
                 zoom,
                 origin_x: ox,
                 origin_y: 64.0,
+                stretch_y: 1.0,
             },
             ..Default::default()
         };
@@ -8408,6 +8552,7 @@ mod tests {
                     zoom: 1.0,
                     origin_x: 0.0,
                     origin_y: 100.0,
+                    stretch_y: 1.0,
                 },
                 anti_alias,
                 ..RenderOptions::default()
@@ -8622,6 +8767,7 @@ mod tests {
                 zoom: 3.0,
                 origin_x: -15.0,
                 origin_y: 200.0,
+                stretch_y: 1.0,
             },
             ..Default::default()
         };
@@ -9693,6 +9839,7 @@ mod culling_tests {
                 zoom: 40.0,
                 origin_x: 0.0,
                 origin_y: 100.0 * 40.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -9726,6 +9873,7 @@ mod culling_tests {
                 zoom: 2.0,
                 origin_x: 0.0,
                 origin_y: 200.0,
+                stretch_y: 1.0,
             },
             ..opts.clone()
         };
@@ -9786,6 +9934,7 @@ mod culling_tests {
                 zoom: 2.0,
                 origin_x: 0.0,
                 origin_y: 200.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -9853,6 +10002,7 @@ mod culling_tests {
                 zoom: 6.0,
                 origin_x: 0.0,
                 origin_y: 600.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -9879,6 +10029,7 @@ mod culling_tests {
                 zoom: 4.0,
                 origin_x: -400.0,
                 origin_y: 300.0 + 400.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -9977,6 +10128,7 @@ mod culling_tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 100.0,
+                stretch_y: 1.0,
             },
             focus: Some((vec![tracedraw_core::ShapeId(2)], v)),
             ..RenderOptions::default()
@@ -10040,6 +10192,7 @@ mod band_tests {
                 zoom: 5.0,
                 origin_x: 0.0,
                 origin_y: 600.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -10115,6 +10268,7 @@ mod band_tests {
                 zoom: 5.0,
                 origin_x: 0.0,
                 origin_y: 1000.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -10196,6 +10350,7 @@ mod band_tests {
                 zoom: 5.0,
                 origin_x: 0.0,
                 origin_y: 600.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -10304,6 +10459,7 @@ mod band_tests {
                 zoom: 1.0,
                 origin_x: 0.0,
                 origin_y: 40.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -10355,6 +10511,7 @@ mod band_tests {
                     zoom,
                     origin_x: 0.3,
                     origin_y: 299.6,
+                    stretch_y: 1.0,
                 },
                 anti_alias: true,
                 ..RenderOptions::default()
@@ -10398,6 +10555,7 @@ mod band_tests {
                 zoom: 0.37,
                 origin_x: 0.0,
                 origin_y: 37.0,
+                stretch_y: 1.0,
             },
             anti_alias: true,
             ..RenderOptions::default()
@@ -10445,6 +10603,7 @@ mod band_tests {
                 zoom: 8.0,
                 origin_x: 0.0,
                 origin_y: 800.0,
+                stretch_y: 1.0,
             },
             ..RenderOptions::default()
         };
@@ -10501,6 +10660,7 @@ mod band_tests {
                 zoom: 8.0,
                 origin_x: 0.0,
                 origin_y: 800.0,
+                stretch_y: 1.0,
             },
             anti_alias: true,
             ..RenderOptions::default()
@@ -10537,6 +10697,7 @@ mod band_tests {
                 zoom: 3.0,
                 origin_x: 20.0,
                 origin_y: 650.0,
+                stretch_y: 1.0,
             },
             anti_alias: true,
             ..RenderOptions::default()
@@ -10609,6 +10770,7 @@ mod band_tests {
                 zoom: 3.0,
                 origin_x: 20.0,
                 origin_y: 650.0,
+                stretch_y: 1.0,
             },
             anti_alias: true,
             ..RenderOptions::default()
@@ -10647,6 +10809,7 @@ mod band_tests {
                 zoom: 3.0,
                 origin_x: 20.0,
                 origin_y: 650.0,
+                stretch_y: 1.0,
             },
             anti_alias: true,
             ..RenderOptions::default()
@@ -10707,6 +10870,7 @@ mod band_tests {
                     zoom,
                     origin_x: 680.0 + 100.0 * zoom,
                     origin_y: 384.0 + 100.0 * zoom,
+                    stretch_y: 1.0,
                 },
                 anti_alias: true,
                 draft: true,
@@ -10742,6 +10906,7 @@ mod band_tests {
                     zoom,
                     origin_x: 0.0,
                     origin_y: h as f64,
+                    stretch_y: 1.0,
                 },
                 anti_alias: true,
                 ..RenderOptions::default()
@@ -10776,6 +10941,7 @@ mod band_tests {
                         zoom,
                         origin_x: 100.0,
                         origin_y: h as f64 - 50.0,
+                        stretch_y: 1.0,
                     },
                     anti_alias: true,
                     draft: true,
@@ -10848,6 +11014,7 @@ mod inner_shadow_view_tests {
                 zoom,
                 origin_x: -8.0 * zoom - dx,
                 origin_y: 900.0 + 8.0 * zoom,
+                stretch_y: 1.0,
             },
             draft: true,
             ..Default::default()
@@ -10922,6 +11089,7 @@ mod inner_shadow_view_tests {
                 zoom,
                 origin_x: 600.0 - 10.0 * zoom,
                 origin_y: 25.0 + 50.0 * zoom,
+                stretch_y: 1.0,
             },
             draft: true,
             ..Default::default()
@@ -10979,6 +11147,87 @@ mod inner_shadow_view_tests {
                 }
             }
             assert!(worst <= 1, "zoom {zoom}: {worst}");
+        }
+    }
+}
+
+/// A picture of a page whose size is not whole pixels at the resolution
+/// asked (#2866): what covers the page covers every pixel, with no light
+/// row above it or column to its right.
+#[cfg(test)]
+mod whole_page_tests {
+    use super::*;
+    use tracedraw_core::{Color, Fill};
+
+    #[test]
+    fn an_exported_page_has_no_light_edge() {
+        for (w, h, dpi) in [(30.1, 20.3, 96.0), (95.37, 41.82, 300.0), (10.0, 10.0, 72.0)] {
+            let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(w, h));
+            let mut s = Shape::new(
+                tracedraw_core::ShapeId(1),
+                ShapeKind::Rect {
+                    rect: Rect::new(0.0, 0.0, w, h),
+                    radius: 0.0,
+                    corners: None,
+                },
+            );
+            s.fill = Fill::Solid(Color::BLACK);
+            s.stroke = None;
+            let layer = doc.pages[0].layers[0].id;
+            doc.layer_mut(layer).expect("layer").shapes.push(s);
+            let page = doc.pages[0].id;
+            let pm = render_page_export_image(&doc, page, dpi).expect("render");
+            let zoom = dpi / 25.4;
+            assert_eq!(pm.width(), (w * zoom).ceil() as u32);
+            assert_eq!(pm.height(), (h * zoom).ceil() as u32);
+            let lightest = pm.pixels().iter().map(|p| p.red()).max().unwrap_or(0);
+            assert!(lightest < 8, "{w} x {h} mm at {dpi} dpi: a pixel at {lightest}");
+        }
+    }
+
+    /// The page's edges are the picture's edges on all four sides: one
+    /// zoom for both ways, made large enough for the width, cut a pixel
+    /// off the top of an A4 page and many off a long strip (#2866).
+    #[test]
+    fn an_exported_page_keeps_its_top_and_right_edges() {
+        for (w, h, dpi) in [
+            (210.0, 297.0, 72.0),
+            (210.0, 297.0, 300.0),
+            (10.0, 300.0, 300.0),
+            (300.0, 10.0, 300.0),
+        ] {
+            let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(w, h));
+            let zoom = dpi / 25.4;
+            // A band one pixel deep along the top and the right edge.
+            let px = 1.0 / zoom;
+            let layer = doc.pages[0].layers[0].id;
+            for (k, rect) in [Rect::new(0.0, h - px, w, h), Rect::new(w - px, 0.0, w, h)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut s = Shape::new(
+                    tracedraw_core::ShapeId(k as u64 + 1),
+                    ShapeKind::Rect {
+                        rect,
+                        radius: 0.0,
+                        corners: None,
+                    },
+                );
+                s.fill = Fill::Solid(Color::BLACK);
+                s.stroke = None;
+                doc.layer_mut(layer).expect("layer").shapes.push(s);
+            }
+            let page = doc.pages[0].id;
+            let pm = render_page_export_image(&doc, page, dpi).expect("render");
+            let (pw, ph) = (pm.width() as usize, pm.height() as usize);
+            let px = |x: usize, y: usize| pm.pixels()[y * pw + x].red();
+            let top = (0..pw).map(|x| px(x, 0)).max().unwrap_or(0);
+            let right = (0..ph).map(|y| px(pw - 1, y)).max().unwrap_or(0);
+            assert!(top < 64, "{w} x {h} mm at {dpi} dpi: top row at {top}");
+            assert!(
+                right < 64,
+                "{w} x {h} mm at {dpi} dpi: right column at {right}"
+            );
         }
     }
 }

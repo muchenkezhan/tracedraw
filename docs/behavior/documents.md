@@ -50,6 +50,8 @@ rulers:
   built-in previews from the user's files and keeps its existing creation
   and browse actions. The user's template list refreshes on page entry
   and when the application regains focus.
+  The table and its scroll bar stop 24 points short of the window's right
+  edge, as far as the New and Open buttons stand from its left (#2867).
 - The Welcome Screen tab has a close button on hover (a middle click
   also closes it): the tab shrinks to its house alone (a 26 px square,
   the title as its tip) and the active drawing shows. With no drawing
