@@ -599,6 +599,7 @@ fn menu_icon(key: &str) -> Option<crate::ui::icons::Action> {
     Some(match key {
         "menu.file.new" => Action::New,
         "menu.file.open" => Action::Open,
+        "menu.file.new_from_template" => Action::Template,
         "menu.file.save" => Action::Save,
         "menu.file.print" => Action::Print,
         "menu.file.import" => Action::Import,
@@ -4097,9 +4098,6 @@ fn bitmaps_menu(app: &mut App, ui: &mut Ui) {
     // Black and white, duotone and paletted open their dialogs; the
     // others convert at once.
     sub(ui, "menu.bitmaps.mode", |ui| {
-        if item(ui, "menu.bitmaps.mode_bw", "", has_bitmap) {
-            app.dialog = Dialog::BitmapBw(Default::default());
-        }
         // Grayscale, RGB and CMYK are the bitmaps' colour mode: the mode
         // of every selected bitmap is ticked (#1254); a grayscale PNG is
         // a grayscale bitmap (#2330), as the status bar names it.
@@ -4119,6 +4117,17 @@ fn bitmaps_menu(app: &mut App, ui: &mut Ui) {
         let all_cmyk = all(crate::bitmap_fx::ColorMode::Cmyk);
         let all_paletted = all(crate::bitmap_fx::ColorMode::Paletted);
         let all_lab = all(crate::bitmap_fx::ColorMode::Lab);
+        // A 1-bit bitmap is ticked Black and White (#2922).
+        let all_bw = all(crate::bitmap_fx::ColorMode::BlackWhite);
+        if mark_item_if(
+            ui,
+            "menu.bitmaps.mode_bw",
+            "",
+            Mark::Check(all_bw),
+            has_bitmap,
+        ) {
+            app.dialog = Dialog::BitmapBw(Default::default());
+        }
         if mark_item_if(
             ui,
             "menu.bitmaps.mode_grayscale",
