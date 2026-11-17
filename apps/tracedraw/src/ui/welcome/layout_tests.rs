@@ -324,6 +324,45 @@ fn workspace_choices_and_language_controls_remain_reachable() {
     }
 }
 
+/// Conflict resolution must not duplicate quick actions or lose the page margins.
+#[test]
+fn welcome_start_actions_appear_once_with_balanced_page_margins() {
+    crate::i18n::with_thread_language("en", || {
+        for width in [1200.0, 1920.0] {
+            let mut driver = Driver::new(egui::vec2(width, 900.0));
+            let recent = std::path::PathBuf::from("welcome-margin-test.tdraw");
+            driver.app.settings.recent_files = vec![recent.clone()];
+            let snapshot = driver.settle();
+            let shell = snapshot.shell.expect("the welcome shell is recorded");
+            for key in [
+                "welcome.new_document",
+                "welcome.new_from_template",
+                "welcome.open_document",
+            ] {
+                let label = tr(key);
+                let controls: Vec<_> = snapshot
+                    .controls
+                    .iter()
+                    .filter(|(name, _)| name == &label)
+                    .collect();
+                assert_eq!(controls.len(), 1, "{width}: {label} appears once");
+                let rect = controls[0].1;
+                assert!(rect.left() >= shell.left() + PAGE_MARGIN);
+                assert!(rect.right() <= shell.right() - PAGE_MARGIN);
+            }
+            let row = driver
+                .ctx
+                .read_response(recent_row_id(&recent))
+                .expect("the recent document row")
+                .rect;
+            assert!(
+                row.right() <= shell.right() - PAGE_MARGIN,
+                "{width}: {row:?}"
+            );
+        }
+    });
+}
+
 /// New Document keeps the existing request path and its dialog preference.
 #[test]
 fn welcome_new_document_opens_the_existing_dialog() {
