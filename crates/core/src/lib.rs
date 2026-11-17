@@ -39,6 +39,7 @@ pub mod picture_inks;
 mod press;
 pub mod procedural;
 pub mod recolor;
+pub mod select_same;
 pub mod shadow;
 pub mod shaping;
 pub mod spreads;
@@ -106,6 +107,10 @@ pub enum Error {
     NotText(ShapeId),
     #[error("a B-spline needs two finite control points or more")]
     BadSpline,
+    #[error("selection size tolerance must be finite and non-negative")]
+    BadSelectionTolerance,
+    #[error("a selection query must run on its own, outside a document edit batch")]
+    SelectionQueryInBatch,
     #[error("symbol {0} not found")]
     SymbolNotFound(usize),
     #[error("symbol {0} cannot hold an instance of itself")]

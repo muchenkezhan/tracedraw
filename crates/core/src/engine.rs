@@ -29,6 +29,8 @@ struct HistoryEntry {
 #[derive(Debug)]
 pub struct Engine {
     doc: Document,
+    /// Result of the latest read-only selection command, consumed by its view.
+    selection_result: Option<Vec<ShapeId>>,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     /// Counts applied commands, so views can cache per revision.
@@ -109,6 +111,7 @@ impl Engine {
     pub fn new(doc: Document) -> Self {
         let mut e = Engine {
             doc,
+            selection_result: None,
             undo: Vec::new(),
             redo: Vec::new(),
             revision: 0,
@@ -131,6 +134,12 @@ impl Engine {
 
     pub fn document(&self) -> &Document {
         &self.doc
+    }
+
+    /// Consume the latest Select Same result. An empty vector is a successful
+    /// query with no matches; `None` means no unconsumed successful query.
+    pub fn take_selection_result(&mut self) -> Option<Vec<ShapeId>> {
+        self.selection_result.take()
     }
 
     /// This engine's identity: no other engine of this run has it, so a
@@ -160,6 +169,7 @@ impl Engine {
     /// Replace the document (open file, new document). Clears history.
     pub fn replace(&mut self, doc: Document) {
         self.doc = doc;
+        self.selection_result = None;
         self.doc.assign_uids(&mut self.uid_state);
         self.doc.refresh_text_flow();
         self.undo.clear();
@@ -180,6 +190,23 @@ impl Engine {
 
     /// Like [`run`](Self::run) with a custom history label.
     pub fn run_with_label(&mut self, cmd: &Command, label: &'static str) -> Result<()> {
+        self.selection_result = None;
+        if let Command::SelectSame {
+            page,
+            references,
+            active_layer,
+            options,
+        } = cmd
+        {
+            self.selection_result = Some(crate::select_same::matching_ids(
+                &self.doc,
+                *page,
+                references,
+                *active_layer,
+                options,
+            )?);
+            return Ok(());
+        }
         if cmd.outside_history() {
             // No step, no redo loss, no revision: views and the unsaved
             // marker do not change for it.
@@ -216,6 +243,13 @@ impl Engine {
 
     /// Apply several commands as one undo step.
     pub fn run_batch(&mut self, label: &'static str, cmds: &[Command]) -> Result<()> {
+        self.selection_result = None;
+        if cmds
+            .iter()
+            .any(|cmd| matches!(cmd, Command::SelectSame { .. }))
+        {
+            return Err(Error::SelectionQueryInBatch);
+        }
         let before = self.doc.clone();
         for c in cmds {
             if let Err(e) = c.apply(&mut self.doc) {
@@ -244,6 +278,10 @@ impl Engine {
     /// applied), so one Undo takes both back. Recorded as a step of its own
     /// when anything else happened since.
     pub fn amend(&mut self, cmd: &Command) -> Result<()> {
+        if matches!(cmd, Command::SelectSame { .. }) {
+            return self.run(cmd);
+        }
+        self.selection_result = None;
         if cmd.outside_history() {
             return cmd.apply(&mut self.doc);
         }
@@ -293,6 +331,13 @@ impl Engine {
     /// recorded, or make a step of their own named `label` when anything
     /// else happened since. A failing command leaves the drawing as it was.
     pub fn amend_batch(&mut self, label: &'static str, cmds: &[Command]) -> Result<()> {
+        self.selection_result = None;
+        if cmds
+            .iter()
+            .any(|cmd| matches!(cmd, Command::SelectSame { .. }))
+        {
+            return Err(Error::SelectionQueryInBatch);
+        }
         if cmds.is_empty() {
             return Ok(());
         }
@@ -359,6 +404,7 @@ impl Engine {
     /// time tracker and the saved view (they never rewind); the drawing it replaced is
     /// returned, for the other stack.
     fn swap_in(&mut self, snapshot: Document) -> Document {
+        self.selection_result = None;
         let ids = self.doc.ids().clone();
         let tracker = std::mem::take(&mut self.doc.time_tracker);
         let saved_view = self.doc.saved_view.take();
@@ -375,6 +421,7 @@ impl Engine {
     /// Mark the drawing changed without an undo step (an edit of state kept
     /// outside the history, which should still be saved).
     pub fn mark_changed(&mut self) {
+        self.selection_result = None;
         self.revision += 1;
     }
 
