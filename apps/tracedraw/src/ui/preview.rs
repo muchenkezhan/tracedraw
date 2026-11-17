@@ -12,6 +12,7 @@ pub struct PreviewSession {
     pub(crate) bounds: tracedraw_core::geometry::Rect,
     pub(crate) zoom: f64,
     was_fullscreen: bool,
+    hint_until: f64,
     texture: Option<(PreviewKey, egui::TextureHandle)>,
 }
 
@@ -36,6 +37,7 @@ pub fn begin(app: &mut App, ctx: &egui::Context, selected_only: bool) {
         bounds: preview_bounds(app),
         zoom: f64::from(app.view.zoom),
         was_fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+        hint_until: ctx.input(|i| i.time) + 1.5,
         texture: None,
     });
     app.fullscreen_preview = true;
@@ -201,21 +203,29 @@ pub fn fullscreen(app: &mut App, ui: &mut Ui) {
                     );
                 }
             }
-            let hint = painter.layout_no_wrap(
-                tr("preview.exit_hint"),
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_gray(200),
-            );
-            let hint_pos = egui::pos2(
-                rect.center().x - hint.size().x / 2.0,
-                rect.max.y - hint.size().y - 10.0,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(hint_pos, hint.size()).expand2(egui::vec2(8.0, 4.0)),
-                4.0,
-                egui::Color32::from_gray(40),
-            );
-            painter.galley(hint_pos, hint, egui::Color32::from_gray(200));
+            let now = ctx.input(|i| i.time);
+            let hint_left = app
+                .preview_session
+                .as_ref()
+                .map_or(0.0, |session| session.hint_until - now);
+            if hint_left > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(hint_left));
+                let hint = painter.layout_no_wrap(
+                    tr("preview.exit_hint"),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_gray(200),
+                );
+                let hint_pos = egui::pos2(
+                    rect.center().x - hint.size().x / 2.0,
+                    rect.max.y - hint.size().y - 10.0,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_size(hint_pos, hint.size()).expand2(egui::vec2(8.0, 4.0)),
+                    4.0,
+                    egui::Color32::from_gray(40),
+                );
+                painter.galley(hint_pos, hint, egui::Color32::from_gray(200));
+            }
         });
     let exit = ctx.input(|i| {
         i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::F9) || i.pointer.any_click()

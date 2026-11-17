@@ -6,7 +6,7 @@ full, row-by-row status.
 
 ## Unreleased
 
-- Full-screen preview (F9) fills the display at the current canvas's centre and zoom, revealing the surrounding drawing in the extra screen area. It fitted the page and every object together, shrinking the visible drawing to include distant objects, and left the window's title bar showing. Esc, F9 or a click restores the previous window state and editing view.
+- Full-screen preview (F9) fills the display at the current canvas's centre and zoom, revealing the surrounding drawing in the extra screen area. It fitted the page and every object together, shrinking the visible drawing to include distant objects, and left the window's title bar showing. Esc, F9 or a click restores the previous window state and editing view; the exit hint hides after 1.5 seconds.
 - Lens docker: Apply with Frozen keeps what the lens shows, as a picture inside the object, and the object keeps that look when moved. It used to drop the lens, and the object went back to its own colour (#3097).
 - Pictures of a page made by a macro (Document.ExportBitmap, Export), by Print as bitmap and by `tracedraw-cli convert` to PNG fill every pixel, as File > Export has since 0.48.0: they still had a light line along the top and right edge when the page was not a whole number of pixels at the resolution (#2866).
 - `.cdr` (version 16 and later): a fountain transparency whose nodes are not stored as greys, or whose nodes the object's style does not list, opens graded instead of solid or evenly see-through (#3095).

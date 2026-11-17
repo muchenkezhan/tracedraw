@@ -6,6 +6,84 @@ use tracedraw_core::geometry::Rect;
 
 const WINDOW: Vec2 = Vec2::new(1400.0, 900.0);
 
+fn timed_frame(
+    ctx: &egui::Context,
+    app: &mut App,
+    time: f64,
+    size: Vec2,
+    events: Vec<Event>,
+) -> egui::FullOutput {
+    let mut raw = input(size, app.fullscreen_preview, events);
+    raw.time = Some(time);
+    let mut output = ctx.run_ui(raw, |ui| crate::ui::root(app, ui));
+    output.textures_delta.clear();
+    output
+}
+
+fn has_exit_hint(output: &egui::FullOutput) -> bool {
+    output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == tr("preview.exit_hint"))
+    })
+}
+
+fn has_exit_hint_background(output: &egui::FullOutput) -> bool {
+    output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Rect(rect)
+            if rect.fill == egui::Color32::from_gray(40) && rect.rect.height() < 50.0)
+    })
+}
+
+#[test]
+fn the_exit_hint_hides_after_one_and_a_half_seconds_and_stays_hidden() {
+    let (ctx, mut app) = setup();
+    let output = timed_frame(&ctx, &mut app, 10.0, WINDOW, vec![key(Key::F9, true)]);
+    assert!(has_exit_hint(&output));
+    assert!(has_exit_hint_background(&output));
+    timed_frame(&ctx, &mut app, 10.1, WINDOW, vec![key(Key::F9, false)]);
+    // Let egui finish the immediate repaints caused by opening the preview.
+    for time in [10.2, 10.3, 10.4] {
+        timed_frame(&ctx, &mut app, time, WINDOW, Vec::new());
+    }
+    let output = timed_frame(&ctx, &mut app, 11.0, WINDOW, Vec::new());
+    let delay = output.viewport_output[&ViewportId::ROOT].repaint_delay;
+    assert!(delay > std::time::Duration::ZERO);
+    assert!(delay <= std::time::Duration::from_millis(500));
+    let output = timed_frame(&ctx, &mut app, 11.49, WINDOW, Vec::new());
+    assert!(has_exit_hint(&output));
+    assert!(has_exit_hint_background(&output));
+
+    let output = timed_frame(&ctx, &mut app, 11.5, WINDOW, Vec::new());
+    assert!(!has_exit_hint(&output));
+    assert!(!has_exit_hint_background(&output));
+    assert!(app.fullscreen_preview, "only the hint disappears");
+    let output = timed_frame(
+        &ctx,
+        &mut app,
+        15.0,
+        egui::vec2(1920.0, 1080.0),
+        vec![Event::PointerMoved(egui::pos2(700.0, 450.0))],
+    );
+    assert!(
+        !has_exit_hint(&output),
+        "resize and pointer motion do not restart the hint"
+    );
+    assert!(!has_exit_hint_background(&output));
+    let output = timed_frame(&ctx, &mut app, 20.0, WINDOW, vec![key(Key::Escape, true)]);
+    assert!(!has_exit_hint(&output));
+    assert!(
+        !app.fullscreen_preview,
+        "Escape still exits after the hint hides"
+    );
+    timed_frame(&ctx, &mut app, 20.1, WINDOW, vec![key(Key::Escape, false)]);
+    let output = timed_frame(&ctx, &mut app, 30.0, WINDOW, vec![key(Key::F9, true)]);
+    assert!(has_exit_hint(&output), "a new preview gets a fresh hint");
+    assert!(has_exit_hint_background(&output));
+    timed_frame(&ctx, &mut app, 30.1, WINDOW, vec![key(Key::F9, false)]);
+    let output = timed_frame(&ctx, &mut app, 31.5, WINDOW, Vec::new());
+    assert!(!has_exit_hint(&output));
+    assert!(!has_exit_hint_background(&output));
+}
+
 fn input(size: Vec2, fullscreen: bool, events: Vec<Event>) -> egui::RawInput {
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),

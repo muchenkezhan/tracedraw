@@ -29,6 +29,10 @@ This retains its existing selection-area behaviour.
 
 ## Return to editing
 
+The exit hint appears for the first 1.5 seconds of each preview, then
+hides automatically even when the pointer stays still. Resizing the
+window or moving the pointer does not show it again.
+
 Press Esc or F9, or click the preview, to return. The window returns to
 its previous full-screen state; a window that was already full-screen
 stays full-screen. The canvas's pan, zoom and selection are preserved.
