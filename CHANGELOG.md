@@ -6,6 +6,15 @@ full, row-by-row status.
 
 ## Unreleased
 
+- Options > Customization > Context Menus lets you show, hide and reorder
+  operations independently in 31 right-click menu locations. Expand submenus
+  to see their children, then drag a handle or use Move Up and Move Down to
+  reorder items at the same level. Parent menus move with their children.
+  Search keeps the parent path visible. Restore one or all menus to reset
+  visibility and order. OK saves the choices; Cancel restores the choices
+  from when Options opened. The settings page fits narrow desktop windows.
+  Main menus, shortcuts and command search keep their commands.
+
 - Lens docker: Apply with Frozen keeps what the lens shows, as a picture inside the object, and the object keeps that look when moved. It used to drop the lens, and the object went back to its own colour (#3097).
 - `.cdr` (version 16 and later): a fountain transparency whose nodes are not stored as greys, or whose nodes the object's style does not list, opens graded instead of solid or evenly see-through (#3095).
 - EPS, PostScript and AI exports leave out the fill of an open curve, as the drawing window and the SVG, PDF and EMF exports do (unless Fill open curves is on): a filled curve left open came out filled in those files, closed by a straight line from its end back to its start.
