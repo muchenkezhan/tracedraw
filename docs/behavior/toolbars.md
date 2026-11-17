@@ -330,7 +330,12 @@ for sliders stepped with the wheel (`step_merge::tests`).
   complex star's sharpness counts steps (1 up to what its points allow).
 - Then the outline: width (Hairline, None, preset widths in the ruler
   unit), line style, start and end arrowheads; then To Front, To Back and
-  Convert to Curves. The mouse wheel over the closed width box steps the
+  Convert to Curves. Each arrowhead list is a four-column grid of line
+  previews: None and 31 presets, followed by custom arrowheads. Start
+  previews point left and end previews point right; the chosen head is
+  highlighted. The wider popup scrolls vertically when needed. Arrow keys move the
+  highlight, Enter chooses and Escape closes without applying a choice.
+  The mouse wheel over the closed width box steps the
   selection's outline to the next width of the list up (wheel up) or
   down, stopping at None and at the widest; a width between two of the
   list goes to the one above or below. One step per notch: a wheel event

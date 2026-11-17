@@ -4,6 +4,11 @@ use crate::color::Color;
 use crate::geometry::{Affine, BezPath, Point, Rect, Size, Vec2};
 use serde::{Deserialize, Serialize};
 
+mod arrowhead_presets;
+mod arrowhead_shaft;
+
+pub use arrowhead_shaft::arrowhead_shaft_path;
+
 /// Fountain (gradient) fill geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -2501,6 +2506,31 @@ pub enum Arrowhead {
     Square,
     Bar,
     Diamond,
+    Triangle,
+    NarrowTriangle,
+    WideTriangle,
+    Stealth,
+    LongStealth,
+    DoubleArrow,
+    TripleArrow,
+    Chevron,
+    DoubleChevron,
+    HalfArrowLeft,
+    HalfArrowRight,
+    Harpoon,
+    ReverseArrow,
+    Tail,
+    DoubleTail,
+    CircleOpen,
+    SquareOpen,
+    DiamondOpen,
+    TriangleOpen,
+    BarDouble,
+    Slash,
+    Cross,
+    Star,
+    Hexagon,
+    Bracket,
     /// User-drawn head (Object > Create > Arrowhead).
     Custom {
         path: crate::geometry::BezPath,
@@ -2510,7 +2540,7 @@ pub enum Arrowhead {
 
 impl Arrowhead {
     /// The built-in presets, in menu order. Custom heads are not listed.
-    pub const ALL: [Arrowhead; 7] = [
+    pub const ALL: [Arrowhead; 32] = [
         Arrowhead::None,
         Arrowhead::Arrow,
         Arrowhead::OpenArrow,
@@ -2518,6 +2548,31 @@ impl Arrowhead {
         Arrowhead::Square,
         Arrowhead::Bar,
         Arrowhead::Diamond,
+        Arrowhead::Triangle,
+        Arrowhead::NarrowTriangle,
+        Arrowhead::WideTriangle,
+        Arrowhead::Stealth,
+        Arrowhead::LongStealth,
+        Arrowhead::DoubleArrow,
+        Arrowhead::TripleArrow,
+        Arrowhead::Chevron,
+        Arrowhead::DoubleChevron,
+        Arrowhead::HalfArrowLeft,
+        Arrowhead::HalfArrowRight,
+        Arrowhead::Harpoon,
+        Arrowhead::ReverseArrow,
+        Arrowhead::Tail,
+        Arrowhead::DoubleTail,
+        Arrowhead::CircleOpen,
+        Arrowhead::SquareOpen,
+        Arrowhead::DiamondOpen,
+        Arrowhead::TriangleOpen,
+        Arrowhead::BarDouble,
+        Arrowhead::Slash,
+        Arrowhead::Cross,
+        Arrowhead::Star,
+        Arrowhead::Hexagon,
+        Arrowhead::Bracket,
     ];
 
     pub fn name(&self) -> &str {
@@ -2529,6 +2584,31 @@ impl Arrowhead {
             Arrowhead::Square => "Square",
             Arrowhead::Bar => "Bar",
             Arrowhead::Diamond => "Diamond",
+            Arrowhead::Triangle => "Triangle",
+            Arrowhead::NarrowTriangle => "Narrow triangle",
+            Arrowhead::WideTriangle => "Wide triangle",
+            Arrowhead::Stealth => "Stealth",
+            Arrowhead::LongStealth => "Long stealth",
+            Arrowhead::DoubleArrow => "Double arrow",
+            Arrowhead::TripleArrow => "Triple arrow",
+            Arrowhead::Chevron => "Chevron",
+            Arrowhead::DoubleChevron => "Double chevron",
+            Arrowhead::HalfArrowLeft => "Half arrow left",
+            Arrowhead::HalfArrowRight => "Half arrow right",
+            Arrowhead::Harpoon => "Harpoon",
+            Arrowhead::ReverseArrow => "Reverse arrow",
+            Arrowhead::Tail => "Tail",
+            Arrowhead::DoubleTail => "Double tail",
+            Arrowhead::CircleOpen => "Open circle",
+            Arrowhead::SquareOpen => "Open square",
+            Arrowhead::DiamondOpen => "Open diamond",
+            Arrowhead::TriangleOpen => "Open triangle",
+            Arrowhead::BarDouble => "Double bar",
+            Arrowhead::Slash => "Slash",
+            Arrowhead::Cross => "Cross",
+            Arrowhead::Star => "Star",
+            Arrowhead::Hexagon => "Hexagon",
+            Arrowhead::Bracket => "Bracket",
             Arrowhead::Custom { name, .. } => name,
         }
     }
@@ -4179,63 +4259,7 @@ mod tests {
 /// and `w` the outline width the thin parts are drawn with. A custom
 /// head's own outline is scaled to `size`. `None` for no head.
 fn head_outline(kind: &Arrowhead, size: f64, w: f64) -> Option<crate::geometry::BezPath> {
-    use crate::geometry::{BezPath, Shape as _};
-    let mut p = BezPath::new();
-    match kind {
-        Arrowhead::None => return None,
-        Arrowhead::Custom { path: outline, .. } => {
-            // Head space (unit tall, tip at the origin, body towards -x)
-            // scaled to the preset size.
-            p = Affine::scale(size) * outline.clone();
-        }
-        Arrowhead::Arrow => {
-            p.move_to((0.0, 0.0));
-            p.line_to((-size, size * 0.4));
-            p.line_to((-size * 0.7, 0.0));
-            p.line_to((-size, -size * 0.4));
-            p.close_path();
-        }
-        Arrowhead::OpenArrow => {
-            let t = w.max(0.2);
-            p.move_to((0.0, 0.0));
-            p.line_to((-size, size * 0.45));
-            p.line_to((-size - t, size * 0.45 - t));
-            p.line_to((-t * 1.4, 0.0));
-            p.line_to((-size - t, -size * 0.45 + t));
-            p.line_to((-size, -size * 0.45));
-            p.close_path();
-        }
-        Arrowhead::Circle => {
-            let r = size * 0.35;
-            p = crate::geometry::Circle::new((-r, 0.0), r).to_path(0.01);
-        }
-        Arrowhead::Square => {
-            let h = size * 0.35;
-            let cx = -h;
-            p.move_to((cx + h, h));
-            p.line_to((cx - h, h));
-            p.line_to((cx - h, -h));
-            p.line_to((cx + h, -h));
-            p.close_path();
-        }
-        Arrowhead::Bar => {
-            let t = w.max(0.2);
-            p.move_to((0.0, size * 0.5));
-            p.line_to((-t, size * 0.5));
-            p.line_to((-t, -size * 0.5));
-            p.line_to((0.0, -size * 0.5));
-            p.close_path();
-        }
-        Arrowhead::Diamond => {
-            let h = size * 0.5;
-            p.move_to((0.0, 0.0));
-            p.line_to((-h, h * 0.6));
-            p.line_to((-h * 2.0, 0.0));
-            p.line_to((-h, -h * 0.6));
-            p.close_path();
-        }
-    }
-    Some(p)
+    arrowhead_presets::outline(kind, size, w)
 }
 
 /// The preset head size in millimetres for an outline `width`:
@@ -4408,7 +4432,7 @@ mod arrowhead_tests {
         for a in Arrowhead::ALL.iter() {
             assert!(!a.is_custom(), "{a:?}");
         }
-        assert_eq!(Arrowhead::ALL.len(), 7);
+        assert_eq!(Arrowhead::ALL.len(), 32);
         assert_eq!(Arrowhead::Arrow.name(), "Arrow");
     }
 

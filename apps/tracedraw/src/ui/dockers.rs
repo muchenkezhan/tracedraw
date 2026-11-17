@@ -3819,7 +3819,7 @@ pub(crate) fn arrow_combo(
     let shown = if mixed {
         format!("{label}:")
     } else {
-        format!("{label}: {}", a.name())
+        format!("{label}: {}", super::arrowhead_picker::name(a))
     };
     let tip = if id.to_lowercase().ends_with("end") {
         "toolbar.end_arrow"
@@ -3830,7 +3830,10 @@ pub(crate) fn arrow_combo(
         .selected_text(shown)
         .show_ui(ui, |ui| {
             for k in Arrowhead::ALL {
-                if ui.selectable_label(!mixed && *a == k, k.name()).clicked() {
+                if ui
+                    .selectable_label(!mixed && *a == k, super::arrowhead_picker::name(&k))
+                    .clicked()
+                {
                     *a = k;
                     changed = true;
                 }

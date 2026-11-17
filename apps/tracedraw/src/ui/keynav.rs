@@ -50,6 +50,10 @@ fn combos_id() -> Id {
     Id::new("keynav_combos")
 }
 
+fn choices_id() -> Id {
+    Id::new("keynav_list_choices")
+}
+
 /// What the navigation keeps between frames.
 #[derive(Clone, Default, Debug)]
 struct State {
@@ -157,6 +161,16 @@ pub fn note_menu_row(ctx: &Context, id: Id, submenu: bool) {
     ctx.data_mut(|d| {
         d.get_temp_mut_or_default::<Noted<(Id, bool)>>(rows_id())
             .add(pass, (id, submenu))
+    });
+}
+
+/// The name and chosen state of a graphical list option, whose picture
+/// carries no painted text for keyboard navigation to read.
+pub fn note_list_choice(ctx: &Context, id: Id, name: String, selected: bool) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<Noted<(Id, String, bool)>>(choices_id())
+            .add(pass, (id, name, selected))
     });
 }
 
@@ -1010,6 +1024,12 @@ fn row_labels(
     rows: &[(Id, Rect)],
     shown: Option<&str>,
 ) -> Vec<(Id, String, bool)> {
+    let pass = ctx.cumulative_pass_nr();
+    let choices = ctx.data_mut(|d| {
+        let noted = d.get_temp_mut_or_default::<Noted<(Id, String, bool)>>(choices_id());
+        noted.roll(pass);
+        noted.this.clone()
+    });
     let mut texts: Vec<(egui::Pos2, String)> = Vec::new();
     let mut fills: Vec<Rect> = Vec::new();
     let selection = ctx.global_style().visuals.selection.bg_fill;
@@ -1043,6 +1063,9 @@ fn row_labels(
     let mut out: Vec<(Id, String, bool)> = rows
         .iter()
         .map(|(id, r)| {
+            if let Some(choice) = choices.iter().rev().find(|choice| choice.0 == *id) {
+                return choice.clone();
+            }
             let mut parts: Vec<&(egui::Pos2, String)> =
                 texts.iter().filter(|(p, _)| r.contains(*p)).collect();
             parts.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
@@ -1054,14 +1077,19 @@ fn row_labels(
             (*id, name, false)
         })
         .collect();
-    let by_name = shown
-        .filter(|s| !s.is_empty())
-        .and_then(|s| out.iter().position(|(_, n, _)| n.trim() == s.trim()));
+    let by_name = shown.filter(|s| !s.is_empty()).and_then(|s| {
+        out.iter().position(|(id, n, _)| {
+            !choices.iter().any(|choice| choice.0 == *id) && n.trim() == s.trim()
+        })
+    });
     let by_fill = || {
-        rows.iter()
-            .position(|(_, r)| fills.iter().any(|f| f.contains(r.center())))
+        rows.iter().position(|(id, r)| {
+            !choices.iter().any(|choice| choice.0 == *id)
+                && fills.iter().any(|f| f.contains(r.center()))
+        })
     };
-    if let Some(i) = by_name.or_else(by_fill) {
+    let by_choice = out.iter().position(|(_, _, selected)| *selected);
+    if let Some(i) = by_choice.or(by_name).or_else(by_fill) {
         if let Some(o) = out.get_mut(i) {
             o.2 = true;
         }
@@ -1835,6 +1863,156 @@ mod tests {
         run(&mut value, vec![press(Key::Enter, Modifiers::NONE)]);
         assert!(egui::Popup::is_id_open(&ctx, combo.popup));
         assert_eq!(lit(&ctx), "Cherry");
+    }
+
+    /// Pictures without painted labels still open on the chosen option
+    /// and support typing a name before confirming it.
+    #[test]
+    fn graphical_list_choices_keep_their_names_and_chosen_state() {
+        let ctx = crate::theme::ui_context();
+        let mut value = 2;
+        let clock = std::cell::Cell::new(0.0);
+        let run = |value: &mut usize, events: Vec<Event>| {
+            let mut events = Some(events);
+            for _ in 0..4 {
+                clock.set(clock.get() + 0.1);
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        events: events.take().unwrap_or_default(),
+                        time: Some(clock.get()),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        frame(ui.ctx(), false);
+                        ComboBox::from_id_salt("graphical_choices")
+                            .selected_text("")
+                            .show_ui(ui, |ui| {
+                                egui::Grid::new("choices_grid")
+                                    .num_columns(3)
+                                    .show(ui, |ui| {
+                                        for (i, name) in FRUIT.iter().enumerate() {
+                                            let response = ui.add_sized(
+                                                [40.0, 32.0],
+                                                egui::Button::new("").selected(*value == i),
+                                            );
+                                            note_list_choice(
+                                                ui.ctx(),
+                                                response.id,
+                                                (*name).into(),
+                                                *value == i,
+                                            );
+                                            if response.clicked() {
+                                                *value = i;
+                                            }
+                                            if i % 3 == 2 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            });
+                        end_frame(ui.ctx());
+                    },
+                );
+                out.textures_delta.clear();
+            }
+        };
+        run(&mut value, Vec::new());
+        let pass = ctx.cumulative_pass_nr();
+        let combo = ctx
+            .data_mut(|d| {
+                d.get_temp_mut_or_default::<Noted<Combo>>(combos_id())
+                    .seen(pass)
+                    .next()
+                    .cloned()
+            })
+            .expect("a graphical list");
+        ctx.memory_mut(|m| m.request_focus(combo.button));
+        run(&mut value, vec![press(Key::ArrowDown, Modifiers::NONE)]);
+        assert!(egui::Popup::is_id_open(&ctx, combo.popup));
+        assert_eq!(lit(&ctx), "Blueberry", "the chosen picture is highlighted");
+        run(&mut value, typed('c'));
+        assert_eq!(lit(&ctx), "Cherry", "type ahead uses the picture's name");
+        assert_eq!(value, 2, "typing has not applied the choice");
+        run(&mut value, vec![press(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(value, 3);
+        assert!(!egui::Popup::is_id_open(&ctx, combo.popup));
+    }
+
+    #[test]
+    fn scrolling_picture_choices_keep_navigation_inside_the_grid() {
+        let ctx = crate::theme::ui_context();
+        let mut value = tracedraw_core::Arrowhead::None;
+        let run = |value: &mut tracedraw_core::Arrowhead, events: Vec<Event>| {
+            let mut events = Some(events);
+            let mut button = Id::NULL;
+            for _ in 0..4 {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        events: events.take().unwrap_or_default(),
+                        time: Some(ctx.cumulative_frame_nr() as f64 / 60.0),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        frame(ui.ctx(), false);
+                        button = ui.make_persistent_id("scrolling_picture_choices");
+                        if let Some(next) = crate::ui::arrowhead_picker::show(
+                            ui,
+                            "scrolling_picture_choices",
+                            value,
+                            true,
+                            false,
+                            &[],
+                        ) {
+                            *value = next;
+                        }
+                        end_frame(ui.ctx());
+                    },
+                );
+                out.textures_delta.clear();
+            }
+            button
+        };
+        let button = run(&mut value, Vec::new());
+        ctx.memory_mut(|m| m.request_focus(button));
+        run(&mut value, vec![press(Key::ArrowDown, Modifiers::NONE)]);
+        let popup = button.with("popup");
+        let rows = rows_of(&ctx, popup);
+        let count = rows.len();
+        assert_eq!(count, tracedraw_core::Arrowhead::ALL.len());
+        let last = rows.last().expect("the last arrowhead choice").0;
+        run(&mut value, vec![press(Key::Home, Modifiers::NONE)]);
+        for (id, _) in rows.iter().skip(1) {
+            run(&mut value, vec![press(Key::ArrowRight, Modifiers::NONE)]);
+            assert_eq!(ctx.memory(|m| m.focused()), Some(*id));
+        }
+        run(&mut value, vec![press(Key::ArrowRight, Modifiers::NONE)]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(last));
+        run(&mut value, vec![press(Key::Home, Modifiers::NONE)]);
+        for row in 1..count / 4 {
+            run(&mut value, vec![press(Key::ArrowDown, Modifiers::NONE)]);
+            assert_eq!(ctx.memory(|m| m.focused()), Some(rows[row * 4].0));
+        }
+        run(&mut value, vec![press(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(rows[count - 4].0));
+        run(&mut value, vec![press(Key::ArrowUp, Modifiers::NONE)]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(rows[count - 8].0));
+        run(&mut value, vec![press(Key::Home, Modifiers::NONE)]);
+        run(&mut value, vec![press(Key::End, Modifiers::NONE)]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(last));
+        run(&mut value, vec![press(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(last));
+        run(&mut value, vec![press(Key::ArrowUp, Modifiers::NONE)]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(rows[count - 5].0));
+        assert!(egui::Popup::is_id_open(&ctx, popup));
+        assert_eq!(value, tracedraw_core::Arrowhead::None);
     }
 
     /// Tab goes from a field of the property bar to its lists, and the

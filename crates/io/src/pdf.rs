@@ -1586,11 +1586,21 @@ impl PageWriter<'_> {
     ) {
         use tracedraw_core::geometry::Shape as _;
         let (drawn, scale) = crate::svg::drawn_stroke(s, transform);
+        let page_path = shape.page_path();
+        let shaft = tracedraw_core::arrowhead_shaft_path(
+            &page_path,
+            s,
+            crate::svg::shaft_width_scale(scale, parent),
+        );
+        let path = match &shaft {
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(path),
+            std::borrow::Cow::Owned(shaft) => std::borrow::Cow::Owned(parent * shaft),
+        };
         self.stroke_state(&drawn);
         if let Some(brush) = &s.painterly {
             // Painterly brush: the marks, one filled path per opacity.
             for (alpha, marks) in tracedraw_core::painterly::marks_by_opacity_along(
-                &shape.page_path(),
+                &shaft,
                 drawn.width,
                 brush,
                 12,
@@ -1613,9 +1623,7 @@ impl PageWriter<'_> {
                 self.path_ops(&(parent * marks));
                 self.content.push_str("f\nQ\n");
             }
-        } else if let Some(band) =
-            tracedraw_core::shaping::outline_band(&shape.page_path(), s, scale)
-        {
+        } else if let Some(band) = tracedraw_core::shaping::outline_band(&shaft, s, scale) {
             // Calligraphic nib or variable width: the band, filled.
             let band = parent * band;
             if let Some(paint) = outline_paint(s, transform) {
@@ -1628,7 +1636,7 @@ impl PageWriter<'_> {
                 self.content.push_str("f\n");
             }
         } else if let Some((paint, area)) = outline_paint(s, transform)
-            .map(|p| (p, tracedraw_core::shaping::stroke_area(path, &drawn)))
+            .map(|p| (p, tracedraw_core::shaping::stroke_area(&path, &drawn)))
             .filter(|(_, a)| !a.elements().is_empty())
         {
             // The outline's own paint: the area it covers, painted
@@ -1636,13 +1644,13 @@ impl PageWriter<'_> {
             let half = drawn.width / 2.0;
             self.paint_area(&paint, &area, bounds.inflate(half, half), true, transform);
         } else {
-            self.path_ops(path);
+            self.path_ops(&path);
             self.content.push_str("S\n");
         }
         // Arrowheads (presets and custom) are filled with the outline
         // colour. They are built on the page-space path, which already
         // carries the shape's own transform, so only the parent applies.
-        for head in tracedraw_core::arrowhead_paths(&shape.page_path(), s) {
+        for head in tracedraw_core::arrowhead_paths(&page_path, s) {
             let op = self.color_op(s.color, true);
             let _ = writeln!(self.content, "{op}");
             self.path_ops(&(parent * head));
@@ -3518,6 +3526,44 @@ mod tests {
         let tip = format!("{} {} l", f(60.0 * MM_PT), f(150.0 * MM_PT));
         assert!(content.contains(&tip), "head tip: {content}");
         assert!(!content.contains(&format!("{} {} l", f(60.0 * MM_PT), f(250.0 * MM_PT))));
+    }
+
+    #[test]
+    fn arrowhead_shafts_stop_before_the_tip_in_the_content_stream() {
+        for (cap, end) in [
+            (LineCap::Butt, 54.4),
+            (LineCap::Round, 53.4),
+            (LineCap::Square, 53.4),
+        ] {
+            let mut doc = Document::default();
+            let mut path = tracedraw_core::BezPath::new();
+            path.move_to((10.0, 50.0));
+            path.line_to((60.0, 50.0));
+            let mut line = Shape::new(
+                tracedraw_core::ShapeId(1),
+                ShapeKind::Path {
+                    path,
+                    closed: false,
+                },
+            );
+            line.fill = Fill::None;
+            line.stroke = Some(tracedraw_core::Stroke {
+                cap,
+                end_arrow: tracedraw_core::Arrowhead::Arrow,
+                ..tracedraw_core::Stroke::new(Color::BLACK, 2.0)
+            });
+            doc.pages[0].layers[0].shapes.push(line);
+            let content = page_content(&document_to_pdf(&doc));
+            let shaft_end = format!("{} {} l\nS\n", f(end * MM_PT), f(50.0 * MM_PT));
+            assert!(content.contains(&shaft_end), "{cap:?}: {content}");
+            let full_line = format!("{} {} l\nS\n", f(60.0 * MM_PT), f(50.0 * MM_PT));
+            assert!(!content.contains(&full_line), "{content}");
+            let tip = format!("{} {} m\n", f(60.0 * MM_PT), f(50.0 * MM_PT));
+            assert!(
+                content.contains(&tip),
+                "head keeps the original endpoint: {content}"
+            );
+        }
     }
 
     /// #1210: a head sized to 200 % and moved 5 mm out past the end lands

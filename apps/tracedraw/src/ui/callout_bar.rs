@@ -34,7 +34,7 @@ fn head_label(a: &Arrowhead) -> String {
         Arrowhead::Square => "\u{25A0}\u{2015}".into(),
         Arrowhead::Bar => "|\u{2015}".into(),
         Arrowhead::Diamond => "\u{2666}\u{2015}".into(),
-        Arrowhead::Custom { name, .. } => name.clone(),
+        _ => super::arrowhead_picker::name(a),
     }
 }
 

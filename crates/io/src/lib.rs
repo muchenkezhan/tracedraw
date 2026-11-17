@@ -991,6 +991,76 @@ mod tests {
         assert_eq!(st.start_arrow, tracedraw_core::Arrowhead::Circle);
     }
 
+    /// Every built-in head survives a real compressed native save and
+    /// reopen on both ends, together with its independent placement.
+    #[test]
+    fn every_arrowhead_preset_round_trips_through_a_native_file() {
+        use tracedraw_core::{Arrowhead, ArrowheadPlacement};
+
+        let mut doc = Document::default();
+        let layer = doc.pages[0].layers[0].id;
+        let presets = Arrowhead::ALL;
+        assert_eq!(presets.len(), 32, "None and all 31 arrowhead presets");
+        let mut expected = Vec::new();
+        for (index, head) in presets.iter().enumerate() {
+            let id = doc.ids_mut().shape();
+            let y = 10.0 + index as f64 * 5.0;
+            let mut path = tracedraw_core::BezPath::new();
+            path.move_to((10.0, y));
+            path.line_to((80.0, y));
+            let mut line = Shape::new(
+                id,
+                ShapeKind::Path {
+                    path,
+                    closed: false,
+                },
+            );
+            line.fill = Fill::None;
+            let stroke = Stroke {
+                start_arrow: head.clone(),
+                end_arrow: presets[presets.len() - 1 - index].clone(),
+                start_head: ArrowheadPlacement {
+                    size: 125.0 + index as f64,
+                    offset: -0.5,
+                    mirror_h: index % 2 == 0,
+                    mirror_v: index % 3 == 0,
+                    rotation: 12.5,
+                },
+                end_head: ArrowheadPlacement {
+                    size: 225.0 - index as f64,
+                    offset: 0.75,
+                    mirror_h: index % 2 != 0,
+                    mirror_v: index % 3 != 0,
+                    rotation: -17.5,
+                },
+                ..Stroke::new(Color::BLACK, 0.5)
+            };
+            line.stroke = Some(stroke.clone());
+            doc.layer_mut(layer).unwrap().shapes.push(line);
+            expected.push((id, stroke));
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "tracedraw-arrowhead-presets-{}-{:?}.tdraw",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        save_native(&doc, &path).expect("save every arrowhead preset");
+        let bytes = std::fs::read(&path).expect("the native file");
+        let back = load_native(&path).expect("reopen every arrowhead preset");
+        let _ = std::fs::remove_file(&path);
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "a compressed .tdraw file");
+        assert_eq!(back, doc);
+        for (id, stroke) in expected {
+            assert_eq!(
+                back.find_shape(id).and_then(|line| line.stroke.as_ref()),
+                Some(&stroke),
+                "both ends and placements survive for {:?}",
+                stroke.start_arrow
+            );
+        }
+    }
+
     /// A feature switched off ("-liga") and a superscript are kept in the
     /// native file (#1201); a file written without them reads as before.
     #[test]

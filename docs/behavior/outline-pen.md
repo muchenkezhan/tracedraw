@@ -73,6 +73,52 @@ selected (the default outline) nothing is previewed.
 
 ## Arrowhead editor
 
+### Preset library
+
+The start and end lists offer None and 31 presets. The property bar
+shows them as a scrollable four-column grid with the chosen head
+highlighted. The same presets are available in the Properties docker,
+Outline Pen dialog and Arrowhead editor; custom heads follow them.
+Names are translated, and graphical choices keep their names for
+keyboard type-ahead and assistive tools.
+
+The library includes filled and open arrows, narrow and wide triangles,
+notched arrows, double and triple arrows, chevrons, left and right half
+arrows, a harpoon, reversed and tail marks, filled and hollow circles,
+squares, diamonds and triangles, single and double bars, a slash, cross,
+star, hexagon and bracket. Each is an original closed outline in the
+head's local frame. Hollow heads have a reverse-wound inner contour,
+so their centres stay hollow with the nonzero fill rule used by the
+renderer and exports. Size and placement follow the same formulas below
+for every preset, without changing the size of the line itself.
+
+The preset catalogue and native-format serialization are covered by
+`style::arrowhead_tests`. The property-bar tests cover four columns,
+scrolling to custom heads, keyboard selection and undo; preview tests
+cover both ends, asymmetric custom heads and texture reuse.
+
+### Line connection
+
+The line body stops where it meets the placed head's filled contour.
+Its original endpoint still anchors the head, so a narrow tip has no
+flat line protruding beside it and a hollow head has no line through
+its centre. A notched head keeps the connection at the notch. Round
+and square caps are shortened by half the drawn outline width, including
+Scale with object, to finish at the same contact as a butt cap.
+The original curve still supplies the object's fill and the head's
+direction. Shortening preserves Bezier segments and separate subpaths;
+a very short line may consist only of its two heads. A head offset
+completely away from the line leaves the body unchanged.
+
+The same geometry is used by the picker previews, canvas and SVG, PDF,
+EPS, PS, AI, EMF and WMF exports. Core shaft tests cover caps, placement,
+curves and separate subpaths; renderer tests compare every preset's
+tip with its standalone silhouette and check hollow centres. Export
+tests check that the line stops before the tip while the original
+fill and head endpoint are kept.
+
+### Placement
+
 (#1210, `ui/arrowhead_editor.rs`) The "..." beside an end's arrowhead
 list, in the Properties docker's outline section and in the Outline Pen
 dialog, opens the Arrowhead editor on that end: a preview of the line's

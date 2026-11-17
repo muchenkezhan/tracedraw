@@ -1,7 +1,7 @@
 //! SVG export. One page per SVG, in millimetres, with the Y axis flipped
 //! from our bottom-up page space to SVG's top-down space.
 
-use std::fmt::Write;
+use std::{borrow::Cow, fmt::Write};
 use tracedraw_core::{
     document::{Shape, ShapeKind},
     geometry::{Affine, PathEl, Shape as _},
@@ -442,13 +442,22 @@ fn write_unlinked(
     let path = transform * shape.local_path();
     let d = path_data(&path);
     let bounds = path.bounding_box();
+    let page_path = shape.page_path();
+    let drawn = shape.stroke.as_ref().map(|s| drawn_stroke(s, transform));
+    let shaft = shape
+        .stroke
+        .as_ref()
+        .zip(drawn.as_ref())
+        .map(|(s, (_, scale))| {
+            tracedraw_core::arrowhead_shaft_path(&page_path, s, shaft_width_scale(*scale, parent))
+        });
+    let shaft_path = shaft.as_deref().unwrap_or(&page_path);
 
     let fill_attr = format!(
         "fill=\"{}\"",
         paint_value(&shape.fill, bounds, transform, symbols, defs, ctx)
     );
 
-    let drawn = shape.stroke.as_ref().map(|s| drawn_stroke(s, transform));
     // A calligraphic, variable, inside or outside outline, or one with
     // dashes fitted to the corners, has no SVG equivalent: its area is
     // written as a filled path after the object.
@@ -457,7 +466,7 @@ fn write_unlinked(
         .as_ref()
         .zip(drawn.as_ref())
         .and_then(|(s, (_, scale))| {
-            tracedraw_core::shaping::outline_band(&shape.page_path(), s, *scale).map(|b| {
+            tracedraw_core::shaping::outline_band(shaft_path, s, *scale).map(|b| {
                 let band = parent * b;
                 let paint =
                     outline_paint_value(s, band.bounding_box(), transform, symbols, defs, ctx);
@@ -544,7 +553,7 @@ fn write_unlinked(
     let heads: Vec<_> = shape
         .stroke
         .as_ref()
-        .map(|s| tracedraw_core::arrowhead_paths(&shape.page_path(), s))
+        .map(|s| tracedraw_core::arrowhead_paths(&page_path, s))
         .unwrap_or_default();
     let painterly = drawn.as_ref().is_some_and(|(s, _)| s.painterly.is_some());
     let see_through = shape.opacity < 1.0;
@@ -558,11 +567,41 @@ fn write_unlinked(
     if wrapped {
         let _ = writeln!(out, "{pad}<g opacity=\"{}\">", fmt(shape.opacity.max(0.0)));
     }
-    let _ = writeln!(
-        out,
-        "{pad}<path id=\"{}\"{name} d=\"{d}\" {fill_attr}{rule} {stroke_attr}{spot}{opacity}/>",
-        shape.id.raw()
-    );
+    if matches!(shaft, Some(Cow::Owned(_))) && calligraphic.is_none() && !painterly {
+        let shaft_d = path_data(&(parent * shaft_path));
+        if matches!(shape.fill, Fill::None) {
+            let _ = writeln!(
+                out,
+                "{pad}<path id=\"{}\"{name} d=\"{shaft_d}\" {fill_attr}{rule} {stroke_attr}{spot}{opacity}/>",
+                shape.id.raw()
+            );
+        } else {
+            // Keep an open curve's original fill boundary while only its
+            // outline stops at the arrowheads.
+            let fill_spot = spot_attrs(&shape.fill, None);
+            let stroke_spot = spot_attrs(&Fill::None, shape.stroke.as_ref());
+            let fill_path = format!(
+                "{pad}<path id=\"{}\"{name} d=\"{d}\" {fill_attr}{rule} stroke=\"none\"{fill_spot}{opacity}/>\n",
+                shape.id.raw()
+            );
+            let stroke_path = format!(
+                "{pad}<path d=\"{shaft_d}\" fill=\"none\" {stroke_attr}{stroke_spot}{opacity}/>\n"
+            );
+            if shape.stroke.as_ref().is_some_and(|s| s.behind_fill) {
+                out.push_str(&stroke_path);
+                out.push_str(&fill_path);
+            } else {
+                out.push_str(&fill_path);
+                out.push_str(&stroke_path);
+            }
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "{pad}<path id=\"{}\"{name} d=\"{d}\" {fill_attr}{rule} {stroke_attr}{spot}{opacity}/>",
+            shape.id.raw()
+        );
+    }
     if let Some((band, paint)) = calligraphic {
         let _ = writeln!(
             out,
@@ -576,12 +615,7 @@ fn write_unlinked(
         .and_then(|(s, _)| s.painterly.as_ref().map(|b| (s, b)))
     {
         for (alpha, marks) in tracedraw_core::painterly::marks_by_opacity_along(
-            &shape.page_path(),
-            s.width,
-            brush,
-            12,
-            &s.widths,
-            s.width,
+            shaft_path, s.width, brush, 12, &s.widths, s.width,
         ) {
             let _ = writeln!(
                 out,
@@ -630,6 +664,14 @@ pub(crate) fn drawn_stroke(
         drawn.width *= scale;
     }
     (drawn, scale)
+}
+
+/// The cap's width in the same space as `Shape::page_path`. The parent
+/// transform is applied to the shortened body afterwards.
+pub(crate) fn shaft_width_scale(drawn_scale: f64, parent: Affine) -> f64 {
+    let c = parent.as_coeffs();
+    let parent_scale = (c[0] * c[3] - c[1] * c[2]).abs().sqrt().max(1e-6);
+    drawn_scale / parent_scale
 }
 
 /// The SVG paint of an outline: its own paint (a gradient, pattern,
@@ -1631,6 +1673,126 @@ pub(crate) mod tests {
         }
         let svg = page_to_svg(&doc, 0);
         assert!(!svg.contains("fill=\"#0000ff\" stroke=\"none\""));
+    }
+
+    #[test]
+    fn arrowhead_shafts_stop_at_the_head_with_each_line_cap() {
+        for (cap, end) in [
+            (LineCap::Butt, 52.0),
+            (LineCap::Round, 51.0),
+            (LineCap::Square, 51.0),
+        ] {
+            let mut doc = Document::default();
+            let mut line = arrow_line();
+            line.stroke.as_mut().expect("stroke").cap = cap;
+            doc.pages[0].layers[0].shapes.push(line);
+            let svg = page_to_svg(&doc, 0);
+            let shaft = svg
+                .lines()
+                .find(|line| line.contains("stroke-width=\"2\""))
+                .expect("shaft");
+            assert!(
+                shaft.contains(&format!("d=\"M10 147L{} 147\"", fmt(end))),
+                "{cap:?}: {shaft}"
+            );
+            let head = svg
+                .lines()
+                .find(|line| line.contains("fill=\"#0000ff\" stroke=\"none\""))
+                .expect("head");
+            let data = head.split("d=\"").nth(1).expect("head path");
+            let data = data.split('"').next().expect("path data");
+            let path = tracedraw_core::BezPath::from_svg(data).expect("valid head path");
+            let bounds = path.bounding_box();
+            assert_eq!(bounds.x1, 60.0, "head stays at the tip: {head}");
+            assert_eq!(bounds.y0, 143.0, "head retains its height: {head}");
+            assert_eq!(bounds.y1, 151.0, "head retains its height: {head}");
+        }
+    }
+
+    #[test]
+    fn scaled_arrow_shafts_compensate_for_the_drawn_cap_width() {
+        for scale_with_object in [false, true] {
+            for grouped in [false, true] {
+                let mut doc = Document::default();
+                let mut line = arrow_line();
+                let stroke = line.stroke.as_mut().expect("stroke");
+                stroke.cap = LineCap::Round;
+                stroke.scale_with_object = scale_with_object;
+                let scale = Affine::scale(3.0);
+                if grouped {
+                    let mut group = Shape::new(
+                        tracedraw_core::ShapeId(2),
+                        ShapeKind::Group {
+                            children: vec![line],
+                        },
+                    );
+                    group.transform = scale;
+                    doc.pages[0].layers[0].shapes.push(group);
+                } else {
+                    line.transform = scale;
+                    doc.pages[0].layers[0].shapes.push(line);
+                }
+                let svg = page_to_svg(&doc, 0);
+                let shaft = svg
+                    .lines()
+                    .find(|line| line.contains("stroke-linecap=\"round\""))
+                    .expect("shaft");
+                let data = shaft.split(" d=\"").nth(1).expect("path");
+                let data = data.split('"').next().expect("path data");
+                let path = tracedraw_core::BezPath::from_svg(data).expect("valid shaft");
+                let head = svg
+                    .lines()
+                    .find(|line| line.contains("fill=\"#0000ff\" stroke=\"none\""))
+                    .expect("head");
+                let data = head.split(" d=\"").nth(1).expect("head path");
+                let data = data.split('"').next().expect("head path data");
+                let head = tracedraw_core::BezPath::from_svg(data).expect("valid head");
+                let cap = if scale_with_object { 3.0 } else { 1.0 };
+                let back = if grouped { 156.0 } else { 172.0 };
+                assert!((head.bounding_box().x0 - back).abs() < 0.001);
+                assert!((head.bounding_box().x1 - 180.0).abs() < 0.001);
+                assert!(
+                    (path.bounding_box().x1 + cap - head.bounding_box().x0).abs() < 0.001,
+                    "scaled cap meets the head ({scale_with_object}, {grouped}): {shaft}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shortening_an_arrow_shaft_preserves_the_open_curve_fill_and_paint_order() {
+        for behind in [false, true] {
+            let mut doc = Document::default();
+            doc.metadata.fill_open_curves = true;
+            let mut line = arrow_line();
+            let mut path = tracedraw_core::BezPath::new();
+            path.move_to((10.0, 50.0));
+            path.line_to((35.0, 60.0));
+            path.line_to((60.0, 50.0));
+            line.kind = ShapeKind::Path {
+                path,
+                closed: false,
+            };
+            line.fill = Fill::Solid(Color::rgb8(255, 0, 0));
+            line.stroke.as_mut().expect("stroke").behind_fill = behind;
+            line.opacity = 0.5;
+            doc.pages[0].layers[0].shapes.push(line);
+            let svg = page_to_svg(&doc, 0);
+            let fill = svg
+                .lines()
+                .find(|line| line.contains("fill=\"#ff0000\""))
+                .expect("fill");
+            assert!(fill.contains("d=\"M10 147L35 137L60 147\""), "{fill}");
+            assert!(fill.contains("stroke=\"none\""), "{fill}");
+            let shaft = svg
+                .lines()
+                .find(|line| line.contains("stroke-width=\"2\""))
+                .expect("shaft");
+            assert!(!shaft.contains("L60 147"), "{shaft}");
+            assert!(shaft.contains("fill=\"none\""), "{shaft}");
+            assert_eq!(svg.find(shaft) < svg.find(fill), behind, "{svg}");
+            assert_eq!(svg.matches("opacity=\"0.5\"").count(), 1, "{svg}");
+        }
     }
 
     /// #1210: a head sized to 200 % and moved 5 mm out past the end is

@@ -574,11 +574,17 @@ impl Writer<'_> {
                 let _ = writeln!(self.out, "[] 0 setdash");
             }
             let _ = writeln!(self.out, "{} setmiterlimit", f(s.miter_ratio()));
-            self.path_ops(&path);
+            let page_path = shape.page_path();
+            let shaft = tracedraw_core::arrowhead_shaft_path(
+                &page_path,
+                s,
+                crate::svg::shaft_width_scale(1.0, parent),
+            );
+            self.path_ops(&(parent * shaft.as_ref()));
             let _ = writeln!(self.out, "stroke");
             // Arrowheads (presets and custom): the page-space path already
             // carries the shape's own transform, so only the parent applies.
-            for head in tracedraw_core::arrowhead_paths(&shape.page_path(), s) {
+            for head in tracedraw_core::arrowhead_paths(&page_path, s) {
                 let _ = writeln!(self.out, "{}", color_op_with(s.color, self.inks));
                 self.path_ops(&(parent * head));
                 let _ = writeln!(self.out, "fill");
@@ -854,6 +860,52 @@ mod tests {
         let base = format!("{} {} m\n", f(52.0 * MM_PT), f(146.0 * MM_PT));
         assert!(eps.contains(&base), "custom head base corner: {eps}");
         assert!(eps.contains(&format!("{} {} l\n", f(60.0 * MM_PT), f(150.0 * MM_PT))));
+    }
+
+    #[test]
+    fn arrowhead_shafts_stop_before_the_tip_in_postscript_exports() {
+        for (cap, end) in [
+            (LineCap::Butt, 54.4),
+            (LineCap::Round, 53.4),
+            (LineCap::Square, 53.4),
+        ] {
+            let mut doc = Document::default();
+            let mut path = tracedraw_core::BezPath::new();
+            path.move_to((10.0, 50.0));
+            path.line_to((60.0, 50.0));
+            let mut line = Shape::new(
+                tracedraw_core::ShapeId(1),
+                ShapeKind::Path {
+                    path,
+                    closed: false,
+                },
+            );
+            line.fill = Fill::None;
+            line.stroke = Some(tracedraw_core::Stroke {
+                cap,
+                end_arrow: tracedraw_core::Arrowhead::Arrow,
+                ..tracedraw_core::Stroke::new(Color::BLACK, 2.0)
+            });
+            doc.pages[0].layers[0].shapes.push(line);
+            for output in [page_to_eps(&doc, 0), document_to_ps(&doc)] {
+                let shaft_end = format!("{} {} l\nstroke\n", f(end * MM_PT), f(50.0 * MM_PT));
+                assert!(output.contains(&shaft_end), "{cap:?}: {output}");
+                let full_line = format!("{} {} l\nstroke\n", f(60.0 * MM_PT), f(50.0 * MM_PT));
+                assert!(!output.contains(&full_line), "{output}");
+                let tip = format!("{} {} m\n", f(60.0 * MM_PT), f(50.0 * MM_PT));
+                assert!(
+                    output.contains(&tip),
+                    "head keeps the original endpoint: {output}"
+                );
+            }
+            let ai = crate::ai::page_to_ai8(&doc, 0);
+            let shaft_end = format!("{} {} L\nS\n", f(end * MM_PT), f(50.0 * MM_PT));
+            assert!(ai.contains(&shaft_end), "{cap:?}: {ai}");
+            let full_line = format!("{} {} L\nS\n", f(60.0 * MM_PT), f(50.0 * MM_PT));
+            assert!(!ai.contains(&full_line), "{ai}");
+            let tip = format!("{} {} m\n", f(60.0 * MM_PT), f(50.0 * MM_PT));
+            assert!(ai.contains(&tip), "head keeps the original endpoint: {ai}");
+        }
     }
 
     #[test]

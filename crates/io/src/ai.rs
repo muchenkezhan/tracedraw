@@ -592,7 +592,23 @@ impl Writer<'_> {
             let dash: Vec<String> = s.dash.iter().map(|d| f(d * unit)).collect();
             let _ = writeln!(self.out, "[{}] 0 d", dash.join(" "));
         }
-        if fill_color.is_some() || shape.stroke.is_some() {
+        let page_path = shape.page_path();
+        let shaft = shape.stroke.as_ref().map(|stroke| {
+            tracedraw_core::arrowhead_shaft_path(
+                &page_path,
+                stroke,
+                crate::svg::shaft_width_scale(1.0, parent),
+            )
+        });
+        if let Some(std::borrow::Cow::Owned(shaft)) = shaft {
+            // The open curve's fill keeps its original boundary. Only the
+            // line body stops at the endpoint symbols.
+            if fill_color.is_some() {
+                self.path_object(&subs, true, false, false);
+            }
+            let shaft = subpaths(&(parent * shaft));
+            self.path_object(&shaft, false, true, false);
+        } else if fill_color.is_some() || shape.stroke.is_some() {
             self.path_object(&subs, fill_color.is_some(), shape.stroke.is_some(), false);
         }
         if fountain_group {
@@ -601,7 +617,7 @@ impl Writer<'_> {
         if let Some(s) = &shape.stroke {
             // Arrowheads: the page path already carries the shape's own
             // transform, so only the parent applies.
-            for head in tracedraw_core::arrowhead_paths(&shape.page_path(), s) {
+            for head in tracedraw_core::arrowhead_paths(&page_path, s) {
                 self.line(&color_op(s.color, "k"));
                 let subs = subpaths(&(parent * head));
                 self.path_object(&subs, true, false, false);
@@ -614,6 +630,44 @@ impl Writer<'_> {
 mod tests {
     use super::*;
     use tracedraw_core::geometry::Rect;
+
+    #[test]
+    fn shortening_an_arrow_shaft_keeps_the_open_curve_fill() {
+        let mut doc = Document::default();
+        doc.metadata.fill_open_curves = true;
+        let mut path = BezPath::new();
+        path.move_to((10.0, 50.0));
+        path.line_to((35.0, 60.0));
+        path.line_to((60.0, 50.0));
+        let mut line = Shape::new(
+            tracedraw_core::ShapeId(1),
+            ShapeKind::Path {
+                path,
+                closed: false,
+            },
+        );
+        line.fill = Fill::Solid(Color::rgb8(255, 0, 0));
+        line.stroke = Some(tracedraw_core::Stroke {
+            end_arrow: tracedraw_core::Arrowhead::Triangle,
+            ..tracedraw_core::Stroke::new(Color::BLACK, 2.0)
+        });
+        doc.pages[0].layers[0].shapes.push(line);
+        let ai = page_to_ai8(&doc, 0);
+        let tip = format!("{} {} L\n", f(60.0 * MM_PT), f(50.0 * MM_PT));
+        assert!(
+            ai.contains(&format!("{tip}F\n")),
+            "original fill boundary: {ai}"
+        );
+        assert!(
+            !ai.contains(&format!("{tip}B\n")),
+            "fill and body are separate: {ai}"
+        );
+        assert!(
+            !ai.contains(&format!("{tip}S\n")),
+            "body stops before the tip: {ai}"
+        );
+        assert_eq!(ai.matches("\nS\n").count(), 1, "one shortened body: {ai}");
+    }
 
     fn rect_shape(id: u64, r: Rect) -> Shape {
         Shape::new(

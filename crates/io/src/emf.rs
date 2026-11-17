@@ -2865,9 +2865,29 @@ impl EmfWriter<'_> {
                     .iter()
                     .any(|(k, v)| k == "fill.rule" && v == "evenodd")
                     || !matches!(shape.kind, ShapeKind::Text { .. });
-                self.fill_and_stroke(&path, &shape.fill, shape.stroke.as_ref(), scale, even_odd);
                 if let Some(st) = &shape.stroke {
-                    for head in tracedraw_core::style::arrowhead_paths(&shape.page_path(), st) {
+                    let page_path = shape.page_path();
+                    let shaft = tracedraw_core::arrowhead_shaft_path(
+                        &page_path,
+                        st,
+                        crate::svg::shaft_width_scale(
+                            if st.scale_with_object { scale } else { 1.0 },
+                            parent,
+                        ),
+                    );
+                    if let std::borrow::Cow::Owned(shaft) = shaft {
+                        self.fill_and_stroke(&path, &shape.fill, None, scale, even_odd);
+                        self.fill_and_stroke(
+                            &(parent * shaft),
+                            &Fill::None,
+                            Some(st),
+                            scale,
+                            even_odd,
+                        );
+                    } else {
+                        self.fill_and_stroke(&path, &shape.fill, Some(st), scale, even_odd);
+                    }
+                    for head in tracedraw_core::style::arrowhead_paths(&page_path, st) {
                         self.fill_and_stroke(
                             &(parent * head),
                             &Fill::Solid(st.color),
@@ -2876,6 +2896,8 @@ impl EmfWriter<'_> {
                             false,
                         );
                     }
+                } else {
+                    self.fill_and_stroke(&path, &shape.fill, None, scale, even_odd);
                 }
             }
         }
@@ -2886,6 +2908,84 @@ impl EmfWriter<'_> {
 mod export_tests {
     use super::*;
     use tracedraw_core::{geometry::Rect, Document};
+
+    #[test]
+    fn metafile_arrowhead_shafts_stop_at_the_head_and_keep_the_original_fill() {
+        for head in [
+            tracedraw_core::Arrowhead::Arrow,
+            tracedraw_core::Arrowhead::CircleOpen,
+            tracedraw_core::Arrowhead::SquareOpen,
+            tracedraw_core::Arrowhead::TriangleOpen,
+        ] {
+            for cap in [LineCap::Butt, LineCap::Round, LineCap::Square] {
+                let mut doc = Document::new("t", Size::new(100.0, 50.0));
+                doc.metadata.fill_open_curves = true;
+                let mut path = BezPath::new();
+                path.move_to((10.0, 25.0));
+                path.line_to((35.0, 35.0));
+                path.line_to((60.0, 25.0));
+                let mut curve = Shape::new(
+                    doc.ids_mut().shape(),
+                    ShapeKind::Path {
+                        path,
+                        closed: false,
+                    },
+                );
+                curve.fill = Fill::Solid(Color::rgb8(255, 0, 0));
+                curve.stroke = Some(Stroke {
+                    cap,
+                    end_arrow: head.clone(),
+                    ..Stroke::new(Color::rgb8(0, 0, 255), 2.0)
+                });
+                let head_bounds = tracedraw_core::arrowhead_paths(
+                    &curve.page_path(),
+                    curve.stroke.as_ref().expect("stroke"),
+                )[0]
+                .bounding_box();
+                doc.pages[0].layers[0].shapes.push(curve);
+                for (format, bytes) in
+                    [("EMF", page_to_emf(&doc, 0)), ("WMF", page_to_wmf(&doc, 0))]
+                {
+                    let imported = parse(&bytes, &mut IdSource::default()).expect("re-read");
+                    assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+                    let shaft = imported
+                        .shapes
+                        .iter()
+                        .find(|shape| shape.stroke.is_some())
+                        .expect("shaft");
+                    let shaft_bounds = shaft.page_path().bounding_box();
+                    assert!((shaft_bounds.x0 - 10.0).abs() < 0.05, "{shaft_bounds:?}");
+                    assert!(
+                        shaft_bounds.x1 < 59.0,
+                        "{format} {head:?} {cap:?}: {shaft_bounds:?}"
+                    );
+                    let fill = imported
+                        .shapes
+                        .iter()
+                        .find(|shape| shape.fill == Fill::Solid(Color::rgb8(255, 0, 0)))
+                        .expect("original fill");
+                    assert!((fill.page_path().bounding_box().x1 - 60.0).abs() < 0.05);
+                    let head_shape = imported
+                        .shapes
+                        .iter()
+                        .find(|shape| shape.fill == Fill::Solid(Color::rgb8(0, 0, 255)))
+                        .expect("arrowhead fill");
+                    let actual = head_shape.page_path().bounding_box();
+                    for (actual, expected) in [
+                        (actual.x0, head_bounds.x0),
+                        (actual.y0, head_bounds.y0),
+                        (actual.x1, head_bounds.x1),
+                        (actual.y1, head_bounds.y1),
+                    ] {
+                        assert!(
+                            (actual - expected).abs() < 0.05,
+                            "{format} {head:?} keeps its original placement"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn bitmaps_round_trip_with_their_placement() {
@@ -3502,11 +3602,27 @@ impl WmfWriter<'_> {
                     Fill::None => None,
                     other => other.preview_color().or(Some(Color::Gray { v: 0.5 })),
                 };
-                self.fill_and_stroke(&path, fill, shape.stroke.as_ref(), scale, even_odd);
                 if let Some(st) = &shape.stroke {
-                    for head in tracedraw_core::style::arrowhead_paths(&shape.page_path(), st) {
+                    let page_path = shape.page_path();
+                    let shaft = tracedraw_core::arrowhead_shaft_path(
+                        &page_path,
+                        st,
+                        crate::svg::shaft_width_scale(
+                            if st.scale_with_object { scale } else { 1.0 },
+                            parent,
+                        ),
+                    );
+                    if let std::borrow::Cow::Owned(shaft) = shaft {
+                        self.fill_and_stroke(&path, fill, None, scale, even_odd);
+                        self.fill_and_stroke(&(parent * shaft), None, Some(st), scale, even_odd);
+                    } else {
+                        self.fill_and_stroke(&path, fill, Some(st), scale, even_odd);
+                    }
+                    for head in tracedraw_core::style::arrowhead_paths(&page_path, st) {
                         self.fill_and_stroke(&(parent * head), Some(st.color), None, 1.0, false);
                     }
+                } else {
+                    self.fill_and_stroke(&path, fill, None, scale, even_odd);
                 }
             }
         }

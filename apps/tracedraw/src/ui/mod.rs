@@ -10,6 +10,7 @@ pub mod ai_generate_docker;
 pub mod ai_ui;
 pub mod align_docker;
 pub mod arrowhead_editor;
+mod arrowhead_picker;
 pub mod bar_items;
 pub mod barcode_wizard;
 pub mod bars;

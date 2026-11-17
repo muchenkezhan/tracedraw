@@ -1540,79 +1540,88 @@ impl Renderer<'_> {
         if let Some(stroke) = &shape.stroke {
             let (mut paint, sk_stroke) = self.stroke_paint(stroke, transform);
             paint.blend_mode = self.blend_for(shape.overprint_outline);
-            if let Some(brush) = stroke.painterly.as_ref().filter(|_| !self.flags.wireframe) {
-                // Painterly brush: its marks, each with its own opacity.
-                let c = transform.as_coeffs();
-                let scale = if stroke.scale_with_object {
-                    ((c[0] * c[3] - c[1] * c[2]).abs()).sqrt().max(1e-6)
-                } else {
-                    1.0
-                };
-                let [r, g, b] = stroke.color.to_rgb8();
-                // A pen's pressure along the stroke sets the marks' width
-                // (#883).
-                for mark in tracedraw_core::painterly::marks_along(
-                    &page_path,
-                    stroke.width * scale,
-                    brush,
-                    &stroke.widths,
-                    stroke.width,
-                ) {
-                    let Some(mp) = to_sk_path(&(self.screen * mark.path)) else {
-                        continue;
-                    };
-                    paint.set_color_rgba8(r, g, b, (mark.alpha * 255.0).round() as u8);
-                    self.pixmap.fill_path(
-                        &mp,
-                        &paint,
-                        FillRule::Winding,
-                        Transform::identity(),
-                        None,
-                    );
-                }
-                return;
-            }
             let object_scale = if stroke.scale_with_object {
                 let c = transform.as_coeffs();
                 ((c[0] * c[3] - c[1] * c[2]).abs()).sqrt().max(1e-6)
             } else {
                 1.0
             };
-            if let Some(band) =
-                tracedraw_core::shaping::outline_band(&page_path, stroke, object_scale)
-            {
-                // Calligraphic nib or variable width: fill the band instead
-                // of stroking, with the outline's own fill when it has one.
-                if let Some(bp) = to_sk_path(&(self.screen * band.clone())) {
-                    match outline_paint(stroke, transform) {
-                        Some(fill) => {
-                            use tracedraw_core::geometry::Shape as _;
-                            let b = bbox(&band).to_path(0.01);
-                            self.draw_fill(&fill, &b, &bp, FillRule::Winding);
-                        }
-                        None => self.pixmap.fill_path(
-                            &bp,
+            let shaft = tracedraw_core::arrowhead_shaft_path(&page_path, stroke, object_scale);
+            let shaft_sk = if matches!(shaft, std::borrow::Cow::Owned(_)) {
+                to_sk_path(&(self.screen * shaft.as_ref().clone()))
+            } else {
+                None
+            };
+            let sk = shaft_sk.as_ref().unwrap_or(&sk);
+            if !shaft.elements().is_empty() {
+                if let Some(brush) = stroke.painterly.as_ref().filter(|_| !self.flags.wireframe) {
+                    // Painterly brush: its marks, each with its own opacity.
+                    let [r, g, b] = stroke.color.to_rgb8();
+                    // A pen's pressure along the stroke sets the marks' width
+                    // (#883).
+                    for mark in tracedraw_core::painterly::marks_along(
+                        &shaft,
+                        stroke.width * object_scale,
+                        brush,
+                        &stroke.widths,
+                        stroke.width,
+                    ) {
+                        let Some(mp) = to_sk_path(&(self.screen * mark.path)) else {
+                            continue;
+                        };
+                        paint.set_color_rgba8(r, g, b, (mark.alpha * 255.0).round() as u8);
+                        self.pixmap.fill_path(
+                            &mp,
                             &paint,
                             FillRule::Winding,
                             Transform::identity(),
                             None,
-                        ),
+                        );
+                    }
+                    paint.set_color(sk_color(stroke.color));
+                } else {
+                    if let Some(band) =
+                        tracedraw_core::shaping::outline_band(&shaft, stroke, object_scale)
+                    {
+                        // Calligraphic nib or variable width: fill the band instead
+                        // of stroking, with the outline's own fill when it has one.
+                        if let Some(bp) = to_sk_path(&(self.screen * band.clone())) {
+                            match outline_paint(stroke, transform) {
+                                Some(fill) => {
+                                    use tracedraw_core::geometry::Shape as _;
+                                    let b = bbox(&band).to_path(0.01);
+                                    self.draw_fill(&fill, &b, &bp, FillRule::Winding);
+                                }
+                                None => self.pixmap.fill_path(
+                                    &bp,
+                                    &paint,
+                                    FillRule::Winding,
+                                    Transform::identity(),
+                                    None,
+                                ),
+                            }
+                        }
+                    } else if let Some(fill) =
+                        outline_paint(stroke, transform).filter(|_| sk_stroke.width > 0.0)
+                    {
+                        // A filled outline: the stroke's area painted with the fill,
+                        // spread over the outline's bounds.
+                        if let Some(band) = sk.stroke(&sk_stroke, 1.0) {
+                            use tracedraw_core::geometry::Shape as _;
+                            let pad = (sk_stroke.width as f64 / self.zoom.max(1e-9)) / 2.0;
+                            let b = bbox(&page_path).inflate(pad, pad);
+                            self.draw_fill(&fill, &b.to_path(0.01), &band, FillRule::Winding);
+                        }
+                    } else {
+                        self.pixmap.stroke_path(
+                            sk,
+                            &paint,
+                            &sk_stroke,
+                            Transform::identity(),
+                            None,
+                        );
                     }
                 }
-            } else if let Some(fill) =
-                outline_paint(stroke, transform).filter(|_| sk_stroke.width > 0.0)
-            {
-                // A filled outline: the stroke's area painted with the fill,
-                // spread over the outline's bounds.
-                if let Some(band) = sk.stroke(&sk_stroke, 1.0) {
-                    use tracedraw_core::geometry::Shape as _;
-                    let pad = (sk_stroke.width as f64 / self.zoom.max(1e-9)) / 2.0;
-                    let b = bbox(&page_path).inflate(pad, pad);
-                    self.draw_fill(&fill, &b.to_path(0.01), &band, FillRule::Winding);
-                }
-            } else {
-                self.pixmap
-                    .stroke_path(&sk, &paint, &sk_stroke, Transform::identity(), None);
             }
             for head in tracedraw_core::style::arrowhead_paths(&page_path, stroke) {
                 if let Some(hp) = to_sk_path(&(self.screen * head)) {
@@ -3570,55 +3579,64 @@ fn paint_shown(
     } else {
         1.0
     };
-    if let Some(band) = tracedraw_core::shaping::outline_band(shown.path, stroke, object_scale) {
-        if let Some(bp) = to_sk_path(&(to_screen * band)) {
-            layer.fill_path(&bp, &paint, FillRule::Winding, Transform::identity(), clip);
-        }
+    let shaft = tracedraw_core::arrowhead_shaft_path(shown.path, stroke, object_scale);
+    let shaft_sk = if matches!(shaft, std::borrow::Cow::Owned(_)) {
+        to_sk_path(&(to_screen * shaft.as_ref().clone()))
     } else {
-        let c = to_screen.as_coeffs();
-        let px_per_mm = ((c[0] * c[3] - c[1] * c[2]).abs()).sqrt();
-        let hair = stroke.width <= Stroke::HAIRLINE + 1e-9 || !stroke.width.is_finite();
-        let true_px = if hair {
-            0.0
+        None
+    };
+    let sk = shaft_sk.as_ref().unwrap_or(&sk);
+    if !shaft.elements().is_empty() {
+        if let Some(band) = tracedraw_core::shaping::outline_band(&shaft, stroke, object_scale) {
+            if let Some(bp) = to_sk_path(&(to_screen * band)) {
+                layer.fill_path(&bp, &paint, FillRule::Winding, Transform::identity(), clip);
+            }
         } else {
-            (stroke.width * object_scale * px_per_mm) as f32
-        };
-        let dash = if stroke.dash.is_empty() {
-            None
-        } else {
-            // A dashed hairline keeps its dashes, as on the page (#2463).
-            let unit = if hair {
-                (Stroke::HAIRLINE * object_scale * px_per_mm) as f32
+            let c = to_screen.as_coeffs();
+            let px_per_mm = ((c[0] * c[3] - c[1] * c[2]).abs()).sqrt();
+            let hair = stroke.width <= Stroke::HAIRLINE + 1e-9 || !stroke.width.is_finite();
+            let true_px = if hair {
+                0.0
             } else {
-                true_px
-            }
-            .max(1.0);
-            let mut arr: Vec<f32> = stroke
-                .dash
-                .iter()
-                .map(|d| (*d as f32 * unit).max(0.01))
-                .collect();
-            if arr.len() % 2 == 1 {
-                arr = [arr.clone(), arr].concat();
-            }
-            StrokeDash::new(arr, 0.0)
-        };
-        let line = SkStroke {
-            width: true_px.clamp(1.0, MAX_REACH as f32),
-            miter_limit: stroke.miter_ratio() as f32,
-            line_cap: match stroke.cap {
-                LCap::Butt => LineCap::Butt,
-                LCap::Round => LineCap::Round,
-                LCap::Square => LineCap::Square,
-            },
-            line_join: match stroke.join {
-                LJoin::Miter => LineJoin::Miter,
-                LJoin::Round => LineJoin::Round,
-                LJoin::Bevel => LineJoin::Bevel,
-            },
-            dash,
-        };
-        layer.stroke_path(&sk, &paint, &line, Transform::identity(), clip);
+                (stroke.width * object_scale * px_per_mm) as f32
+            };
+            let dash = if stroke.dash.is_empty() {
+                None
+            } else {
+                // A dashed hairline keeps its dashes, as on the page (#2463).
+                let unit = if hair {
+                    (Stroke::HAIRLINE * object_scale * px_per_mm) as f32
+                } else {
+                    true_px
+                }
+                .max(1.0);
+                let mut arr: Vec<f32> = stroke
+                    .dash
+                    .iter()
+                    .map(|d| (*d as f32 * unit).max(0.01))
+                    .collect();
+                if arr.len() % 2 == 1 {
+                    arr = [arr.clone(), arr].concat();
+                }
+                StrokeDash::new(arr, 0.0)
+            };
+            let line = SkStroke {
+                width: true_px.clamp(1.0, MAX_REACH as f32),
+                miter_limit: stroke.miter_ratio() as f32,
+                line_cap: match stroke.cap {
+                    LCap::Butt => LineCap::Butt,
+                    LCap::Round => LineCap::Round,
+                    LCap::Square => LineCap::Square,
+                },
+                line_join: match stroke.join {
+                    LJoin::Miter => LineJoin::Miter,
+                    LJoin::Round => LineJoin::Round,
+                    LJoin::Bevel => LineJoin::Bevel,
+                },
+                dash,
+            };
+            layer.stroke_path(&sk, &paint, &line, Transform::identity(), clip);
+        }
     }
     for head in tracedraw_core::style::arrowhead_paths(shown.path, stroke) {
         if let Some(hp) = to_sk_path(&(to_screen * head)) {
@@ -6989,7 +7007,9 @@ mod tests {
         };
         blue(53, 48);
         blue(53, 52);
-        blue(58, 50);
+        // Sample inside the head. Near the tip its antialiased edge must
+        // remain visible instead of being covered by the full-width body.
+        blue(57, 50);
         // Beside the line, before the head, there is nothing.
         assert_eq!(px(&pm, 40, 47), (255, 255, 255));
         // Beyond the tip, nothing either.
@@ -7004,6 +7024,70 @@ mod tests {
         let pm2 = render_page_image(&plain, page, 25.4).unwrap();
         assert_eq!(px(&pm2, 53, 48), (255, 255, 255));
         assert_eq!(px(&pm2, 53, 52), (255, 255, 255));
+    }
+
+    #[test]
+    fn arrowhead_shafts_stay_behind_the_tip_and_out_of_hollow_heads() {
+        use tracedraw_core::Arrowhead;
+        for cap in [LCap::Butt, LCap::Round, LCap::Square] {
+            for head in Arrowhead::ALL.iter().skip(1) {
+                let mut path = BezPath::new();
+                path.move_to((20.0, 50.0));
+                path.line_to((80.0, 50.0));
+                let mut line = Shape::new(
+                    ShapeId(1),
+                    ShapeKind::Path {
+                        path,
+                        closed: false,
+                    },
+                );
+                line.fill = Fill::None;
+                line.stroke = Some(Stroke {
+                    cap,
+                    start_arrow: head.clone(),
+                    end_arrow: head.clone(),
+                    ..Stroke::new(Color::BLACK, 2.0)
+                });
+                let heads = tracedraw_core::arrowhead_paths(
+                    &line.page_path(),
+                    line.stroke.as_ref().expect("line stroke"),
+                );
+                let reference: Vec<_> = heads
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, path)| {
+                        let mut shape = Shape::new(
+                            ShapeId(i as u64 + 2),
+                            ShapeKind::Path { path, closed: true },
+                        );
+                        shape.fill = Fill::Solid(Color::BLACK);
+                        shape.stroke = None;
+                        shape
+                    })
+                    .collect();
+                let (reference, reference_page) = doc_with(reference);
+                let reference =
+                    render_page_image(&reference, reference_page, 254.0).expect("head reference");
+                let (doc, page) = doc_with(vec![line]);
+                let image = render_page_image(&doc, page, 254.0).expect("arrowhead image");
+                // Compare to the actual head silhouette, including rounded
+                // tips, so only a protruding body changes these pixels.
+                for x in (192..208).chain(792..808) {
+                    for y in 488..512 {
+                        assert!(
+                            px(&image, x, y).0.abs_diff(px(&reference, x, y).0) <= 2,
+                            "shaft beside tip: {head:?}, {cap:?}, ({x}, {y})"
+                        );
+                    }
+                }
+                if *head == Arrowhead::CircleOpen {
+                    for x in [232, 768] {
+                        assert!(px(&image, x, 500).0 > 245, "shaft crosses hole: {cap:?}");
+                    }
+                }
+                assert!(px(&image, 500, 500).0 < 10, "shaft remains visible");
+            }
+        }
     }
 
     /// A symmetry's mirrored copy is as see-through as the object (#2121):

@@ -2537,65 +2537,50 @@ pub fn outline_part(app: &mut App, ui: &mut Ui) {
         } else {
             StrokeField::EndArrow
         });
-        crate::ui::keynav::ComboBox::from_id_salt(if start {
-            "arrow_start_bar"
-        } else {
-            "arrow_end_bar"
-        })
-        .selected_text(if shown {
-            arrow_label(&current)
-        } else {
-            String::new()
-        })
-        .width(56.0)
-        .show_ui(ui, |ui| {
-            for a in tracedraw_core::Arrowhead::ALL {
-                if ui
-                    .selectable_label(shown && current == a, arrow_label(&a))
-                    .clicked()
-                {
-                    if defaults {
-                        let mut st = stroke.clone().unwrap_or_default();
+        if let Some(a) = arrow_picker(
+            ui,
+            if start {
+                "arrow_start_bar"
+            } else {
+                "arrow_end_bar"
+            },
+            &current,
+            shown,
+            start,
+            &app.settings.custom_arrowheads,
+        ) {
+            if defaults {
+                let mut st = stroke.clone().unwrap_or_default();
+                if start {
+                    st.start_arrow = a.clone();
+                } else {
+                    st.end_arrow = a.clone();
+                }
+                app.request_default_change(crate::defaults::DefaultChange::Outline(Some(st)));
+            } else {
+                // Each object (each one in a group too) keeps the
+                // rest of its own outline.
+                let cmds: Vec<Command> = app
+                    .paint_targets()
+                    .iter()
+                    .filter_map(|s| {
+                        let mut st = s.stroke.clone()?;
                         if start {
                             st.start_arrow = a.clone();
                         } else {
                             st.end_arrow = a.clone();
                         }
-                        app.request_default_change(crate::defaults::DefaultChange::Outline(Some(
-                            st,
-                        )));
-                        continue;
-                    }
-                    // Each object (each one in a group too) keeps the
-                    // rest of its own outline.
-                    let cmds: Vec<Command> = app
-                        .paint_targets()
-                        .iter()
-                        .filter_map(|s| {
-                            let mut st = s.stroke.clone()?;
-                            if start {
-                                st.start_arrow = a.clone();
-                            } else {
-                                st.end_arrow = a.clone();
-                            }
-                            Some(Command::SetStroke {
-                                shapes: vec![s.id],
-                                stroke: Some(st),
-                            })
+                        Some(Command::SetStroke {
+                            shapes: vec![s.id],
+                            stroke: Some(st),
                         })
-                        .collect();
-                    if let Err(e) = app.engine.run_batch("Arrowheads", &cmds) {
-                        app.status = e.to_string();
-                    }
+                    })
+                    .collect();
+                if let Err(e) = app.engine.run_batch("Arrowheads", &cmds) {
+                    app.status = e.to_string();
                 }
             }
-        })
-        .response
-        .rich_tip(crate::ui::tips::keyed(if start {
-            "toolbar.start_arrow"
-        } else {
-            "toolbar.end_arrow"
-        }));
+        }
     }
 }
 
@@ -2628,19 +2613,20 @@ pub(crate) fn dash_label(d: &[f64]) -> String {
     s
 }
 
-fn arrow_label(a: &tracedraw_core::Arrowhead) -> String {
-    use tracedraw_core::Arrowhead as A;
-    match a {
-        A::None => "\u{2015}".into(),
-        A::Arrow => "\u{2015}\u{25B6}".into(),
-        A::OpenArrow => "\u{2015}>".into(),
-        A::Circle => "\u{2015}\u{23FA}".into(),
-        A::Square => "\u{2015}\u{25A0}".into(),
-        A::Bar => "\u{2015}|".into(),
-        A::Diamond => "\u{2015}\u{2666}".into(),
-        A::Custom { name, .. } => name.clone(),
-    }
+fn arrow_picker(
+    ui: &mut Ui,
+    id: &str,
+    current: &tracedraw_core::Arrowhead,
+    shown: bool,
+    start: bool,
+    custom: &[tracedraw_core::Arrowhead],
+) -> Option<tracedraw_core::Arrowhead> {
+    crate::ui::arrowhead_picker::show(ui, id, current, shown, start, custom)
 }
+
+#[cfg(test)]
+#[path = "propbar/arrow_tests.rs"]
+mod arrow_tests;
 
 // ----- shape parts ------------------------------------------------------
 
