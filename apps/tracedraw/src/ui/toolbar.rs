@@ -682,7 +682,7 @@ pub(crate) fn draw_item(app: &mut App, ui: &mut Ui, bar: &str, id: &str) {
             )
             .clicked()
             {
-                app.fullscreen_preview = true;
+                super::preview::begin(app, ui.ctx(), false);
             }
         }
         "rulers" => {

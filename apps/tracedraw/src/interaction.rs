@@ -5121,7 +5121,7 @@ impl App {
         // its own F9 and close at once; while it shows, its F9 closes it.
         if !self.fullscreen_preview && first_pressed(Key::F9, Modifiers::NONE) {
             ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F9));
-            self.fullscreen_preview = true;
+            crate::ui::preview::begin(self, ctx, false);
         }
         // F11: the Edit Fill dialog. F3: zoom out.
         if pressed(Key::F11, Modifiers::NONE) {

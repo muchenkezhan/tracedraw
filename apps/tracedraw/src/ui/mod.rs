@@ -433,8 +433,11 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     keep_tab_on_the_drawing(app, &ctx);
     // The menu bar and an open menu or list take their keys first, so
     // that the arrows never nudge the drawing then (#1839).
-    keynav::frame(&ctx, app.shortcut_editor.capture.is_some());
-    app.keyboard(&ctx);
+    // The preview owns its keys until it returns to the drawing.
+    if !app.fullscreen_preview {
+        keynav::frame(&ctx, app.shortcut_editor.capture.is_some());
+        app.keyboard(&ctx);
+    }
     // A menu command run by a shortcut of the user's.
     if let Some(cmd) = app.pending_command.take() {
         if !menus::run_command(app, &ctx, &cmd) {

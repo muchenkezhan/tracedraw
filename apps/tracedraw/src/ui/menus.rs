@@ -3000,7 +3000,7 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
     }
     sep(ui);
     if item(ui, "menu.view.fullscreen_preview", "F9", true) {
-        app.fullscreen_preview = true;
+        super::preview::begin(app, ui.ctx(), false);
     }
     if item(
         ui,
@@ -3008,8 +3008,7 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
         "",
         !app.selection.is_empty(),
     ) {
-        app.preview_selected_only = true;
-        app.fullscreen_preview = true;
+        super::preview::begin(app, ui.ctx(), true);
     }
     if check(ui, "menu.view.page_sorter", "", app.page_sorter) {
         app.page_sorter = !app.page_sorter;
