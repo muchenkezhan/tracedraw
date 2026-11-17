@@ -40,8 +40,8 @@
 
 - Default (Options > Tools > Default action for mouse wheel: Zoom): the
   wheel zooms by the zoom step per notch about the pointer, in a glide
-  over a few frames, not in one jump; Ctrl+wheel scrolls vertically;
-  Alt+wheel scrolls horizontally (#766,
+  over a few frames, not in one jump; Shift+wheel scrolls horizontally;
+  Alt+wheel scrolls vertically (#3087, #766,
   `pick_drag_tests::a_wheel_notch_zooms_in_a_glide`).
 - Zoom step (Options > Tools > Zoom/Pan > Zoom per wheel notch, #895):
   1 to 100 %, 15 % at first (a factor of 1.15 a notch). A notch is a line of the
@@ -74,8 +74,14 @@
   (`raster::tests::light_zoom_renders_once_when_the_zoom_stops`,
   `pick_drag_tests::light_zoom_draws_once_per_wheel_turn`).
 - With the Scroll setting: the wheel scrolls vertically; Shift+wheel
-  scrolls horizontally; Ctrl+wheel zooms.
-- A trackpad pinch zooms by the gesture's factor with either setting.
+  scrolls horizontally and Alt+wheel vertically; Ctrl+wheel zooms.
+- The pan direction stays the same through the smoothed frames after
+  the modifier key is released. Turning on Center mouse when zooming
+  does not recenter the view during these pan gestures.
+- Shaping brushes keep their nib-size shortcuts ahead of canvas panning:
+  Shift+wheel with the Zoom setting, Alt+wheel with the Scroll setting.
+- Ctrl+wheel (Cmd+wheel on macOS) and a trackpad pinch zoom with either
+  setting.
 - On a touch screen two fingers pan the view and a pinch zooms, with any
   tool (the first finger's drag is dropped).
 

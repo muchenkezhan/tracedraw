@@ -996,6 +996,52 @@ fn smooth_wheel_notch(unit: egui::MouseWheelUnit, line_speed: f32, height: f32, 
     points.max(1.0)
 }
 
+/// Keep a canvas wheel gesture's modifiers through its smoothed frames.
+/// Trackpad moves retain modifiers until the gesture ends, as egui does.
+fn canvas_wheel_modifiers(ctx: &egui::Context) -> egui::Modifiers {
+    let id = egui::Id::new("canvas_wheel_modifiers");
+    let previous = ctx
+        .data(|d| d.get_temp::<(egui::Modifiers, bool)>(id))
+        .unwrap_or_default();
+    let state = ctx.input(|input| {
+        if !input.is_scrolling() {
+            return (egui::Modifiers::NONE, false);
+        }
+        let (mut modifiers, mut in_touch) = previous;
+        for event in &input.events {
+            if let egui::Event::MouseWheel {
+                phase,
+                modifiers: latest,
+                ..
+            } = event
+            {
+                match phase {
+                    egui::TouchPhase::Start => {
+                        modifiers = *latest;
+                        in_touch = true;
+                    }
+                    egui::TouchPhase::Move => {
+                        if in_touch {
+                            modifiers |= *latest;
+                        } else {
+                            modifiers = *latest;
+                        }
+                    }
+                    egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                        modifiers = egui::Modifiers::NONE;
+                        in_touch = false;
+                    }
+                }
+            }
+        }
+        (modifiers, in_touch)
+    });
+    if state != previous {
+        ctx.data_mut(|d| d.insert_temp(id, state));
+    }
+    state.0
+}
+
 /// The active drawing's window in `full`: rulers, the canvas with its
 /// tools, scrollbars, the page tabs and the navigator.
 pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
@@ -1027,9 +1073,9 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
     let painter = ui.painter_at(canvas_rect);
 
     // Wheel: with the default setting the wheel zooms about the
-    // pointer, Ctrl+wheel scrolls vertically and Alt+wheel
-    // horizontally; with the scroll setting the wheel scrolls,
-    // Shift+wheel horizontally and Ctrl+wheel zooms. Pinch zooms.
+    // pointer, Shift+wheel scrolls horizontally and Alt+wheel vertically.
+    // With the scroll setting the wheel scrolls and Ctrl+wheel zooms.
+    // Pinch and Ctrl/Cmd+wheel zoom with either setting.
     // Edit Fill and Outline Pen leave the wheel to the drawing outside
     // them, so it can be zoomed to see the change; nothing else of the
     // drawing takes the pointer meanwhile (#1035). So does a bitmap
@@ -1042,6 +1088,7 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
     ) && ui.ctx().pointer_hover_pos().is_some_and(|p| {
         canvas_rect.contains(p) && crate::ui::chrome::over_modal_blocker(ui.ctx(), p)
     });
+    let mods = canvas_wheel_modifiers(ui.ctx());
     if response.hovered() || wheel_through_dialog {
         let line = ui.ctx().options(|o| o.input_options.line_scroll_speed);
         let height = ui.ctx().content_rect().height();
@@ -1051,7 +1098,7 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
         // egui leaves unsmoothed) apply at once.
         let mut zoom_glide_notches = 0.0f32;
         let mut zoom_now_notches = 0.0f32;
-        let (scroll, notches, any_notches, zoom_delta, mods) = ui.input(|i| {
+        let (scroll, notches, any_notches, zoom_delta) = ui.input(|i| {
             // Wheel notches this frame (the smoothed delta is spread
             // over several frames, so the zoom steps come from the
             // raw events).
@@ -1088,13 +1135,7 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
                     _ => 0.0,
                 })
                 .sum();
-            (
-                i.smooth_scroll_delta,
-                notches,
-                any_notches,
-                i.zoom_delta(),
-                i.modifiers,
-            )
+            (i.smooth_scroll_delta, notches, any_notches, i.zoom_delta())
         });
         let hover = response.hover_pos().or_else(|| {
             wheel_through_dialog
@@ -1105,6 +1146,7 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
         // scrolls) sizes its nib, and neither zooms nor scrolls.
         let brush_wheel = response.hovered()
             && app.tool.is_shaping_brush()
+            && zoom_delta == 1.0
             && crate::brushes::wheel_resizes(app.settings.wheel_zooms, mods);
         if brush_wheel {
             app.brush_wheel(any_notches);
@@ -1118,9 +1160,9 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
             // to the middle of the view, and the pointer with it, and the
             // zoom (its whole glide) goes about the middle.
             let wheel_zooms = if app.settings.wheel_zooms {
-                !mods.alt && !mods.ctrl
+                !mods.shift && !mods.alt
             } else {
-                mods.ctrl
+                mods.ctrl || mods.command
             };
             let anchor = if app.settings.wheel_zoom_centers && zoom_delta == 1.0 && wheel_zooms {
                 let center = canvas_rect.center();
@@ -1138,11 +1180,12 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
             if zoom_delta != 1.0 {
                 app.view.zoom_at(h, zoom_delta);
             } else if app.settings.wheel_zooms {
-                if mods.alt && scroll != egui::Vec2::ZERO {
-                    app.view.pan(egui::vec2(scroll.y, scroll.x));
-                } else if mods.ctrl && scroll != egui::Vec2::ZERO {
-                    app.view.pan(scroll);
-                } else if !mods.shift && (zoom_glide_notches != 0.0 || zoom_now_notches != 0.0) {
+                if mods.shift || mods.alt {
+                    // egui has already applied the modifier's axis.
+                    if scroll != egui::Vec2::ZERO {
+                        app.view.pan(scroll);
+                    }
+                } else if zoom_glide_notches != 0.0 || zoom_now_notches != 0.0 {
                     // A notch zooms in one glide over a few frames instead
                     // of one jump; its frames multiply to the step a
                     // notch (#766), in the browser too (#1016). The glide
@@ -1166,11 +1209,7 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
             } else if mods.ctrl && notches != 0.0 {
                 app.view.zoom_at(anchor, zoom_factor);
             } else if scroll != egui::Vec2::ZERO {
-                app.view.pan(if mods.shift {
-                    egui::vec2(scroll.y, scroll.x)
-                } else {
-                    scroll
-                });
+                app.view.pan(scroll);
             }
         }
     }

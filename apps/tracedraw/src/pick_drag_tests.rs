@@ -16,6 +16,9 @@ use tracedraw_core::{ShapeId, ShapeKind};
 #[path = "field_focus_tests.rs"]
 mod field_focus_tests;
 
+#[path = "wheel_navigation_tests.rs"]
+mod wheel_navigation_tests;
+
 fn frame(ctx: &egui::Context, app: &mut App, events: Vec<Event>, modifiers: Modifiers) {
     // The keys held come first, as the windowing layer sends them.
     let mut all = vec![Event::ModifiersChanged(modifiers)];

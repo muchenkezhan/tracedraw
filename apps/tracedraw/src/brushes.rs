@@ -90,9 +90,9 @@ pub struct BrushResize {
 }
 
 /// Whether the wheel turned with `mods` sizes the nib: with Shift while
-/// the wheel zooms (Shift+wheel does nothing else then), with Alt while
-/// the wheel scrolls (Shift+wheel scrolls sideways then, Alt+wheel
-/// nothing else). Ctrl keeps its zoom or scroll.
+/// the wheel zooms, with Alt while the wheel scrolls. The brushes reserve
+/// these shortcuts for nib sizing before the canvas handles panning.
+/// Ctrl keeps its zoom.
 pub fn wheel_resizes(wheel_zooms: bool, mods: Modifiers) -> bool {
     let ctrl = mods.ctrl || mods.command;
     if wheel_zooms {
