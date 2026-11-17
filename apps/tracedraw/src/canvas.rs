@@ -4437,10 +4437,12 @@ mod tests {
                                 };
                                 let pieces = if m.is_curved() { 8 } else { 1 };
                                 let line = |r, c, across| {
-                                    let edge = s.transform * m.edge(r, c, across).expect("edge");
+                                    let edge = m.edge(r, c, across).expect("edge");
                                     let points = (0..=pieces)
                                         .map(|i| {
-                                            view.to_screen(edge.eval(i as f64 / pieces as f64))
+                                            view.to_screen(
+                                                s.transform * edge.eval(i as f64 / pieces as f64),
+                                            )
                                         })
                                         .collect();
                                     ui.painter().add(egui::Shape::line(
