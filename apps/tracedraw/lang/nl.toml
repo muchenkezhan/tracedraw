@@ -2373,7 +2373,7 @@ menu.edit.delete = "Verwijderen"
 menu.edit.duplicate = "Dupliceren"
 menu.edit.find_and_replace = "Zoeken en vervangen"
 menu.edit.paste = "Plakken"
-menu.edit.paste_in_view = "Plakken in weergave"
+menu.edit.paste_in_view = "Plakken bij aanwijzer"
 menu.edit.paste_special = "Plakken speciaal..."
 menu.edit.redo = "Opnieuw"
 menu.edit.repeat = "Herhalen"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "Midden" # mt
 docker.bevel_center_desc = "De afschuiningsband half binnen en half buiten de omtrek." # mt
 docker.bevel_smooth_light = "Zacht licht" # mt
 docker.bevel_smooth_light_desc = "Het licht valt naar richting rond de rand, elk deel zo licht als het naar het licht kijkt, in plaats van twee helften." # mt
+
+status.pasting = "Bezig met plakken..."
+
+status.clipboard_failed = "Kan niet plakken vanuit het klembord: {e}"

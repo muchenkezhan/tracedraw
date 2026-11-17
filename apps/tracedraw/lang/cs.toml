@@ -2373,7 +2373,7 @@ menu.edit.delete = "Odstranit"
 menu.edit.duplicate = "Duplikovat"
 menu.edit.find_and_replace = "Najít a nahradit"
 menu.edit.paste = "Vložit"
-menu.edit.paste_in_view = "Vložit do zobrazení"
+menu.edit.paste_in_view = "Vložit u ukazatele"
 menu.edit.paste_special = "Vložit jinak..."
 menu.edit.redo = "Znovu"
 menu.edit.repeat = "Opakovat"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "Střed" # mt
 docker.bevel_center_desc = "Pás zkosení napůl uvnitř a napůl vně obrysu." # mt
 docker.bevel_smooth_light = "Měkké světlo" # mt
 docker.bevel_smooth_light_desc = "Světlo dopadá kolem okraje podle směru, každá část tak světlá, jak je natočena ke světlu, místo dvou polovin." # mt
+
+status.pasting = "Vkládání..."
+
+status.clipboard_failed = "Nelze vložit ze schránky: {e}"

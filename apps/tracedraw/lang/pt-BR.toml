@@ -2373,7 +2373,7 @@ menu.edit.delete = "Excluir"
 menu.edit.duplicate = "Duplicar"
 menu.edit.find_and_replace = "Localizar e substituir"
 menu.edit.paste = "Colar"
-menu.edit.paste_in_view = "Colar na visualização"
+menu.edit.paste_in_view = "Colar no ponteiro"
 menu.edit.paste_special = "Colar especial..."
 menu.edit.redo = "Refazer"
 menu.edit.repeat = "Repetir"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "Centro" # mt
 docker.bevel_center_desc = "A faixa do bisel metade dentro e metade fora do contorno." # mt
 docker.bevel_smooth_light = "Luz suave" # mt
 docker.bevel_smooth_light_desc = "A luz cai ao redor da borda pela direção, cada parte tão iluminada quanto está voltada para a luz, em vez de duas metades." # mt
+
+status.pasting = "Colando..."
+
+status.clipboard_failed = "Não foi possível colar da área de transferência: {e}"

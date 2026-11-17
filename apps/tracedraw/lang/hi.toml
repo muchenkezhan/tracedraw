@@ -2373,7 +2373,7 @@ menu.edit.delete = "हटाएँ"
 menu.edit.duplicate = "डुप्लिकेट"
 menu.edit.find_and_replace = "खोजें और बदलें"
 menu.edit.paste = "पेस्ट"
-menu.edit.paste_in_view = "दृश्य में पेस्ट करें"
+menu.edit.paste_in_view = "पॉइंटर पर चिपकाएँ"
 menu.edit.paste_special = "विशेष पेस्ट..."
 menu.edit.redo = "फिर से करें"
 menu.edit.repeat = "दोहराएँ"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "केंद्र" # mt
 docker.bevel_center_desc = "बेवल पट्टी आधी आउटलाइन के अंदर और आधी बाहर।" # mt
 docker.bevel_smooth_light = "कोमल प्रकाश" # mt
 docker.bevel_smooth_light_desc = "प्रकाश दिशा के अनुसार किनारे के चारों ओर पड़ता है, हर भाग उतना रोशन जितना वह प्रकाश की ओर है, दो हिस्सों के बजाय।" # mt
+
+status.pasting = "चिपकाया जा रहा है..."
+
+status.clipboard_failed = "क्लिपबोर्ड से चिपकाया नहीं जा सका: {e}"

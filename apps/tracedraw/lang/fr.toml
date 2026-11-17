@@ -2373,7 +2373,7 @@ menu.edit.delete = "Supprimer"
 menu.edit.duplicate = "Dupliquer"
 menu.edit.find_and_replace = "Rechercher et remplacer"
 menu.edit.paste = "Coller"
-menu.edit.paste_in_view = "Coller dans la vue"
+menu.edit.paste_in_view = "Coller au pointeur"
 menu.edit.paste_special = "Collage spécial..."
 menu.edit.redo = "Rétablir"
 menu.edit.repeat = "Répéter"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "Centre" # mt
 docker.bevel_center_desc = "La bande du biseau moitié à l'intérieur, moitié à l'extérieur du contour." # mt
 docker.bevel_smooth_light = "Lumière douce" # mt
 docker.bevel_smooth_light_desc = "La lumière tombe autour du bord selon la direction, chaque partie aussi éclairée qu'elle fait face à la lumière, au lieu de deux moitiés." # mt
+
+status.pasting = "Collage en cours..."
+
+status.clipboard_failed = "Impossible de coller depuis le presse-papiers : {e}"

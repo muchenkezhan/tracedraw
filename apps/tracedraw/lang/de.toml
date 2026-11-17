@@ -2373,7 +2373,7 @@ menu.edit.delete = "Löschen"
 menu.edit.duplicate = "Duplizieren"
 menu.edit.find_and_replace = "Suchen und ersetzen"
 menu.edit.paste = "Einfügen"
-menu.edit.paste_in_view = "In Ansicht einfügen"
+menu.edit.paste_in_view = "Am Mauszeiger einfügen"
 menu.edit.paste_special = "Inhalte einfügen..."
 menu.edit.redo = "Wiederherstellen"
 menu.edit.repeat = "Wiederholen"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "Mitte" # mt
 docker.bevel_center_desc = "Das Abschrägungsband halb innerhalb, halb außerhalb der Kontur." # mt
 docker.bevel_smooth_light = "Weiches Licht" # mt
 docker.bevel_smooth_light_desc = "Das Licht fällt nach Richtung um die Kante, jeder Teil so hell, wie er zum Licht zeigt, statt zwei Hälften." # mt
+
+status.pasting = "Einfügen..."
+
+status.clipboard_failed = "Einfügen aus der Zwischenablage nicht möglich: {e}"

@@ -2373,7 +2373,7 @@ menu.edit.delete = "Sil"
 menu.edit.duplicate = "Çoğalt"
 menu.edit.find_and_replace = "Bul ve Değiştir"
 menu.edit.paste = "Yapıştır"
-menu.edit.paste_in_view = "Görünüme Yapıştır"
+menu.edit.paste_in_view = "İşaretçide Yapıştır"
 menu.edit.paste_special = "Özel Yapıştır..."
 menu.edit.redo = "Yinele"
 menu.edit.repeat = "Tekrarla"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "Orta" # mt
 docker.bevel_center_desc = "Eğim bandı yarısı içte, yarısı dışta." # mt
 docker.bevel_smooth_light = "Yumuşak ışık" # mt
 docker.bevel_smooth_light_desc = "Işık kenar boyunca yöne göre düşer, her parça ışığa baktığı kadar aydınlık, iki yarı yerine." # mt
+
+status.pasting = "Yapıştırılıyor..."
+
+status.clipboard_failed = "Panodan yapıştırılamadı: {e}"

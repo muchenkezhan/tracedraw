@@ -2373,7 +2373,7 @@ menu.edit.delete = "删除"
 menu.edit.duplicate = "再制副本"
 menu.edit.find_and_replace = "查找和替换"
 menu.edit.paste = "粘贴"
-menu.edit.paste_in_view = "粘贴到视图中"
+menu.edit.paste_in_view = "粘贴到鼠标位置"
 menu.edit.paste_special = "选择性粘贴..."
 menu.edit.redo = "重做"
 menu.edit.repeat = "重复"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "居中" # mt
 docker.bevel_center_desc = "斜角带一半在轮廓内、一半在轮廓外。" # mt
 docker.bevel_smooth_light = "柔和光线" # mt
 docker.bevel_smooth_light_desc = "光线按方向落在边缘四周，每部分的亮度取决于它朝向光的程度，而不是分成两半。" # mt
+
+status.pasting = "正在粘贴..."
+
+status.clipboard_failed = "无法从剪贴板粘贴：{e}"

@@ -2373,7 +2373,7 @@ menu.edit.delete = "حذف"
 menu.edit.duplicate = "تكرار النسخ"
 menu.edit.find_and_replace = "بحث واستبدال"
 menu.edit.paste = "لصق"
-menu.edit.paste_in_view = "لصق في العرض"
+menu.edit.paste_in_view = "لصق عند المؤشر"
 menu.edit.paste_special = "لصق خاص..."
 menu.edit.redo = "إعادة"
 menu.edit.repeat = "تكرار"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "المنتصف" # mt
 docker.bevel_center_desc = "شريط الحافة المشطوفة نصفه داخل الحد ونصفه خارجه." # mt
 docker.bevel_smooth_light = "ضوء ناعم" # mt
 docker.bevel_smooth_light_desc = "يسقط الضوء حول الحافة حسب الاتجاه، كل جزء مضاء بقدر مواجهته للضوء، بدل نصفين." # mt
+
+status.pasting = "جارٍ اللصق..."
+
+status.clipboard_failed = "تعذر اللصق من الحافظة: {e}"

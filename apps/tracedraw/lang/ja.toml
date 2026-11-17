@@ -2373,7 +2373,7 @@ menu.edit.delete = "削除"
 menu.edit.duplicate = "複製"
 menu.edit.find_and_replace = "検索と置換"
 menu.edit.paste = "貼り付け"
-menu.edit.paste_in_view = "表示位置に貼り付け"
+menu.edit.paste_in_view = "ポインターの位置に貼り付け"
 menu.edit.paste_special = "形式を選択して貼り付け..."
 menu.edit.redo = "やり直し"
 menu.edit.repeat = "繰り返し"
@@ -9129,3 +9129,7 @@ docker.bevel_center = "中央" # mt
 docker.bevel_center_desc = "ベベルの帯を輪郭の内側と外側に半分ずつ置きます。" # mt
 docker.bevel_smooth_light = "やわらかい光" # mt
 docker.bevel_smooth_light_desc = "光が方向に応じて縁の周りに当たり、各部分は光に向いている分だけ明るくなります (二分割ではなく)。" # mt
+
+status.pasting = "貼り付け中..."
+
+status.clipboard_failed = "クリップボードから貼り付けできませんでした: {e}"
