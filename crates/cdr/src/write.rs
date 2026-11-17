@@ -188,6 +188,10 @@ pub fn document_to_cdr_version_with(doc: &Document, version: u16, previews: &Pre
     if let Some(b) = crate::kept_effects::encode(&w.effects) {
         own.push((crate::kept_effects::MEMBER, b));
     }
+    // Object data, a clone's link to its master among it (#2879).
+    if let Some(b) = crate::kept_data::encode(doc, &w.static_ids) {
+        own.push((crate::kept_data::MEMBER, b));
+    }
     let out = if v.redirects() {
         let (root, files) = pack_redirected(v, &tree);
         zip_v16(
@@ -3151,10 +3155,16 @@ fn curve_coords_typed(
             PathEl::LineTo(p) => {
                 // A line of no length (a file of an earlier version read
                 // back: a curve to the start, then the closing line) is
-                // left out.
-                let q = (units(p.x), units(p.y));
+                // left out. A subpath that is only such a line (the
+                // extension lines of a dimension, as files have them)
+                // keeps a line of one unit instead: left out, the object
+                // was lost on saving.
+                let mut q = (units(p.x), units(p.y));
                 if pts.len() > last_start && pts.last() == Some(&q) {
-                    continue;
+                    if pts.len() > last_start + 1 {
+                        continue;
+                    }
+                    q.0 = q.0.saturating_add(1);
                 }
                 pts.push(q);
                 types.push(0x40 | node_bits(i));
@@ -6125,22 +6135,26 @@ impl<'a> Writer<'a> {
             }
             _ => {
                 let coords = match &s.kind {
-                    // Before version 16 no file seen holds a fill rule: a
-                    // curve that fills nonzero (#1919) goes out as the
+                    // A curve that fills nonzero (#1919) goes out as the
                     // outline of the area it covers, which fills the same
-                    // under the even-odd rule those versions draw with.
+                    // under the even-odd rule: before version 16 no file
+                    // seen holds a fill rule, and from 16 the program that
+                    // reads the files still filled such curves even-odd,
+                    // with holes where their parts overlap, although
+                    // their style strings hold `winding` "1" (#2733). The
+                    // winding stays in the style string, so TraceDraw
+                    // reads the curve back as nonzero.
                     ShapeKind::Path { path, .. }
-                        if v.0 < 16
-                            && s.fill_rule == tracedraw_core::shaping::FillRule::NonZero
+                        if s.fill_rule == tracedraw_core::shaping::FillRule::NonZero
                             && !matches!(s.fill, Fill::None) =>
                     {
                         curve_coords(&tracedraw_core::shaping::nonzero_as_even_odd(path))
                     }
                     ShapeKind::Path { path, .. } => curve_coords_typed(path, &s.node_types),
-                    // The outline of a text fitted to a path fills nonzero
-                    // as the text does (#2733): before 16 as the area it
-                    // covers, from 16 with the style string's winding.
-                    ShapeKind::Text { .. } if v.0 < 16 => curve_coords(
+                    // The outline of a text fitted to a path, or bent,
+                    // fills nonzero as the text does (#2733): written as
+                    // the area it covers, in every version.
+                    ShapeKind::Text { .. } => curve_coords(
                         &tracedraw_core::shaping::nonzero_as_even_odd(&s.local_path()),
                     ),
                     _ => curve_coords(&s.local_path()),

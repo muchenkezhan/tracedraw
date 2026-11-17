@@ -2367,6 +2367,49 @@ fn curve_nodes_carry_the_marks_of_version_16_files() {
 }
 
 #[test]
+fn a_line_of_no_length_alone_is_kept() {
+    // A dimension's extension lines can be lines of no length: saving
+    // to .cdr left the whole object out (306 of them lost in one file).
+    let mut doc = doc_with(Vec::new());
+    let mut ids = doc.ids().clone();
+    let mut p = BezPath::new();
+    p.move_to((30.0, 40.0));
+    p.line_to((30.0, 40.0));
+    let mut dot = Shape::new(
+        ids.shape(),
+        ShapeKind::Path {
+            path: p,
+            closed: false,
+        },
+    );
+    dot.stroke = Some(Stroke::new(Color::BLACK, 0.2));
+    let mut q = BezPath::new();
+    q.move_to((10.0, 10.0));
+    q.line_to((50.0, 10.0));
+    let mut line = Shape::new(
+        ids.shape(),
+        ShapeKind::Path {
+            path: q,
+            closed: false,
+        },
+    );
+    line.stroke = Some(Stroke::new(Color::BLACK, 0.2));
+    doc.pages[0].layers[0].shapes = vec![dot, line];
+    doc.set_ids(ids);
+    for v in versions() {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, rep) = crate::open_bytes(&bytes, "back").expect("reads back");
+        let shapes = &back.pages[0].layers[0].shapes;
+        assert_eq!(shapes.len(), 2, "{v}: {:?}", rep.warnings);
+        let b = shapes[0].bounds();
+        assert!(
+            (b.x0 - 30.0).abs() < 0.01 && (b.y0 - 40.0).abs() < 0.01 && b.width() < 0.01,
+            "{v}: {b:?}"
+        );
+    }
+}
+
+#[test]
 fn subpaths_back_at_their_start_close_on_their_last_node() {
     // Letters' outlines (#1130): a curve back to the start, then the
     // close; a line back to the start; lone moves around them.
@@ -8926,6 +8969,58 @@ fn text_fitted_to_a_path_goes_out_filling_nonzero() {
     }
 }
 
+/// A curve that fills nonzero goes out, in every version, as the outline
+/// of the area it covers (#2733): from version 16 the program that read
+/// the files still filled such curves even-odd, with holes where their
+/// parts overlap, although the style string held `winding` "1". The
+/// winding is kept, so the curve reads back nonzero; two overlapping
+/// squares come back as one outline of their union.
+#[test]
+fn a_nonzero_curve_goes_out_as_the_area_it_fills() {
+    use tracedraw_core::shaping::FillRule;
+    let mut doc = doc_with(Vec::new());
+    let mut ids = doc.ids().clone();
+    let mut p = BezPath::new();
+    for x in [0.0, 20.0] {
+        p.move_to((x, 0.0));
+        p.line_to((x + 40.0, 0.0));
+        p.line_to((x + 40.0, 40.0));
+        p.line_to((x, 40.0));
+        p.close_path();
+    }
+    let mut c = Shape::new(
+        ids.shape(),
+        ShapeKind::Path {
+            path: p,
+            closed: true,
+        },
+    );
+    c.fill = Fill::Solid(Color::BLACK);
+    c.fill_rule = FillRule::NonZero;
+    c.transform = Affine::translate((50.0, 30.0));
+    doc.pages[0].layers[0].shapes = vec![c];
+    doc.set_ids(ids);
+    for v in versions() {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, rep) = crate::open_bytes(&bytes, "back").expect("reads back");
+        let s = &back.pages[0].layers[0].shapes[0];
+        let ShapeKind::Path { path, .. } = &s.kind else {
+            panic!("{v}: {:?} {:?}", s.kind, rep.warnings);
+        };
+        let starts = path
+            .elements()
+            .iter()
+            .filter(|e| matches!(e, PathEl::MoveTo(_)))
+            .count();
+        assert_eq!(starts, 1, "{v}: one outline of the union");
+        let area = (s.transform * path.clone()).area().abs();
+        assert!((area - 2400.0).abs() < 24.0, "{v}: area {area}");
+        if v >= 16 {
+            assert_eq!(s.fill_rule, FillRule::NonZero, "{v}");
+        }
+    }
+}
+
 /// From version 16 the `font` records are the faces the text uses, and
 /// the style table names the first of them: the file of #1733 that
 /// program saved for bold "Khand" text has one Khand record, the bold
@@ -9755,4 +9850,79 @@ fn repeated_pictures_are_stored_once() {
             assert_eq!((pm.width(), pm.height()), (4, 3), "{v}");
         }
     }
+}
+
+/// Object data opens again from a package (#2879): a clone keeps its
+/// link to its master, naming the master's id in the drawing read, and
+/// data fields come back; inside a group too. A RIFF file has no place
+/// for them.
+#[test]
+fn object_data_and_clone_links_open_again() {
+    let rect = |id: u64, x: f64| {
+        let mut s = Shape::new(
+            tracedraw_core::ShapeId(id),
+            ShapeKind::Rect {
+                rect: Rect::new(x, 10.0, x + 20.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        s.fill = Fill::Solid(Color::rgb8(200, 30, 30));
+        s
+    };
+    let master = rect(101, 10.0);
+    let mut clone = rect(102, 50.0);
+    clone.data = vec![
+        ("Price".into(), "5".into()),
+        ("clone.master".into(), "101".into()),
+        ("clone.state".into(), "fill:1/2;outline:own".into()),
+    ];
+    let mut inner = rect(103, 90.0);
+    inner.data = vec![("Code".into(), "A-1".into())];
+    let group = Shape::new(
+        tracedraw_core::ShapeId(104),
+        ShapeKind::Group {
+            children: vec![inner, rect(105, 130.0)],
+        },
+    );
+    let mut doc = doc_with(vec![master, clone, group]);
+    doc.ids_mut().shape();
+    for v in [20u16, 24] {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        let mut all = Vec::new();
+        shapes_on_page(&back.pages[0].layers[0].shapes, Affine::IDENTITY, &mut all);
+        let at = |x: f64| {
+            all.iter()
+                .map(|(_, s)| s)
+                .find(|s| {
+                    (s.bounds().x0 - x).abs() < 0.5 && !matches!(s.kind, ShapeKind::Group { .. })
+                })
+                .unwrap_or_else(|| panic!("v{v}: object at {x}"))
+        };
+        let (m, c) = (at(10.0), at(50.0));
+        let value = |s: &Shape, k: &str| {
+            s.data
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(value(c, "Price").as_deref(), Some("5"), "v{v}");
+        assert_eq!(
+            value(c, "clone.master"),
+            Some(m.id.raw().to_string()),
+            "v{v}"
+        );
+        assert_eq!(
+            value(c, "clone.state").as_deref(),
+            Some("fill:1/2;outline:own")
+        );
+        assert!(m.data.is_empty(), "v{v}: {:?}", m.data);
+        assert_eq!(value(at(90.0), "Code").as_deref(), Some("A-1"), "v{v}");
+    }
+    // Version 13, a RIFF file: as before, without them.
+    let (back, _) = crate::open_bytes(&document_to_cdr_version(&doc, 13), "back").expect("reads");
+    let mut all = Vec::new();
+    shapes_on_page(&back.pages[0].layers[0].shapes, Affine::IDENTITY, &mut all);
+    assert!(all.iter().all(|(_, s)| s.data.is_empty()));
 }

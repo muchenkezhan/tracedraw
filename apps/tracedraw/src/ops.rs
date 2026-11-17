@@ -118,10 +118,10 @@ impl App {
             AlignTo::PageCenter => Rect::new(c.x, c.y, c.x, c.y),
         };
         let grid = self.doc().metadata.grid;
-        let rulers = self.doc().metadata.rulers.clone();
+        let origin = self.grid_origin();
         let on_grid = to == AlignTo::Grid && how != Align::CenterPage;
-        let gx = |v: f64| nearest_line(v, rulers.origin_x, grid.spacing_x);
-        let gy = |v: f64| nearest_line(v, rulers.origin_y, grid.spacing_y);
+        let gx = |v: f64| nearest_line(v, origin.x, grid.spacing_x);
+        let gy = |v: f64| nearest_line(v, origin.y, grid.spacing_y);
         let mut cmds = Vec::new();
         for s in &shapes {
             let b = self.align_box(s);
@@ -838,7 +838,17 @@ impl App {
         let (w, h) = picture.rgba.dimensions();
         let keep_jpeg = planes.is_none()
             && tracedraw_core::jpeg_source::decodes_to(&bytes, w, h, picture.rgba.as_raw());
-        let Some(id) = self.place_image_at(picture.rgba, name, dpi) else {
+        // A 1-bit, grayscale or indexed file keeps its colour mode; all
+        // came in as RGB (#3025).
+        let placed = if planes.is_none() && picture.mode != crate::bitmap_file::FileMode::Rgb {
+            match crate::bitmap_file::encode_as(&picture.rgba, picture.mode) {
+                Some(png) => self.place_png_at(png, w, h, name, dpi),
+                None => self.place_image_at(picture.rgba, name, dpi),
+            }
+        } else {
+            self.place_image_at(picture.rgba, name, dpi)
+        };
+        let Some(id) = placed else {
             return;
         };
         if keep_jpeg {
@@ -990,8 +1000,6 @@ impl App {
         name: Option<String>,
         dpi: Option<(f64, f64)>,
     ) -> Option<tracedraw_core::ShapeId> {
-        let (dpi_x, dpi_y) =
-            dpi.unwrap_or((crate::image_dpi::DEFAULT_DPI, crate::image_dpi::DEFAULT_DPI));
         let (w, h) = img.dimensions();
         let mut png = Vec::new();
         if let Err(e) = image::DynamicImage::ImageRgba8(img)
@@ -1001,6 +1009,22 @@ impl App {
                 crate::i18n::trf("status.could_not_encode_image", &[("e", &e.to_string())]);
             return None;
         }
+        self.place_png_at(png, w, h, name, dpi)
+    }
+
+    /// Place a picture already encoded as the PNG a bitmap keeps (`w` by
+    /// `h` pixels) at the page centre, as [`App::place_image_at`] does:
+    /// a 1-bit, grayscale or indexed picture keeps its mode so (#3025).
+    pub fn place_png_at(
+        &mut self,
+        png: Vec<u8>,
+        w: u32,
+        h: u32,
+        name: Option<String>,
+        dpi: Option<(f64, f64)>,
+    ) -> Option<tracedraw_core::ShapeId> {
+        let (dpi_x, dpi_y) =
+            dpi.unwrap_or((crate::image_dpi::DEFAULT_DPI, crate::image_dpi::DEFAULT_DPI));
         let mm_w = w as f64 * 25.4 / dpi_x;
         let mm_h = h as f64 * 25.4 / dpi_y;
         let page = self.page_rect();
