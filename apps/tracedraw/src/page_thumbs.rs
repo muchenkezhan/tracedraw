@@ -119,6 +119,7 @@ fn render(doc: &Document, page: PageId, px: u32) -> Option<egui::ColorImage> {
                 zoom,
                 origin_x: 0.0,
                 origin_y: height as f64,
+                stretch_y: 1.0,
             },
             ..Default::default()
         },
