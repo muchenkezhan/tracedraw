@@ -28,9 +28,11 @@ first shows the system's Save dialog (`dialogs::choose_export_file`):
 - Every export format is offered, the format of the last export (else
   of Options > Global > File Formats) first, each with its extensions
   ("jpg" and "jpeg", "tif" and "tiff", "html" and "htm"); the name
-  offered is the drawing's (Graphic1 for a new one) with that format's
-  extension; the folder is the one exported to last, else the
-  drawing's, else the last one opened (#1817).
+  offered is the drawing's saved file name, else the name it was opened
+  from, else Graphic1, with that format's extension (#3254). For example,
+  opening `MyDesign.cdr` and exporting to SVG suggests `MyDesign.svg`.
+  The folder is the one exported to last, else the drawing's, else the
+  last one opened (#1817).
 - The extension of the name chosen picks the format, in any case, with
   the choices that format was exported with last; a name without an
   export format's extension ("Poster", "Poster.v2") keeps the format and

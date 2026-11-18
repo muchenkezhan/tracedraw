@@ -4529,6 +4529,19 @@ pub fn export_format_of(path: &std::path::Path) -> Option<usize> {
         .position(|(_, e)| export_extensions(e).contains(&typed.as_str()))
 }
 
+/// The name offered for an export: the drawing's saved name, else the
+/// name it was opened from, else the default for a new drawing.
+fn export_file_name(app: &App, ext: &str) -> String {
+    let stem = app
+        .file
+        .as_deref()
+        .or(app.opened_from.as_deref())
+        .and_then(std::path::Path::file_stem)
+        .unwrap_or_else(|| std::ffi::OsStr::new("Graphic1"))
+        .to_string_lossy();
+    format!("{stem}.{ext}")
+}
+
 /// The Save dialog of an export with `st`: every format, the one of `st`
 /// (the last one used) first, so the extension of the name typed decides
 /// (live test of 0.41: only the format of Options > File Formats was
@@ -4536,11 +4549,6 @@ pub fn export_format_of(path: &std::path::Path) -> Option<usize> {
 /// exported to last, else the drawing's own (#1817).
 fn export_save_dialog(app: &App, st: &ExportState) -> crate::files::Dialog {
     let (name, ext) = EXPORT_FORMATS[st.format.min(EXPORT_FORMATS.len() - 1)];
-    let stem = app
-        .file
-        .as_ref()
-        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "Graphic1".into());
     let mut dialog = crate::files::Dialog::new().add_filter(name, &export_extensions(ext));
     for (other, e) in EXPORT_FORMATS.iter() {
         if *e != ext {
@@ -4562,7 +4570,7 @@ fn export_save_dialog(app: &App, st: &ExportState) -> crate::files::Dialog {
     if let Some(dir) = folder {
         dialog = dialog.set_directory(dir);
     }
-    dialog.set_file_name(format!("{stem}.{ext}"))
+    dialog.set_file_name(export_file_name(app, ext))
 }
 
 /// The file `path` chosen in an export's Save dialog: its folder is the
@@ -5372,17 +5380,12 @@ pub fn export_dialog_ok(app: &mut App, st: &ExportState) {
             write(app, path, st);
             return;
         }
-        let stem = app
-            .file
-            .as_ref()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "Graphic1".into());
-        let ext = exts.first().cloned().unwrap_or_default();
+        let ext = exts.first().map(String::as_str).unwrap_or_default();
         let patterns: Vec<&str> = exts.iter().map(String::as_str).collect();
         let st2 = st.clone();
         crate::files::Dialog::new()
             .add_filter(label, &patterns)
-            .set_file_name(format!("{stem}.{ext}"))
+            .set_file_name(export_file_name(app, ext))
             .save_file(app, move |app, path| write(app, path, &st2));
         return;
     }

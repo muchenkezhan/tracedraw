@@ -12793,6 +12793,46 @@ fn export_test_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
+#[test]
+fn export_suggests_the_opened_or_saved_document_name() {
+    use crate::files::test_save;
+    use crate::ui::dialogs::{export_format_of, export_with_file_dialog, ExportState};
+    use std::path::Path;
+    use tracedraw_core::{Document, Size};
+
+    let mut app = App::headless();
+    let dir = export_test_dir("document-name");
+    let source = dir.join("MyDesign.v2.cdr");
+    let doc = Document::new("Internal title", Size::new(80.0, 60.0));
+    std::fs::write(
+        &source,
+        tracedraw_cdr::write::document_to_cdr_version(&doc, 21),
+    )
+    .expect("CDR fixture");
+    app.open_path(source);
+    assert!(app.file.is_none() && app.opened_from.is_some());
+
+    let assert_suggestion = |app: &mut App, name: &str| {
+        let st = ExportState {
+            format: export_format_of(Path::new(name)).expect("export format"),
+            ..ExportState::default()
+        };
+        test_save::answer(None);
+        export_with_file_dialog(app, &st, false);
+        let asked = test_save::asked();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].file_name(), Some(name));
+    };
+    for name in ["MyDesign.v2.svg", "MyDesign.v2.pdf", "MyDesign.v2.png"] {
+        assert_suggestion(&mut app, name);
+    }
+
+    let saved = dir.join("Final Design.tdraw");
+    app.save_to(saved.clone());
+    assert_eq!(app.file.as_deref(), Some(saved.as_path()));
+    assert_suggestion(&mut app, "Final Design.svg");
+}
+
 /// File > Export (Ctrl+E) asks for the file first, every format offered
 /// with the last one first, then shows the options of the format the
 /// name chose, titled with the file; choosing another format there

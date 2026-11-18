@@ -8385,8 +8385,10 @@ impl App {
                 if let Some(dpi) = pictures {
                     self.opened_pages_to_pictures(dpi);
                 }
-                self.opened_from = (!crate::files::WEB && !is_template_path(&path))
-                    .then(|| crate::files::canonical(&path));
+                // Uploads are not deduplicated, but their names still
+                // suggest a file name for downloads such as exports.
+                self.opened_from =
+                    (!is_template_path(&path)).then(|| crate::files::canonical(&path));
                 self.cdr_version = cdr_version;
                 self.cdr_unsaved_version =
                     opened_version.filter(|v| *v < tracedraw_cdr::write::CHECKED_SINCE);
