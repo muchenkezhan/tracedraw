@@ -302,7 +302,7 @@ struct Palette {
 
 const LIGHT: Palette = Palette {
     panel: rgb(0xF3F4F6),
-    menu_bar: rgb(0xF3F4F6),
+    menu_bar: rgb(0xD1D5DB),
     panel_dark: rgb(0xE5E7EB),
     border: rgb(0xD1D5DB),
     icon_off: rgb(0x858B96),
@@ -329,8 +329,8 @@ const LIGHT: Palette = Palette {
     hovered_row: rgb(0xDFE9F4),
     selected_row_line: rgb(0x7AA9D6),
     control_fill: rgb(0xF0F0F0),
-    tab_strip: rgb(0xE5E7EB),
-    tab: rgb(0xD1D5DB),
+    tab_strip: rgb(0xF3F4F6),
+    tab: rgb(0xE5E7EB),
     tab_active: rgb(0xACC8E5),
     ruler_tick: rgb(0x858789),
     ruler_label: rgb(0x767676),
@@ -525,6 +525,16 @@ tokens!(
 );
 
 impl Tokens {
+    /// The docker surface, distinct from its white fields in the light
+    /// theme. Other themes retain their existing docker surface.
+    pub fn docker() -> Color32 {
+        if theme() == Theme::Light {
+            Self::panel()
+        } else {
+            Self::field()
+        }
+    }
+
     /// Accents, the page and the selection stay the same in every theme.
     pub const ACCENT: Color32 = Color32::from_rgb(0x00, 0x78, 0xD7);
     pub const PAGE: Color32 = Color32::WHITE;
@@ -1128,7 +1138,15 @@ fn fallback_fonts(defs: &mut egui::FontDefinitions) -> Vec<String> {
     let fs = tracedraw_text::fonts();
     let mut added = Vec::new();
     for group in groups {
-        let Some((name, data, index)) = fs.first_face_data(group) else {
+        // Use the system UI face for compact Chinese labels on Windows.
+        // Keep the script groups in language order for Japanese and Traditional Chinese.
+        let native_ui_face =
+            if cfg!(target_os = "windows") && group.first() == Some(&"Noto Sans CJK SC") {
+                fs.first_face_data(&["Microsoft YaHei UI", "Microsoft YaHei"])
+            } else {
+                None
+            };
+        let Some((name, data, index)) = native_ui_face.or_else(|| fs.first_face_data(group)) else {
             continue;
         };
         let key = format!("fallback-{name}");
@@ -1154,6 +1172,39 @@ fn fallback_fonts(defs: &mut egui::FontDefinitions) -> Vec<String> {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
+
+    /// Compact Chinese labels use the regular system UI face when installed.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn chinese_interface_uses_the_regular_windows_ui_face() {
+        let Some((name, data, index)) =
+            tracedraw_text::fonts().first_face_data(&["Microsoft YaHei UI", "Microsoft YaHei"])
+        else {
+            return;
+        };
+        let face = ttf_parser::Face::parse(&data, index).expect("installed UI face");
+        assert_eq!(face.weight(), ttf_parser::Weight::Normal);
+        assert!(!face.is_italic());
+        let defs = font_definitions();
+        let key = format!("fallback-{name}");
+        let registered = defs.font_data.get(&key).expect("native UI font registered");
+        assert_eq!(registered.index, index);
+        assert_eq!(registered.font.as_ref(), data.as_slice());
+        let regular = defs
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .expect("regular interface family");
+        assert!(regular.contains(&key));
+        assert_eq!(regular.first().map(String::as_str), Some("ui-regular"));
+        let ctx = egui::Context::default();
+        ctx.set_fonts(defs);
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+        let font = egui::FontId::proportional(13.0);
+        for c in "文件编辑视图对象文本图像效果页面工具窗口帮助".chars() {
+            assert!(ctx.fonts_mut(|f| f.has_glyph(&font, c)), "{c}");
+        }
+    }
 
     /// A test that switches the theme leaves the theme of the tests
     /// running alongside alone: the pointer bitmaps are kept by theme, and
@@ -1276,14 +1327,36 @@ mod theme_tests {
     fn light_theme_uses_bright_cool_surfaces_and_a_soft_blue_selection() {
         let p = Theme::Light.palette();
         assert_eq!(p.panel, rgb(0xF3F4F6));
-        assert_eq!(p.menu_bar, p.panel);
+        assert_eq!(p.menu_bar, rgb(0xD1D5DB));
+        assert_ne!(p.menu_bar, p.panel);
+        assert!(contrast(p.menu_bar, p.text) >= 4.5);
         assert_eq!(p.ruler_bg, p.panel);
         assert_eq!(p.panel_dark, rgb(0xE5E7EB));
         assert_eq!(p.field, Color32::WHITE);
-        assert_eq!(p.tab_strip, p.panel_dark);
+        assert_eq!(p.tab_strip, p.panel);
+        assert_eq!(p.tab, p.panel_dark);
         assert_eq!(p.tool_active, rgb(0xACC8E5));
         assert_eq!(p.selected_row, p.tool_active);
         assert_eq!(p.tab_active, p.tool_active);
+    }
+
+    #[test]
+    fn light_tool_buttons_keep_their_field_fill_and_accent_frame() {
+        let p = Theme::Light.palette();
+        let accent = egui::Stroke::new(1.0, Tokens::ACCENT);
+        assert_eq!(icon_button_in(Theme::Light, false, false), None);
+        assert_eq!(
+            icon_button_in(Theme::Light, false, true),
+            Some((p.field, accent))
+        );
+        assert_eq!(
+            icon_button_in(Theme::Light, true, false),
+            Some((p.selected_row, egui::Stroke::new(1.0, p.selected_row_line)))
+        );
+        assert_eq!(
+            icon_button_in(Theme::Light, true, true),
+            Some((p.selected_row, accent))
+        );
     }
 
     /// The labels on a tabbed dialog's page (Color Management, Document

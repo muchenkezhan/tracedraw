@@ -652,7 +652,7 @@ pub fn floating_dockers(app: &mut App, ctx: &egui::Context) {
             .default_pos(pos)
             .frame(
                 egui::Frame::new()
-                    .fill(crate::theme::Tokens::field())
+                    .fill(crate::theme::Tokens::docker())
                     .stroke(egui::Stroke::new(
                         1.0,
                         crate::theme::Tokens::window_border(),
@@ -1068,7 +1068,7 @@ fn docker_part(app: &mut App, ui: &mut Ui, front: DockerTab, place: DockerPlace)
     docker_title(app, ui, front, place);
     let content = egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + TITLE_H), full.max);
     ui.painter()
-        .rect_filled(content, 0.0, crate::theme::Tokens::field());
+        .rect_filled(content, 0.0, crate::theme::Tokens::docker());
     // The docker keeps the width it was given (its default or the one the
     // user dragged it to): the page lies in a child that never widens the
     // panel, clipped to the docker, so no section can push it wider.
@@ -4479,6 +4479,89 @@ fn undo_docker(app: &mut App, ui: &mut Ui) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Docker bodies keep their panel colour, including the empty space
+    /// below the controls, while the controls retain their field colour.
+    #[test]
+    fn docker_surfaces_and_fields_stay_distinct_when_docked_or_floating() {
+        use crate::theme::{set_theme, Theme};
+        fn rectangles<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        rectangles(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for theme in Theme::ALL {
+            for floating in [false, true] {
+                let mut app = App::headless();
+                set_theme(theme);
+                let ctx = crate::theme::ui_context();
+                ctx.set_visuals(crate::theme::visuals());
+                ctx.all_styles_mut(|style| style.animation_time = 0.0);
+                if floating {
+                    app.move_docker(
+                        DockerTab::Properties,
+                        DockerPlace::Floating,
+                        Some(egui::pos2(20.0, 20.0)),
+                    );
+                }
+                let mut output = None;
+                for _ in 0..2 {
+                    let mut out = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(340.0, 700.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            if floating {
+                                floating_dockers(&mut app, ui.ctx());
+                            } else {
+                                docker_part(
+                                    &mut app,
+                                    ui,
+                                    DockerTab::Properties,
+                                    DockerPlace::Right,
+                                );
+                            }
+                        },
+                    );
+                    out.textures_delta.clear();
+                    output = Some(out);
+                }
+                let out = output.expect("painted docker");
+                let surface = if theme == Theme::Light {
+                    Tokens::panel()
+                } else {
+                    Tokens::field()
+                };
+                let mut rects = Vec::new();
+                for shape in &out.shapes {
+                    rectangles(&shape.shape, &mut rects);
+                }
+                assert!(
+                    rects.iter().any(|r| r.fill == surface
+                        && r.rect.width() > 200.0
+                        && r.rect.height() > 200.0),
+                    "{theme:?}, floating={floating}: missing docker surface"
+                );
+                assert!(
+                    rects.iter().any(|r| r.fill == Tokens::field()
+                        && r.rect.width() > 35.0
+                        && (15.0..100.0).contains(&r.rect.height())),
+                    "{theme:?}, floating={floating}: missing field surface"
+                );
+            }
+        }
+        set_theme(Theme::Light);
+    }
 
     #[test]
     fn stacked_dockers_share_the_column_height() {

@@ -932,7 +932,7 @@ fn docker_column(
             panel(id.1).default_size(340.0).resizable(true)
         };
         let r = panel
-            .frame(Frame::new().fill(crate::theme::Tokens::field()))
+            .frame(Frame::new().fill(crate::theme::Tokens::docker()))
             .show(ui, |ui| dockers::dockers(app, ui, place))
             .response
             .rect;
