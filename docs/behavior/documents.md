@@ -3,10 +3,12 @@
 Several drawings can be open at once, one tab each in the strip above the
 rulers:
 
-- The strip is 26 px high over a 1 px `#00ADFE` line that runs the width
-  of the window. Tabs are `#D8D8D8` with 1 px gaps of the strip colour
-  `#EAEAEA`; the active tab is `#CEE3FF`; labels are 13 px black.
-- The Welcome Screen tab comes first (a filled dark house and its title).
+- The strip is 30 px high, with 4 px of space above the 26 px tabs and
+  4 px gaps between them. All tabs have 6 px rounded top corners and flat
+  bottoms meeting the rulers without a separator line. Tab colours follow
+  the selected interface theme; labels stay at 13 px in the regular
+  interface font.
+- The Welcome Screen tab comes first (an outlined house and its title).
   With no drawing open it is the only tab, and the menu bar shows only
   File, Tools, Window and Help; File commands that need a drawing are
   disabled. While it is shown (with drawings open too) the toolbox and the
@@ -33,17 +35,21 @@ rulers:
   The table and its scroll bar stop 24 points short of the window's right
   edge, as far as the New and Open buttons stand from its left (#2867).
 - The Welcome Screen tab has a close button on hover (a middle click
-  also closes it): the tab shrinks to its house alone (a 26 px square,
+  also closes it): the tab shrinks to its house alone (28 px wide,
   the title as its tip) and the active drawing shows. With no drawing
   open the workspace stays empty and grey, the toolbox and property bar
   stay pale, and the Hints docker comes to the front at its Home topics
   (#1081). A click on the house, Window > Welcome Screen or Help >
   Welcome Screen shows the Welcome Screen again with its whole tab. The
   closed tab is remembered with the settings (#677).
-- Each drawing's tab (at least 116 px wide) shows its file name, or its
-  document name when it has never been saved, followed by `*` while it has
-  unsaved changes. A close button shows on the hovered tab; a middle click
-  also closes.
+- Each drawing's tab fits its title without a fixed minimum width, with
+  8 px outer padding and 4 px between its title and the 14 px close area.
+  The Welcome Screen tab uses the same spacing, with 6 px between its
+  house and title. The close area stays reserved while hidden, so hovering
+  does not resize tabs or move their neighbours. Each drawing shows its
+  file name, or its document name when it has never been saved, followed
+  by `*` while it has unsaved changes. A close button shows on the hovered
+  tab; a middle click also closes.
 - A drawing's tab dragged along the strip moves the drawing among the
   tabs, as a page tab does: while it is held the other tabs slide aside
   to show where it will land, an outline marks that place and the tab
@@ -51,7 +57,7 @@ rulers:
   drawing stays active. A plain click still switches (#2903,
   `ui::tabs::tests::a_drawing_tab_dragged_along_the_strip_moves_the_drawing`,
   `ui::tabs::tests::move_document_keeps_the_active_window`).
-- The New tab after the last one (a grey plus on a 26 px square) runs
+- The New tab after the last one (a grey plus on a 28 px wide tab) runs
   File > New.
 - More tabs than the strip is wide: the strip slides as an overflowing
   bar does (`toolbars.md`), with a « button at its start and a » button
@@ -60,6 +66,8 @@ rulers:
   active (a new or opened drawing, the Window menu), so the
   tab of the drawing shown is always on the strip (#1908). Check:
   `ui::tabs::tests::tabs_past_the_window_edge_can_be_reached`.
+
+![Document tabs with short and long titles](../images/document-tabs.png)
 
 Each drawing keeps its own pages, objects, undo history, selection, view
 (zoom and scroll), file, page number settings and drawing units.

@@ -821,8 +821,7 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     align_docker::settle_gap(app);
 
     // Document tabs above the rulers.
-    // The tabs' blue line is the strip's lower edge: no separator and no
-    // gap between it and the rulers.
+    // The tabs' flat bottoms meet the rulers without a separator or gap.
     Panel::top("document_tabs")
         .frame(Frame::new().fill(crate::theme::Tokens::tab_strip()))
         .show_separator_line(false)

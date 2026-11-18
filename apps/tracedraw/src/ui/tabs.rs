@@ -1,7 +1,7 @@
 //! The document tabs above the rulers: the Welcome Screen, one tab per open
 //! drawing (an asterisk marks unsaved changes; the close button shows on
-//! the hovered tab) and the New tab after the last one, over a blue line
-//! that runs the width of the window. The Welcome Screen tab closes to its
+//! the hovered tab) and the New tab after the last one. Tabs share rounded
+//! top corners and flat bottoms. The Welcome Screen tab closes to its
 //! house alone, which shows the Welcome Screen again (#677). A drawing's
 //! tab dragged along the strip takes the drawing to another place among
 //! the tabs (#2903).
@@ -12,13 +12,21 @@ use crate::theme::Tokens;
 use crate::ui::tips::RichTip;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
-/// Height of a tab; the blue line adds one pixel under it.
-pub const TAB_HEIGHT: f32 = 26.0;
-const PAD: f32 = 15.0;
+/// Height of the strip, including the space above each tab.
+pub const TAB_HEIGHT: f32 = 30.0;
+const TOP_PAD: f32 = 4.0;
+const GAP: f32 = 4.0;
+const CORNERS: egui::CornerRadius = egui::CornerRadius {
+    nw: 6,
+    ne: 6,
+    sw: 0,
+    se: 0,
+};
+const PAD: f32 = 8.0;
+const ICON_GAP: f32 = 6.0;
+const CLOSE_GAP: f32 = 4.0;
 const CLOSE: f32 = 14.0;
 const FONT: f32 = 13.0;
-/// The line under the tabs.
-const LINE: Color32 = Color32::from_rgb(0x00, 0xAD, 0xFE);
 
 /// What a click on the strip asked for.
 enum Action {
@@ -33,11 +41,10 @@ enum Action {
 
 pub fn document_tabs(app: &mut App, ui: &mut Ui) {
     let mut action = None;
-    let strip = ui.max_rect();
     #[cfg(test)]
     ui.ctx()
-        .data_mut(|d| d.insert_temp(egui::Id::new("document_tabs_strip"), strip));
-    // Nothing below the line: the strip ends where it does.
+        .data_mut(|d| d.insert_temp(egui::Id::new("document_tabs_strip"), ui.max_rect()));
+    // The tabs' flat bottoms meet the rulers without a separator.
     ui.spacing_mut().item_spacing.y = 0.0;
     // The active tab, when it changed since the last frame: the strip
     // slides to show it (a drawing opened or chosen from the Window
@@ -49,7 +56,8 @@ pub fn document_tabs(app: &mut App, ui: &mut Ui) {
     // More tabs than the window is wide: the strip slides with its « and
     // » buttons and the mouse wheel (#1908).
     crate::ui::overflow::row_showing(ui, "document_tabs", |ui| {
-        ui.spacing_mut().item_spacing.x = 1.0;
+        ui.spacing_mut().item_spacing.x = GAP;
+        ui.add_space(GAP);
         let mut keep = None;
         let welcome = app.show_welcome;
         // Shown again, the Welcome Screen has its whole tab back.
@@ -139,16 +147,6 @@ pub fn document_tabs(app: &mut App, ui: &mut Ui) {
         }
         keep
     });
-    let line_y = strip.top() + TAB_HEIGHT;
-    ui.painter().rect_filled(
-        Rect::from_min_max(
-            Pos2::new(strip.left(), line_y),
-            Pos2::new(strip.right(), line_y + 1.0),
-        ),
-        0.0,
-        LINE,
-    );
-    ui.allocate_space(Vec2::new(0.0, 1.0));
     match action {
         Some(Action::Welcome) => app.show_welcome = true,
         Some(Action::CloseWelcome) => {
@@ -182,16 +180,34 @@ fn tab_fill(active: bool, hovered: bool) -> Color32 {
     }
 }
 
+/// Every tab leaves the same space above its rounded top.
+fn tab_rect(slot: Rect) -> Rect {
+    Rect::from_min_max(slot.min + Vec2::new(0.0, TOP_PAD), slot.max)
+}
+
+/// Reserve only the label and close button, even for short titles.
+fn tab_width(content_width: f32) -> f32 {
+    PAD + content_width + CLOSE_GAP + CLOSE + PAD
+}
+
+fn tab_close_rect(rect: Rect) -> Rect {
+    Rect::from_center_size(
+        Pos2::new(rect.right() - PAD - CLOSE / 2.0, rect.center().y),
+        Vec2::splat(CLOSE),
+    )
+}
+
 /// The Welcome Screen tab: a house and the title, with a close button on
 /// hover; `closed`, the house alone, which shows the Welcome Screen
 /// again.
 fn welcome_tab(ui: &mut Ui, active: bool, closed: bool) -> TabClick {
     let icon = 16.0;
     if closed {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(TAB_HEIGHT), Sense::hover());
+        let (slot, _) = ui.allocate_exact_size(Vec2::new(28.0, TAB_HEIGHT), Sense::hover());
+        let rect = tab_rect(slot);
         let resp = ui.interact(rect, egui::Id::new(WELCOME_TAB), Sense::click());
         let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, tab_fill(active, resp.hovered()));
+        painter.rect_filled(rect, CORNERS, tab_fill(active, resp.hovered()));
         house(
             painter,
             rect.center() - Vec2::splat(icon / 2.0),
@@ -212,27 +228,25 @@ fn welcome_tab(ui: &mut Ui, active: bool, closed: bool) -> TabClick {
         egui::FontId::proportional(FONT),
         crate::theme::Tokens::text(),
     );
-    let width = 6.0 + icon + 15.0 + galley.size().x + 27.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, TAB_HEIGHT), Sense::hover());
+    let width = tab_width(icon + ICON_GAP + galley.size().x);
+    let (slot, _) = ui.allocate_exact_size(Vec2::new(width, TAB_HEIGHT), Sense::hover());
+    let rect = tab_rect(slot);
     let resp = ui.interact(rect, egui::Id::new(WELCOME_TAB), Sense::click());
-    let close_rect = Rect::from_center_size(
-        Pos2::new(rect.right() - 6.0 - CLOSE / 2.0, rect.center().y),
-        Vec2::splat(CLOSE),
-    );
+    let close_rect = tab_close_rect(rect);
     let close_resp = ui
         .interact(close_rect, egui::Id::new(WELCOME_CLOSE), Sense::click())
         .rich_tip(crate::ui::tips::keyed("tabs.close_welcome"));
     let close_hovered = close_resp.hovered();
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, tab_fill(active, resp.hovered()));
+    painter.rect_filled(rect, CORNERS, tab_fill(active, resp.hovered()));
     house(
         painter,
-        Pos2::new(rect.left() + 6.0, rect.top() + 5.0),
+        Pos2::new(rect.left() + PAD, rect.center().y - icon / 2.0),
         crate::theme::Tokens::icon(),
     );
     painter.galley(
         Pos2::new(
-            rect.left() + 6.0 + icon + 15.0,
+            rect.left() + PAD + icon + ICON_GAP,
             (rect.center().y - galley.size().y / 2.0).round(),
         ),
         galley,
@@ -266,42 +280,35 @@ fn close_mark(painter: &egui::Painter, close_rect: Rect, hovered: bool) {
     painter.line_segment([r.right_top(), r.left_bottom()], s);
 }
 
-/// A filled house, 16 pixels square, top-left at `o`: a roof with eaves
-/// and a body with a door.
+/// An outlined house, 16 pixels square, top-left at `o`.
 fn house(painter: &egui::Painter, o: Pos2, color: Color32) {
-    let roof = vec![
-        Pos2::new(o.x + 8.0, o.y),
-        Pos2::new(o.x + 16.0, o.y + 8.5),
-        Pos2::new(o.x, o.y + 8.5),
-    ];
-    painter.add(egui::Shape::convex_polygon(roof, color, Stroke::NONE));
-    painter.rect_filled(
-        Rect::from_min_max(
-            Pos2::new(o.x + 2.0, o.y + 8.0),
-            Pos2::new(o.x + 14.0, o.y + 16.0),
-        ),
-        0.0,
-        color,
-    );
-    painter.rect_filled(
-        Rect::from_min_max(
-            Pos2::new(o.x + 6.0, o.y + 12.0),
-            Pos2::new(o.x + 10.0, o.y + 16.0),
-        ),
-        0.0,
-        crate::theme::Tokens::tab(),
-    );
+    let stroke = Stroke::new(1.2, color);
+    for [a, b] in [
+        [(0.5, 7.5), (8.0, 0.5)],
+        [(8.0, 0.5), (15.5, 7.5)],
+        [(2.5, 6.0), (2.5, 15.5)],
+        [(2.5, 15.5), (6.0, 15.5)],
+        [(6.0, 15.5), (6.0, 10.0)],
+        [(6.0, 10.0), (10.0, 10.0)],
+        [(10.0, 10.0), (10.0, 15.5)],
+        [(10.0, 15.5), (13.5, 15.5)],
+        [(13.5, 15.5), (13.5, 6.0)],
+    ] {
+        painter.line_segment([o + Vec2::new(a.0, a.1), o + Vec2::new(b.0, b.1)], stroke);
+    }
 }
 
 /// The New tab: a grey plus on a tab-coloured square.
 fn new_tab(ui: &mut Ui) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(TAB_HEIGHT), Sense::click());
+    let (slot, _) = ui.allocate_exact_size(Vec2::new(28.0, TAB_HEIGHT), Sense::hover());
+    let rect = tab_rect(slot);
+    let resp = ui.interact(rect, ui.id().with("new_document_tab"), Sense::click());
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, tab_fill(false, resp.hovered()));
+    painter.rect_filled(rect, CORNERS, tab_fill(false, resp.hovered()));
     let c = rect.center();
     let s = Stroke::new(2.0, crate::theme::Tokens::text_dim());
-    painter.line_segment([c - Vec2::new(7.0, 0.0), c + Vec2::new(7.0, 0.0)], s);
-    painter.line_segment([c - Vec2::new(0.0, 7.0), c + Vec2::new(0.0, 7.0)], s);
+    painter.line_segment([c - Vec2::new(6.0, 0.0), c + Vec2::new(6.0, 0.0)], s);
+    painter.line_segment([c - Vec2::new(0.0, 6.0), c + Vec2::new(0.0, 6.0)], s);
     resp.rich_tip(tr("menu.file.new")).clicked()
 }
 
@@ -323,7 +330,7 @@ fn doc_tab_width(ui: &Ui, title: &str) -> f32 {
         egui::FontId::proportional(FONT),
         crate::theme::Tokens::text(),
     );
-    (PAD + galley.size().x + 6.0 + CLOSE + 8.0).max(116.0)
+    tab_width(galley.size().x)
 }
 
 /// What a drawing's tab did this frame.
@@ -353,15 +360,12 @@ fn doc_tab(
         crate::theme::Tokens::text(),
     );
     let (slot, _) = ui.allocate_exact_size(Vec2::new(width, TAB_HEIGHT), Sense::hover());
-    let rect = match float_left {
+    let rect = tab_rect(match float_left {
         Some(left) => Rect::from_min_size(Pos2::new(left, slot.min.y), slot.size()),
         None => slot,
-    };
+    });
     let resp = ui.interact(rect, doc_tab_id(i), Sense::click_and_drag());
-    let close_rect = Rect::from_center_size(
-        Pos2::new(rect.right() - 8.0 - CLOSE / 2.0, rect.center().y),
-        Vec2::splat(CLOSE),
-    );
+    let close_rect = tab_close_rect(rect);
     let close_id = ui.id().with(("doc_tab_close", i));
     let close_resp = ui
         .interact(close_rect, close_id, Sense::click())
@@ -376,12 +380,10 @@ fn doc_tab(
             egui::StrokeKind::Inside,
         );
         ui.ctx().request_repaint();
-        ui.painter()
-            .clone()
-            .with_layer_id(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("doc_tab_dragged"),
-            ))
+        ui.painter().clone().with_layer_id(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("doc_tab_dragged"),
+        ))
     } else {
         ui.painter().clone()
     };
@@ -390,7 +392,7 @@ fn doc_tab(
     } else {
         tab_fill(active, resp.hovered())
     };
-    painter.rect_filled(rect, 0.0, fill);
+    painter.rect_filled(rect, CORNERS, fill);
     painter.galley(
         Pos2::new(
             rect.left() + PAD,
@@ -426,6 +428,243 @@ mod tests {
     use super::*;
     use egui::{Event, PointerButton};
 
+    /// Short, long and multilingual titles keep the same compact padding,
+    /// including while each close cross appears and disappears.
+    #[test]
+    fn tabs_fit_their_titles_without_resizing_on_hover() {
+        fn lines_inside(shape: &egui::Shape, rect: Rect) -> usize {
+            match shape {
+                egui::Shape::LineSegment { points, .. }
+                    if points.iter().all(|p| rect.contains(*p)) =>
+                {
+                    1
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().map(|s| lines_inside(s, rect)).sum(),
+                _ => 0,
+            }
+        }
+        let ctx = crate::theme::ui_context();
+        let titles = [
+            "A",
+            "Plan.tdraw",
+            "未命名-1",
+            "未命名-2未命名-2",
+            "未命名-1*",
+        ];
+        let mut baseline = Vec::new();
+        let targets = std::iter::once(None)
+            .chain((0..=titles.len()).map(Some))
+            .chain(std::iter::once(None));
+        for target in targets {
+            let pointer = target.map(|i| tab_close_rect(baseline[i]).center());
+            for frame in 0..3 {
+                let mut drawn = Vec::new();
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1200.0, TAB_HEIGHT),
+                        )),
+                        events: vec![pointer.map_or(Event::PointerGone, Event::PointerMoved)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::new())
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = GAP;
+                                ui.horizontal(|ui| {
+                                    let text_width = |ui: &Ui, title: &str| {
+                                        ui.painter()
+                                            .layout_no_wrap(
+                                                title.to_owned(),
+                                                egui::FontId::proportional(FONT),
+                                                Tokens::text(),
+                                            )
+                                            .size()
+                                            .x
+                                    };
+                                    welcome_tab(ui, false, false);
+                                    drawn.push((
+                                        ctx.read_response(egui::Id::new(WELCOME_TAB))
+                                            .expect("welcome tab")
+                                            .rect,
+                                        16.0 + 6.0 + text_width(ui, &tr("welcome.title")),
+                                    ));
+                                    for (i, title) in titles.iter().enumerate() {
+                                        let width = doc_tab_width(ui, title);
+                                        let tab = doc_tab(ui, i, title, false, width, None);
+                                        drawn.push((tab_rect(tab.slot), text_width(ui, title)));
+                                    }
+                                });
+                            });
+                    },
+                );
+                out.textures_delta.clear();
+                for (rect, content_width) in &drawn {
+                    assert!((rect.width() - content_width - 34.0).abs() < 0.01);
+                    assert!(
+                        (tab_close_rect(*rect).left() - rect.left() - 8.0 - content_width - 4.0)
+                            .abs()
+                            < 0.01
+                    );
+                }
+                let rects: Vec<_> = drawn.iter().map(|(rect, _)| *rect).collect();
+                if baseline.is_empty() {
+                    assert!(
+                        rects[1].width() < 60.0,
+                        "short titles have no minimum width"
+                    );
+                    baseline = rects;
+                } else {
+                    assert_eq!(rects, baseline, "hover does not move or resize tabs");
+                }
+                // Hover responses settle after the pointer changes tabs.
+                if frame == 2 {
+                    for (i, rect) in baseline.iter().enumerate() {
+                        let lines: usize = out
+                            .shapes
+                            .iter()
+                            .map(|s| lines_inside(&s.shape, tab_close_rect(*rect)))
+                            .sum();
+                        assert_eq!(
+                            lines,
+                            if target == Some(i) { 2 } else { 0 },
+                            "close cross on tab {i}, hovered tab {target:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Welcome, drawing and New tabs share their silhouette and spacing;
+    /// their flat bottoms leave the strip visible in every gap.
+    #[test]
+    fn document_tabs_share_rounded_tops_and_flat_bottoms() {
+        fn rectangles<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        rectangles(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for theme in crate::theme::Theme::ALL {
+            for closed in [false, true] {
+                let mut app = App::headless();
+                while app.docs.len() < 3 {
+                    app.new_document();
+                }
+                app.switch_document(1);
+                app.show_welcome = false;
+                app.settings.welcome_tab_closed = closed;
+                crate::theme::set_theme(theme);
+                let ctx = crate::theme::ui_context();
+                ctx.set_visuals(crate::theme::visuals());
+                let mut textures = crate::soft_canvas::Textures::default();
+                for _ in 0..3 {
+                    let mut out = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(640.0, 30.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::new().fill(Tokens::tab_strip()))
+                                .show(ui, |ui| document_tabs(&mut app, ui));
+                        },
+                    );
+                    textures.apply(&out.textures_delta);
+                    out.textures_delta.clear();
+                    let mut rects = Vec::new();
+                    for shape in &out.shapes {
+                        rectangles(&shape.shape, &mut rects);
+                    }
+                    let mut tabs: Vec<_> = rects
+                        .into_iter()
+                        .filter(|r| r.corner_radius == CORNERS)
+                        .collect();
+                    tabs.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+                    assert_eq!(tabs.len(), 5, "{theme:?}, closed={closed}");
+                    for (i, tab) in tabs.iter().enumerate() {
+                        assert_eq!(tab.rect.top(), 4.0);
+                        assert_eq!(tab.rect.bottom(), 30.0);
+                        assert_eq!(
+                            tab.fill,
+                            if i == 2 {
+                                Tokens::tab_active()
+                            } else {
+                                Tokens::tab()
+                            }
+                        );
+                    }
+                    for pair in tabs.windows(2) {
+                        assert_eq!(pair[1].rect.left() - pair[0].rect.right(), 4.0);
+                    }
+                    let gaps: Vec<_> = tabs
+                        .windows(2)
+                        .map(|p| p[0].rect.right() as usize + 2)
+                        .collect();
+                    let shapes = std::mem::take(&mut out.shapes);
+                    let prims = ctx.tessellate(shapes, out.pixels_per_point);
+                    let mut canvas = crate::soft_canvas::Canvas::new(640, 30);
+                    canvas.paint(&textures, &prims);
+                    let rgb = |x: usize, y: usize| {
+                        let p = canvas.px[y * canvas.w + x];
+                        [p[0], p[1], p[2]].map(|c| (c * 255.0).round() as u8)
+                    };
+                    for x in gaps {
+                        assert_eq!(rgb(x, 29), Tokens::tab_strip().to_array()[..3]);
+                    }
+                    // Close crosses stay hidden while the pointer is
+                    // absent, leaving the compact tabs' fills visible.
+                    for i in 0..4 {
+                        if i == 0 && closed {
+                            continue;
+                        }
+                        let rect = if i == 0 {
+                            ctx.read_response(egui::Id::new(WELCOME_TAB))
+                                .expect("welcome tab")
+                                .rect
+                        } else {
+                            tab(&ctx, i - 1)
+                        };
+                        let x = tab_close_rect(rect).center().x as usize;
+                        let y = rect.center().y as usize;
+                        let fill = if i == 2 {
+                            Tokens::tab_active()
+                        } else {
+                            Tokens::tab()
+                        };
+                        assert_eq!(
+                            rgb(x, y),
+                            fill.to_array()[..3],
+                            "close cross stays hidden on tab {i}"
+                        );
+                    }
+                    if theme == crate::theme::Theme::Light && !closed {
+                        if let Some(path) = std::env::var_os("TRACEDRAW_TABS_SHOT") {
+                            let img = image::RgbaImage::from_fn(640, 30, |x, y| {
+                                image::Rgba(
+                                    canvas.px[y as usize * canvas.w + x as usize]
+                                        .map(|c| (c * 255.0).round() as u8),
+                                )
+                            });
+                            img.save(path).expect("save the rendered document tabs");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn frame(ctx: &egui::Context, app: &mut App, events: Vec<Event>) {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 800.0))),
@@ -457,6 +696,53 @@ mod tests {
         ctx.read_response(doc_tab_id(i))
             .map(|r| r.rect)
             .expect("the tab is drawn")
+    }
+
+    /// Hovering the cross on an inactive tab closes that drawing only.
+    #[test]
+    fn an_inactive_drawing_closes_from_its_cross() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        while app.docs.len() < 3 {
+            app.new_document();
+        }
+        app.switch_document(0);
+        let drawings: Vec<_> = app.docs.iter().map(|d| d.drawing).collect();
+        // Enough room for every tab, without the full window's dockers
+        // reducing the strip and sliding this cross out of view.
+        let mut draw = |events| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 30.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new().fill(Tokens::tab_strip()))
+                        .show(ui, |ui| document_tabs(&mut app, ui));
+                },
+            );
+            out.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            draw(Vec::new());
+        }
+        let rect = tab(&ctx, 1);
+        let close = tab_close_rect(rect).center();
+        draw(vec![Event::PointerMoved(close)]);
+        for pressed in [true, false] {
+            draw(vec![Event::PointerButton {
+                pos: close,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert_eq!(
+            app.docs.iter().map(|d| d.drawing).collect::<Vec<_>>(),
+            vec![drawings[0], drawings[2]]
+        );
     }
 
     /// Twelve drawings in a 700 point window: the tabs past the window's
@@ -588,8 +874,11 @@ mod tests {
         let strip = ctx
             .data(|d| d.get_temp::<Rect>(egui::Id::new("document_tabs_strip")))
             .expect("the strip is drawn");
+        let b = crate::ui::overflow::BUTTON;
+        let window =
+            Rect::from_min_max(strip.min + Vec2::new(b, 0.0), strip.max - Vec2::new(b, 0.0));
         let j = (0..3)
-            .find(|j| *j != app.active_doc && strip.contains(tab(&ctx, *j).center()))
+            .find(|j| *j != app.active_doc && window.contains_rect(tab(&ctx, *j)))
             .expect("another tab in reach");
         click(&ctx, &mut app, tab(&ctx, j).center());
         assert_eq!(app.active_doc, j);
