@@ -301,38 +301,38 @@ struct Palette {
 }
 
 const LIGHT: Palette = Palette {
-    panel: rgb(0xF4F4F4),
-    menu_bar: rgb(0xD8D8D8),
-    panel_dark: rgb(0xE1E1E1),
-    border: rgb(0xD8D8D8),
-    icon_off: rgb(0xC8C8C8),
-    text: rgb(0x1E1E1E),
-    text_dim: rgb(0x6E6E6E),
-    page_shadow: rgb(0xBFBFBF),
-    page_border: rgb(0xAAAAAA),
-    ruler_bg: rgb(0xF4F4F4),
-    tool_active: rgb(0xCCE4F7),
-    tool_hover: rgb(0xE5F1FB),
-    icon: rgb(0x2A2A2A),
-    button: rgb(0xE1E1E1),
-    control_border: rgb(0xADADAD),
-    slider_rail: rgb(0xC4C4C4),
+    panel: rgb(0xF3F4F6),
+    menu_bar: rgb(0xF3F4F6),
+    panel_dark: rgb(0xE5E7EB),
+    border: rgb(0xD1D5DB),
+    icon_off: rgb(0x858B96),
+    text: rgb(0x2E3238),
+    text_dim: rgb(0x62666D),
+    page_shadow: rgb(0xC4C8CE),
+    page_border: rgb(0xADB3BB),
+    ruler_bg: rgb(0xF3F4F6),
+    tool_active: rgb(0xACC8E5),
+    tool_hover: rgb(0xDFE9F4),
+    icon: rgb(0x2E3238),
+    button: rgb(0xE5E7EB),
+    control_border: rgb(0xACADB0),
+    slider_rail: rgb(0xC4C8CE),
     field: rgb(0xFFFFFF),
     menu: rgb(0xFFFFFF),
-    menu_gutter: rgb(0xF4F4F4),
-    menu_hover: rgb(0xE0F0FF),
-    menu_hover_line: rgb(0x00ADFE),
-    menu_text_off: rgb(0xC8C8C8),
-    title_bar: rgb(0xFFFFFF),
-    window_border: rgb(0xB2B2B2),
-    selected_row: rgb(0xCCE8FF),
-    hovered_row: rgb(0xE5F3FF),
-    selected_row_line: rgb(0x99D1FF),
-    control_fill: rgb(0xEAEAEA),
-    tab_strip: rgb(0xEAEAEA),
-    tab: rgb(0xD8D8D8),
-    tab_active: rgb(0xCEE3FF),
-    ruler_tick: rgb(0x8C8C8C),
+    menu_gutter: rgb(0xF3F4F6),
+    menu_hover: rgb(0xDFE9F4),
+    menu_hover_line: rgb(0x0078D7),
+    menu_text_off: rgb(0x989EA8),
+    title_bar: rgb(0xF9FAFB),
+    window_border: rgb(0xACADB0),
+    selected_row: rgb(0xACC8E5),
+    hovered_row: rgb(0xDFE9F4),
+    selected_row_line: rgb(0x7AA9D6),
+    control_fill: rgb(0xF0F0F0),
+    tab_strip: rgb(0xE5E7EB),
+    tab: rgb(0xD1D5DB),
+    tab_active: rgb(0xACC8E5),
+    ruler_tick: rgb(0x858789),
     ruler_label: rgb(0x767676),
     ruler_marker: rgb(0x0B0B0B),
     desktop: rgb(0xFFFFFF),
@@ -1263,7 +1263,27 @@ mod theme_tests {
                 p.text,
                 p.field
             );
+            assert!(
+                contrast(p.panel, p.text) >= 4.5,
+                "{t:?}: {:?} on {:?}",
+                p.text,
+                p.panel
+            );
         }
+    }
+
+    #[test]
+    fn light_theme_uses_bright_cool_surfaces_and_a_soft_blue_selection() {
+        let p = Theme::Light.palette();
+        assert_eq!(p.panel, rgb(0xF3F4F6));
+        assert_eq!(p.menu_bar, p.panel);
+        assert_eq!(p.ruler_bg, p.panel);
+        assert_eq!(p.panel_dark, rgb(0xE5E7EB));
+        assert_eq!(p.field, Color32::WHITE);
+        assert_eq!(p.tab_strip, p.panel_dark);
+        assert_eq!(p.tool_active, rgb(0xACC8E5));
+        assert_eq!(p.selected_row, p.tool_active);
+        assert_eq!(p.tab_active, p.tool_active);
     }
 
     /// The labels on a tabbed dialog's page (Color Management, Document
