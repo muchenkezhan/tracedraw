@@ -156,6 +156,13 @@ verticais.
 1. Selecione um texto e uma curva ou forma.
 2. Escolha [[menu.text > menu.text.fit_text_to_path]].
 
+Com a ferramenta [[tool.pick]], você também pode arrastar um único texto
+sobre um caminho com o botão direito do mouse. Quando o contorno for
+destacado, solte e escolha [[menu.text.fit_text_to_path]]. Em um caminho
+fechado, o ponto onde você solta define o centro do texto sobre o caminho.
+O texto acompanha as edições no contorno, inclusive depois de reabrir um
+desenho no formato nativo.
+
 Ou clique no contorno de um caminho com a ferramenta [[tool.text]] e digite. O
 texto em uma forma fechada fica do lado de fora dela, centralizado no alto;
 clicado na parte de baixo de uma elipse, ele começa ali.

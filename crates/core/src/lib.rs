@@ -45,6 +45,7 @@ pub mod spreads;
 pub mod style;
 pub mod table;
 pub mod text_flow;
+pub mod text_path;
 pub mod toc;
 
 pub use bytes::SharedBytes;
