@@ -1602,14 +1602,16 @@ fn split_by_lengths<'t, T>(
     runs
 }
 
-/// Cut `text` into runs of `n` characters per style (see
-/// [`split_by_lengths`]).
+/// Cut `text` into runs of `n` letters per style (see
+/// [`split_by_lengths`]). A letter is a UTF-16 unit, as files count them:
+/// a letter beyond U+FFFF (an emoji) is two, a surrogate pair. Counted in
+/// characters, every run after such a letter started one letter late.
 fn split_runs(text: &str, styles: &[(usize, RunStyle)]) -> Vec<TextRun> {
-    let chars: Vec<char> = text.chars().collect();
-    split_by_lengths(&chars, styles)
+    let units: Vec<u16> = text.encode_utf16().collect();
+    split_by_lengths(&units, styles)
         .into_iter()
-        .map(|(c, style)| TextRun {
-            text: c.iter().collect(),
+        .map(|(u, style)| TextRun {
+            text: String::from_utf16_lossy(u),
             style,
             raw: None,
         })
@@ -1842,10 +1844,15 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
         } else {
             decode_utf16le(text)
         };
-        // Group consecutive characters sharing a style record.
+        // Group consecutive characters sharing a style record. Each
+        // record is a letter's, a UTF-16 unit: a letter beyond U+FFFF (an
+        // emoji) has two, and the letters after it name the records after
+        // its second.
         let mut runs: Vec<TextRun> = Vec::new();
-        for (i, ch) in text.chars().enumerate() {
+        let mut i = 0usize;
+        for ch in text.chars() {
             let idx = overrides.get(i).copied().unwrap_or(usize::MAX);
+            i += ch.len_utf16();
             let style = match records.get(idx) {
                 Some(s) => s.over(&default),
                 None => default.clone(),
@@ -1873,6 +1880,30 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
         });
     }
     Some(out)
+}
+
+/// How many line breaks a text's spans start with.
+pub(crate) fn leading_breaks(spans: &[tracedraw_core::TextSpan]) -> usize {
+    spans
+        .iter()
+        .flat_map(|s| s.text.chars())
+        .take_while(|c| *c == '\n')
+        .count()
+}
+
+/// Drop the first `n` characters of a text's spans, and the spans left
+/// empty.
+pub(crate) fn drop_leading_chars(spans: &mut Vec<tracedraw_core::TextSpan>, mut n: usize) {
+    for s in spans.iter_mut() {
+        if n == 0 {
+            break;
+        }
+        let len = s.text.chars().count();
+        let k = n.min(len);
+        s.text = s.text.chars().skip(k).collect();
+        n -= k;
+    }
+    spans.retain(|s| !s.text.is_empty());
 }
 
 /// Text with its paragraph ends as `\n`: files end lines with a carriage

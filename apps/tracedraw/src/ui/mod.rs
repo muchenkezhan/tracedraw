@@ -1399,10 +1399,38 @@ pub(crate) fn view_navigator(app: &mut App, ui: &mut Ui, corner: egui::Rect, can
             ));
         }
     }
-    let area_rect = egui::Rect::from_min_max(
+    let mut area_rect = egui::Rect::from_min_max(
         egui::pos2(corner.max.x - thumb_w - 8.0, corner.min.y - thumb_h - 8.0),
         egui::pos2(corner.max.x, corner.min.y),
     );
+    // Opened with its key, it comes up at the pointer, as in CorelDRAW,
+    // with the spot of the view's centre under the pointer so the view
+    // does not jump: it always came up in the corner (#3086). The place
+    // is kept while it is open, so moving over it pans.
+    let at_id = egui::Id::new("navigator_at_pointer");
+    if key_held {
+        let kept = ui.ctx().data(|d| d.get_temp::<egui::Pos2>(at_id));
+        let at = kept.or_else(|| {
+            let pointer = ui
+                .input(|i| i.pointer.latest_pos())
+                .filter(|p| canvas.contains(*p))?;
+            let vis = app.view.visible_page_rect(canvas);
+            let cx = (((vis.x0 + vis.x1) / 2.0 - page.x0) / page.width()) as f32 * thumb_w;
+            let cy = ((page.y1 - (vis.y0 + vis.y1) / 2.0) / page.height()) as f32 * thumb_h;
+            let m = egui::Frame::popup(ui.style()).total_margin();
+            let min = pointer - egui::vec2(cx + m.left, cy + m.top);
+            let size = egui::vec2(thumb_w + m.sum().x, thumb_h + m.sum().y);
+            let max = (canvas.max - size).max(canvas.min);
+            let min = min.clamp(canvas.min, max);
+            ui.ctx().data_mut(|d| d.insert_temp(at_id, min));
+            Some(min)
+        });
+        if let Some(min) = at {
+            area_rect = egui::Rect::from_min_size(min, area_rect.size());
+        }
+    } else {
+        ui.ctx().data_mut(|d| d.remove::<egui::Pos2>(at_id));
+    }
     // Shown only because View > Navigator opened it (no button or key
     // held): the picture follows clicks, not the pointer passing over.
     let pinned_only =
@@ -1810,6 +1838,78 @@ mod tests {
             }
             app.undo();
         }
+        frame(&ctx, &mut app);
+    }
+
+    /// #3264: a toolbar the user makes in Options > Customization >
+    /// Command Bars is drawn in a row of its own, empty at first; a menu
+    /// command without a picture dragged onto it from the Commands page
+    /// sits on it named in words and runs with a click; the Command Bars
+    /// page's New and Delete make and take it away.
+    #[test]
+    fn a_toolbar_the_user_makes_holds_commands_without_pictures() {
+        use crate::ui::bar_items::{apply_drop, items, ItemBar, ItemDrag};
+        use crate::ui::bars::Bar;
+        let ctx = crate::theme::ui_context();
+        let mut app = mixed_app();
+        app.show_welcome = false;
+        frame(&ctx, &mut app);
+        let Some(Bar::Custom(slot)) = app.settings.bars.add_custom("Mine") else {
+            panic!("a toolbar made");
+        };
+        let bar = ItemBar::Custom(slot);
+        frame(&ctx, &mut app);
+        frame(&ctx, &mut app);
+        let drawn = |app: &App| {
+            app.shown_bar_slots
+                .iter()
+                .find(|s| s.bar == bar)
+                .cloned()
+                .expect("the new toolbar is drawn")
+        };
+        assert!(drawn(&app).items.is_empty(), "made empty");
+        assert!(drawn(&app).rect.width() >= 40.0, "with room to drop on");
+        // Page Border has no picture of its own (#3211).
+        let key = "menu.view.page_border";
+        assert!(!crate::ui::menus::has_menu_picture(key));
+        apply_drop(
+            &mut app,
+            &ItemDrag {
+                item: key.into(),
+                from: None,
+            },
+            Some((bar, 0)),
+        );
+        assert_eq!(items(&app, bar), vec![key.to_string()]);
+        frame(&ctx, &mut app);
+        frame(&ctx, &mut app);
+        let r = drawn(&app).items[0];
+        assert!(
+            r.width() > 40.0,
+            "named in words, wider than a picture button: {r:?}"
+        );
+        let shown = app.show_page_border;
+        frame_with(&ctx, &mut app, vec![egui::Event::PointerMoved(r.center())]);
+        frame_with(
+            &ctx,
+            &mut app,
+            vec![button(r.center(), true, egui::PointerButton::Primary)],
+        );
+        frame_with(
+            &ctx,
+            &mut app,
+            vec![button(r.center(), false, egui::PointerButton::Primary)],
+        );
+        frame(&ctx, &mut app);
+        assert_ne!(app.show_page_border, shown, "the button runs Page Border");
+        // Hidden from Window > Toolbars, it is not drawn.
+        Bar::Custom(slot).set_visible(&mut app, false);
+        frame(&ctx, &mut app);
+        assert!(app.shown_bar_slots.iter().all(|s| s.bar != bar));
+        // Deleted, it goes with its buttons.
+        crate::ui::options::delete_custom_bar(&mut app, slot);
+        assert!(app.settings.bars.custom.is_empty());
+        assert!(!app.settings.bar_items.contains_key(Bar::Custom(slot).id()));
         frame(&ctx, &mut app);
     }
 
