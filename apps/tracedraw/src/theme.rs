@@ -1138,15 +1138,7 @@ fn fallback_fonts(defs: &mut egui::FontDefinitions) -> Vec<String> {
     let fs = tracedraw_text::fonts();
     let mut added = Vec::new();
     for group in groups {
-        // Use the system UI face for compact Chinese labels on Windows.
-        // Keep the script groups in language order for Japanese and Traditional Chinese.
-        let native_ui_face =
-            if cfg!(target_os = "windows") && group.first() == Some(&"Noto Sans CJK SC") {
-                fs.first_face_data(&["Microsoft YaHei UI", "Microsoft YaHei"])
-            } else {
-                None
-            };
-        let Some((name, data, index)) = native_ui_face.or_else(|| fs.first_face_data(group)) else {
+        let Some((name, data, index)) = fs.first_face_data(group) else {
             continue;
         };
         let key = format!("fallback-{name}");
@@ -1172,39 +1164,6 @@ fn fallback_fonts(defs: &mut egui::FontDefinitions) -> Vec<String> {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
-
-    /// Compact Chinese labels use the regular system UI face when installed.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn chinese_interface_uses_the_regular_windows_ui_face() {
-        let Some((name, data, index)) =
-            tracedraw_text::fonts().first_face_data(&["Microsoft YaHei UI", "Microsoft YaHei"])
-        else {
-            return;
-        };
-        let face = ttf_parser::Face::parse(&data, index).expect("installed UI face");
-        assert_eq!(face.weight(), ttf_parser::Weight::Normal);
-        assert!(!face.is_italic());
-        let defs = font_definitions();
-        let key = format!("fallback-{name}");
-        let registered = defs.font_data.get(&key).expect("native UI font registered");
-        assert_eq!(registered.index, index);
-        assert_eq!(registered.font.as_ref(), data.as_slice());
-        let regular = defs
-            .families
-            .get(&egui::FontFamily::Proportional)
-            .expect("regular interface family");
-        assert!(regular.contains(&key));
-        assert_eq!(regular.first().map(String::as_str), Some("ui-regular"));
-        let ctx = egui::Context::default();
-        ctx.set_fonts(defs);
-        let mut out = ctx.run_ui(Default::default(), |_| {});
-        out.textures_delta.clear();
-        let font = egui::FontId::proportional(13.0);
-        for c in "文件编辑视图对象文本图像效果页面工具窗口帮助".chars() {
-            assert!(ctx.fonts_mut(|f| f.has_glyph(&font, c)), "{c}");
-        }
-    }
 
     /// A test that switches the theme leaves the theme of the tests
     /// running alongside alone: the pointer bitmaps are kept by theme, and
