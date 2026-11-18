@@ -1825,7 +1825,7 @@ impl PathPlacement {
         let (at, dir) = self.baseline.at(self.start + p.x - self.line_x0)?;
         let flip = if self.flip { -1.0 } else { 1.0 };
         let local = Point::new(0.0, flip * (p.y - self.line_y + self.lift));
-        Some(Affine::translate(at.to_vec2()) * letter_frame(self.orientation, dir) * local)
+        Some(Affine::translate(at.to_vec2()) * path_letter_frame(self.orientation, dir) * local)
     }
 
     /// The point of the straight layout placed nearest the point `p`
@@ -6277,7 +6277,7 @@ fn place_on_path(
         let Some((p, dir)) = baseline.at(mid) else {
             continue;
         };
-        let along = letter_frame(tp.orientation, dir);
+        let along = path_letter_frame(tp.orientation, dir);
         let place = Affine::translate(p.to_vec2())
             * along
             * flip
@@ -6326,7 +6326,7 @@ fn place_glyph(collect: bool, a: Affine, g: &Glyph, out: &mut GlyphLayout) {
 
 /// How a letter centred at a point of the path with unit direction `dir`
 /// is turned or sheared there (before the letter's own flip).
-fn letter_frame(o: PathTextOrientation, dir: tracedraw_core::geometry::Vec2) -> Affine {
+pub fn path_letter_frame(o: PathTextOrientation, dir: tracedraw_core::geometry::Vec2) -> Affine {
     // The direction's horizontal part, kept away from zero so a nearly
     // vertical stretch of path does not shear a letter to a line.
     let cx = if dir.x.abs() < 0.2 {
