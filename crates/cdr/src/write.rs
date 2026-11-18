@@ -355,6 +355,23 @@ const CLIP_CONTAINER_FLAG: u8 = 0x10;
 /// The flags of a drawing's own layer (byte 3: a layer; byte 0 the kind,
 /// byte 2 set on a master layer).
 const PLAIN_LAYER_FLAGS: [u8; 4] = [0, 0, 0, 0x98];
+/// The flags of a drawing's own layer from version 16: bit 0 of byte 1
+/// hides it, 0x10 in byte 0 locks it and 0x08 keeps it from print and
+/// export, as files of version 27 hold them (`docs/cdr-format.md`,
+/// "Modern saved states", #2850).
+fn layer_state_flags(l: &tracedraw_core::document::Layer) -> [u8; 4] {
+    let mut f = PLAIN_LAYER_FLAGS;
+    if l.locked {
+        f[0] |= 0x10;
+    }
+    if !l.printable {
+        f[0] |= 0x08;
+    }
+    if !l.visible {
+        f[1] |= 1;
+    }
+    f
+}
 /// Layer kinds stored as the `loda` object type of a layer.
 const LAYER_PLAIN: u32 = 0;
 const LAYER_GRID: u32 = 0x0b;
@@ -4723,8 +4740,22 @@ impl<'a> Writer<'a> {
         if v.zip() {
             // Front to back, as files list them.
             for layer in page.layers.iter().rev() {
-                let objects = self.layer_objects(layer, centre, &mut content);
-                layers.push(self.layer(PLAIN_LAYER_FLAGS, LAYER_PLAIN, &layer.name, objects));
+                // From version 16 a layer's state is a flag, as the
+                // files' own layers carry it (#2850): a hidden layer
+                // keeps its objects. Before, it goes out empty.
+                let (flags, objects) = if v.style_strings() {
+                    let objects = self.objects(&layer.shapes, centre, 0);
+                    if let (true, Some(b)) = (layer.visible, objects.bounds) {
+                        content = Some(content.map_or(b, |c| c.union(b)));
+                    }
+                    (layer_state_flags(layer), objects.nodes)
+                } else {
+                    (
+                        PLAIN_LAYER_FLAGS,
+                        self.layer_objects(layer, centre, &mut content),
+                    )
+                };
+                layers.push(self.layer(flags, LAYER_PLAIN, &layer.name, objects));
             }
         } else {
             let slots = std::mem::take(&mut self.layer_slots);
@@ -5671,6 +5702,45 @@ impl<'a> Writer<'a> {
             plain.raster_fx = None;
             return self.drawn_as(s, vec![plain], 0, None, centre, depth);
         }
+        // An object holding what these files cannot hold yet (a pattern,
+        // texture, PostScript or mesh fill, fountain options, an outline
+        // fill, arrowheads, overprint) goes out with stand-ins: the fill
+        // as one colour or the nearest plain fountain, the arrowheads as
+        // curves above the line in the outline's colour, which `outl`
+        // has no place for. From version 14 the package's own member
+        // keeps the object, so it opens here as it was saved.
+        if self.drawing_effects == 0 && s.effects.is_empty() && crate::kept_effects::not_held(s) {
+            let shadow = s.shadow.as_ref().and_then(|_| self.shadow_picture(s));
+            let mut plain = s.clone();
+            plain.shadow = None;
+            let mut heads = Vec::new();
+            if let Some(st) = plain.stroke.as_mut() {
+                if crate::kept_effects::has_arrowheads(st) {
+                    for head in tracedraw_core::arrowhead_paths(&s.page_path(), st) {
+                        let mut h = Shape::new(
+                            // No object of the drawing: the line keeps its
+                            // static id.
+                            tracedraw_core::ShapeId(u64::MAX),
+                            ShapeKind::Path {
+                                path: head,
+                                closed: true,
+                            },
+                        );
+                        h.fill = Fill::Solid(st.color);
+                        h.stroke = None;
+                        h.visible = s.visible;
+                        h.locked = s.locked;
+                        h.overprint_fill = s.overprint_outline;
+                        heads.push(h);
+                    }
+                    st.start_arrow = tracedraw_core::Arrowhead::None;
+                    st.end_arrow = tracedraw_core::Arrowhead::None;
+                }
+            }
+            let mut all = vec![plain];
+            all.extend(heads);
+            return self.drawn_as(s, all, 0, shadow, centre, depth);
+        }
         // An object with live effects goes out as what they draw, and its
         // drop shadow as a picture of it beneath it (the caller's, or one
         // drawn here). From version 14 the package's own member keeps the
@@ -6110,11 +6180,19 @@ impl<'a> Writer<'a> {
                     // their style strings hold `winding` "1" (#2733). The
                     // winding stays in the style string, so TraceDraw
                     // reads the curve back as nonzero.
+                    // A curve the merge leaves as it is (no contours
+                    // overlapping one turning the same way) keeps its
+                    // chosen node types, as any other curve.
                     ShapeKind::Path { path, .. }
                         if s.fill_rule == tracedraw_core::shaping::FillRule::NonZero
                             && !matches!(s.fill, Fill::None) =>
                     {
-                        curve_coords(&tracedraw_core::shaping::nonzero_as_even_odd(path))
+                        let merged = tracedraw_core::shaping::nonzero_as_even_odd(path);
+                        if merged == *path {
+                            curve_coords_typed(path, &s.node_types)
+                        } else {
+                            curve_coords(&merged)
+                        }
                     }
                     ShapeKind::Path { path, .. } => curve_coords_typed(path, &s.node_types),
                     // The outline of a text fitted to a path, or bent,
@@ -6303,6 +6381,23 @@ impl<'a> Writer<'a> {
     ) -> Vec<u8> {
         let v = self.v;
         let n = v.0;
+        // Before 12 the letters are Windows-1252, which has no line
+        // separator: a line break inside a paragraph (U+2028) goes out as
+        // a paragraph break, the nearest the format holds, instead of a
+        // "?" that also turned every other letter beyond ASCII into one.
+        let broken: Vec<TextSpan>;
+        let spans = if !v.unicode() && spans.iter().any(|s| s.text.contains('\u{2028}')) {
+            broken = spans
+                .iter()
+                .map(|s| TextSpan {
+                    text: s.text.replace('\u{2028}', "\n"),
+                    ..s.clone()
+                })
+                .collect();
+            &broken[..]
+        } else {
+            spans
+        };
         // As files of versions 7 to 15 hold artistic text: -1, -1, 0, -1,
         // 8, a number growing with the version (2 in 7, 4 in 8 (both
         // variants), 4 in 9, 5 in 10 and 11, 6 in 12, 8 in 13, 9 in 14, 11
