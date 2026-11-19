@@ -67,7 +67,7 @@ pub use icc::{Intent as RenderingIntent, Profile as IccProfile, Transform as Icc
 pub use id::{LayerId, PageId, ShapeId};
 pub use paragraphs::ParagraphFormat;
 pub use style::{
-    arrowhead_paths, arrowhead_shaft_path, Arrowhead, ArrowheadPlacement, ColorBlend, Fill,
+    arrowhead_paths, arrowhead_shaft_path, arrowhead_stroke_path, Arrowhead, ArrowheadPlacement, ColorBlend, Fill,
     Fountain, FountainKind, FountainRepeat, LineCap, LineJoin, Mesh, MeshHandle, MeshNode,
     OutlinePosition, Pattern, PatternTile, Procedural, ProceduralParam, ProceduralParams,
     ProceduralPattern, Stop, Stroke, Texture, TextureKind, WidthNode,

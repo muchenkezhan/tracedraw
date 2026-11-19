@@ -3637,6 +3637,15 @@ fn command_items(app: &App, category: Option<&str>, filter: &str) -> Vec<Command
     out
 }
 
+/// The commands the Commands page lists: [`command_items`] in
+/// alphabetical order, as CorelDRAW lists them. In menu order a command
+/// was slow to find in a long category (#3212).
+fn listed_commands(app: &App, category: Option<&str>, filter: &str) -> Vec<CommandItem> {
+    let mut out = command_items(app, category, filter);
+    out.sort_by_cached_key(|c| c.name.to_lowercase());
+    out
+}
+
 const LIST_W: f32 = 240.0;
 const LIST_H: f32 = 330.0;
 const ROW_H: f32 = 24.0;
@@ -3717,7 +3726,7 @@ fn commands_page(app: &mut App, ui: &mut Ui) {
     });
     ui.add_space(4.0);
     let filter = app.shortcut_editor.filter.trim().to_lowercase();
-    let items = command_items(app, app.shortcut_editor.category.as_deref(), &filter);
+    let items = listed_commands(app, app.shortcut_editor.category.as_deref(), &filter);
     if app
         .shortcut_editor
         .selected
@@ -4294,7 +4303,9 @@ fn command_bars_page(app: &mut App, ui: &mut Ui) {
                             format!("{}\n{}", tr(key), tr("options.show_bar_tip"))
                         });
                     }
+                    custom_bars_list(app, ui);
                 });
+            custom_bars_buttons(app, ui);
             if ui
                 .button(tr("options.reset"))
                 .rich_tip(crate::ui::tips::pair("options.reset", "dialog.reset_desc"))
@@ -4318,6 +4329,133 @@ fn command_bars_page(app: &mut App, ui: &mut Ui) {
             ));
         });
     });
+}
+
+/// The toolbar the user made that is picked in the Command Bars list
+/// (renamed and deleted with the controls under it).
+fn picked_custom_bar(app: &App, ui: &Ui) -> Option<u8> {
+    let picked: Option<u8> = ui.data(|d| d.get_temp(custom_bar_pick_id())).flatten();
+    picked.filter(|s| app.settings.bars.custom_bar(*s).is_some())
+}
+
+fn custom_bar_pick_id() -> egui::Id {
+    egui::Id::new("command_bars_custom_picked")
+}
+
+/// The toolbars the user made in the Command Bars list (#3264): each
+/// shown or not with its box, picked with a click on its name.
+fn custom_bars_list(app: &mut App, ui: &mut Ui) {
+    let picked = picked_custom_bar(app, ui);
+    let bars: Vec<(u8, String, bool)> = app
+        .settings
+        .bars
+        .custom
+        .iter()
+        .map(|c| {
+            let bar = crate::ui::bars::Bar::Custom(c.slot);
+            (c.slot, bar.name(app), c.shown)
+        })
+        .collect();
+    for (slot, name, shown) in bars {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let mut on = shown;
+            if ui
+                .checkbox(&mut on, "")
+                .rich_tip_with(|| format!("{}\n{}", name, tr("options.show_bar_tip")))
+                .changed()
+            {
+                crate::ui::bars::Bar::Custom(slot).set_visible(app, on);
+            }
+            if ui
+                .selectable_label(picked == Some(slot), &name)
+                .rich_tip(crate::ui::tips::pair(
+                    "bars.custom_bar",
+                    "options.custom_bar_pick_tip",
+                ))
+                .clicked()
+            {
+                ui.data_mut(|d| d.insert_temp(custom_bar_pick_id(), Some(slot)));
+            }
+        });
+    }
+}
+
+/// New, the picked toolbar's name and Delete, under the Command Bars list
+/// (#3264). A new toolbar is empty and shown; commands are dragged onto
+/// it from the Commands page (or with Alt from another bar).
+fn custom_bars_buttons(app: &mut App, ui: &mut Ui) {
+    let picked = picked_custom_bar(app, ui);
+    ui.horizontal(|ui| {
+        let room = app.settings.bars.custom.len() < crate::ui::bars::MAX_CUSTOM;
+        if ui
+            .add_enabled(room, egui::Button::new(tr("options.custom_bar_new")))
+            .rich_tip(crate::ui::tips::pair(
+                "options.custom_bar_new",
+                "options.custom_bar_new_tip",
+            ))
+            .clicked()
+        {
+            let name = new_custom_bar_name(app);
+            if let Some(crate::ui::bars::Bar::Custom(slot)) = app.settings.bars.add_custom(&name) {
+                ui.data_mut(|d| d.insert_temp(custom_bar_pick_id(), Some(slot)));
+            }
+        }
+        if ui
+            .add_enabled(
+                picked.is_some(),
+                egui::Button::new(tr("options.custom_bar_delete")),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "options.custom_bar_delete",
+                "options.custom_bar_delete_tip",
+            ))
+            .clicked()
+        {
+            if let Some(slot) = picked {
+                delete_custom_bar(app, slot);
+                ui.data_mut(|d| d.insert_temp(custom_bar_pick_id(), None::<u8>));
+            }
+        }
+    });
+    if let Some(slot) = picked {
+        ui.horizontal(|ui| {
+            ui.label(tr("options.custom_bar_name"));
+            let mut name = app
+                .settings
+                .bars
+                .custom_bar(slot)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            if ui
+                .add(egui::TextEdit::singleline(&mut name).desired_width(140.0))
+                .changed()
+            {
+                app.settings.bars.rename_custom(slot, &name);
+            }
+        });
+    }
+}
+
+/// The name a new toolbar gets: "New Toolbar", then "New Toolbar 2" and
+/// so on, one no other toolbar the user made has.
+pub(crate) fn new_custom_bar_name(app: &App) -> String {
+    let base = tr("options.custom_bar_default_name");
+    let taken = |n: &str| app.settings.bars.custom.iter().any(|c| c.name == n);
+    if !taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|i| format!("{base} {i}"))
+        .find(|n| !taken(n))
+        .unwrap_or(base)
+}
+
+/// Take away the toolbar the user made in `slot`, with its buttons.
+pub(crate) fn delete_custom_bar(app: &mut App, slot: u8) {
+    let id = crate::ui::bars::Bar::Custom(slot).id();
+    app.settings.bar_items.remove(id);
+    app.settings.bars.remove_custom(slot);
 }
 
 // ----- Tools -------------------------------------------------------------
@@ -6051,6 +6189,13 @@ mod tests {
         assert!(text.iter().any(|c| c.id == "menu.table.create_new_table"));
         assert!(text.iter().any(|c| c.id == "menu.text.grammar"));
         assert!(command_items(&app, Some("menu.table"), "").is_empty());
+        // Listed in alphabetical order (#3212).
+        for category in [None, Some("menu.file"), Some("menu.text"), Some(TOOLBOX)] {
+            let list = listed_commands(&app, category, "");
+            assert_eq!(list.len(), command_items(&app, category, "").len());
+            let names: Vec<String> = list.iter().map(|c| c.name.to_lowercase()).collect();
+            assert!(names.windows(2).all(|w| w[0] <= w[1]), "{names:?}");
+        }
         // A user's key shows beside the built-in one (#822).
         let open = file
             .iter()

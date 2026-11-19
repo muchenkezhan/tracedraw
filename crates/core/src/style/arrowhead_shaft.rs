@@ -452,7 +452,11 @@ mod tests {
             ..Default::default()
         };
         let body = arrowhead_shaft_path(&path, &stroke, 1.0);
-        assert!(body.bounding_box().x0.abs() < 1e-6);
+        let heads = arrowhead_paths(&path, &stroke);
+        // A repeated point does not hide the direction of the next segment.
+        assert_eq!(heads.len(), 2);
+        assert!((body.bounding_box().x0 - heads[0].bounding_box().x1).abs() < 1e-6);
+        assert!((body.bounding_box().x1 - heads[1].bounding_box().x0).abs() < 1e-6);
         assert!((body.bounding_box().x1 - 92.8).abs() < 1e-6);
     }
 

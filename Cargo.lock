@@ -4305,6 +4305,7 @@ dependencies = [
  "log",
  "lopdf",
  "matrixmultiply",
+ "png",
  "pollster 0.4.0",
  "qrcode",
  "rfd",
@@ -4428,6 +4429,7 @@ dependencies = [
  "tracedraw-render",
  "tracedraw-text",
  "ttf-parser",
+ "unicode-bidi",
  "usvg",
  "web-time",
  "zip",
@@ -4464,6 +4466,7 @@ dependencies = [
 name = "tracedraw-thumbnailer"
 version = "0.48.0"
 dependencies = [
+ "tracedraw-cdr",
  "tracedraw-core",
  "tracedraw-render",
  "tracedraw-text",
