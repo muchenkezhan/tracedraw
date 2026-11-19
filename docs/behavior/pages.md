@@ -1,5 +1,14 @@
 # Pages
 
+## Undo and Redo of the page shown
+
+When Undo or Redo takes away the page shown (Undo of Insert Page or of
+Duplicate Page, Redo of Delete Page), the page now at its place becomes
+current, or the last page when it was the last one, and the selection is
+cleared. The view no longer stays on a page that is gone, where nothing
+could be drawn (
+`app::tests::undo_of_the_page_shown_moves_to_a_page_that_is_there`).
+
 ## Duplicate Page
 
 Page > Duplicate Page..., the page tab menu's Duplicate Page... and the
@@ -20,6 +29,24 @@ page with " (copy)", and becomes the current page. It is one command,
 `Command::DuplicatePage { page, before, contents }`, so one undo step
 removes it. A saved or scripted command that names only the page copies
 it with its contents after it, as before (Data Merge works that way).
+
+Copied with its contents, the page's linked text frames are a chain of
+the copies and a blend ends at the copy of its end object, in the same
+undo step: the copies named the original page's objects, so the copied
+frames ran on into the original chain and the copied blend followed the
+original end object
+(`textflow::tests::a_duplicated_page_keeps_its_copied_chain_to_itself`,
+`blend_link::tests::a_duplicated_page_blends_to_its_own_end_object`).
+
+## Deleting a page or a layer with linked text frames
+
+A page deleted (the page tab's Delete, Page > Delete Page) or a layer
+deleted in the Objects docker with a frame of a linked text chain on it
+leaves that frame's text to the frames left, as deleting the frame itself
+does (see [Text](text.md)): the frames left are relinked and the text
+flows anew over them, in the same undo step. The text the deleted frame
+showed was lost with the page or the layer
+(`textflow::tests::deleting_a_page_or_layer_holding_a_frame_of_a_chain_keeps_its_text`).
 
 Tests: `command::tests::duplicate_page_goes_before_or_after_with_or_without_contents`,
 `command::tests::a_saved_duplicate_page_without_options_copies_contents_after`,

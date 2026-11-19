@@ -1757,6 +1757,71 @@ fn ctrl_keeps_lines_to_the_constrain_angle() {
     );
 }
 
+/// #3219: a polyline whose last node is placed on its first (by a snap
+/// to the node, or a click just outside the reach that closes it) and
+/// then finished is closed, so its corner there is joined like the
+/// others instead of two capped ends; one with an end elsewhere stays
+/// open.
+#[test]
+fn a_line_finished_on_its_first_node_is_closed() {
+    let (ctx, mut app, first) = setup();
+    app.select(vec![first]);
+    app.delete_selection();
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    app.set_tool(Tool::Polyline);
+    let pts = [
+        Point::new(40.0, 120.0),
+        Point::new(150.0, 60.0),
+        Point::new(180.0, 130.0),
+        Point::new(40.0, 120.0),
+    ];
+    let start = |app: &mut App, pts: &[Point]| {
+        app.curve = Some(crate::app::CurveInProgress {
+            nodes: pts.iter().map(|p| (*p, None)).collect(),
+            ..Default::default()
+        });
+        app.finish_curve();
+    };
+    start(&mut app, &pts);
+    let shape = app
+        .doc()
+        .all_layers()
+        .flat_map(|l| &l.shapes)
+        .last()
+        .cloned()
+        .expect("a curve");
+    let ShapeKind::Path { path, closed } = &shape.kind else {
+        panic!("{:?}", shape.kind)
+    };
+    assert!(closed, "{path:?}");
+    let els = path.elements();
+    assert!(
+        matches!(
+            els.last(),
+            Some(tracedraw_core::geometry::PathEl::ClosePath)
+        ),
+        "{els:?}"
+    );
+    // Three corners, the first not doubled.
+    assert_eq!(els.len(), 4, "{els:?}");
+    // Ending elsewhere, it stays open.
+    let mut open = pts;
+    open[3] = Point::new(60.0, 125.0);
+    start(&mut app, &open);
+    let ShapeKind::Path { closed, .. } = &app
+        .doc()
+        .all_layers()
+        .flat_map(|l| &l.shapes)
+        .last()
+        .expect("a curve")
+        .kind
+    else {
+        panic!()
+    };
+    assert!(!closed);
+    let _ = last_path(&app);
+}
+
 /// Two filled 20 x 20 mm squares grouped (at x 100 and 140, y 100) and a
 /// third square on its own at (100, 150), nothing selected.
 fn grouped() -> (egui::Context, App, [ShapeId; 3], ShapeId) {
@@ -2632,10 +2697,15 @@ fn the_pointer_shows_moves_for_objects_and_guidelines() {
     assert!(close(page_bounds(&app, c).y0 - before.y0, 30.0));
     assert_eq!(cursor(&app, to), moving);
     assert_eq!(cursor(&app, on_a), arrow);
-    // An unselected object over a guideline: the arrow, not the arrows
-    // across the guideline, as the object takes the press.
+    // A guideline over an unselected object: the arrows across the
+    // guideline, as it takes the press (guidelines lie above the layers,
+    // #2640); over the selected object the move arrows.
     app.add_guide(tracedraw_core::document::Guide::horizontal(110.0));
-    assert_eq!(cursor(&app, on_a), arrow);
+    assert_eq!(
+        cursor(&app, on_a),
+        ToolCursor::System(egui::CursorIcon::ResizeVertical)
+    );
+    assert_eq!(cursor(&app, to), moving);
     app.select(Vec::new());
     app.delete_guide(0);
     // Guidelines: arrows across them; a locked one keeps the arrow.
@@ -5655,6 +5725,31 @@ fn alignment_guides_line_up_a_moved_object_and_show_the_line() {
     let _ = other;
 }
 
+/// Q held on its own turns all snapping off for as long as it is held, a
+/// drag included, and on again when it is let go; Alt+Q stays as it
+/// was. While a text is typed, Q is a letter and changes nothing (#3072).
+#[test]
+fn holding_q_turns_snapping_off_until_it_is_let_go() {
+    let (ctx, mut app, id) = setup();
+    app.snap.guides = true;
+    assert!(app.snap_enabled() && !app.snaps_off());
+    let none = Modifiers::NONE;
+    frame(&ctx, &mut app, vec![key(egui::Key::Q, none)], none);
+    assert!(app.snaps_off() && !app.snap_enabled());
+    assert!(!app.snap.off, "Alt+Q is not turned on");
+    // Still held over the next frames and through a drag.
+    let b = bounds(&app, id);
+    let from = app.view.to_screen(b.center());
+    let to = app.view.to_screen(b.center() + Vec2::new(3.0, 0.0));
+    drag(&ctx, &mut app, from, to, none, Vec::new());
+    frame(&ctx, &mut app, Vec::new(), none);
+    assert!(app.snaps_off());
+    frame(&ctx, &mut app, vec![key_up(egui::Key::Q, none)], none);
+    frame(&ctx, &mut app, Vec::new(), none);
+    assert!(!app.snaps_off() && app.snap_enabled());
+    assert_eq!(app.tool, Tool::Pick, "Q picks no tool");
+}
+
 /// With alignment guides on, a rectangle drawn near the size of another
 /// object takes its width and height.
 #[test]
@@ -7011,6 +7106,105 @@ fn clipped_away_contents_are_not_hit() {
     assert_eq!(app.hit_test(Point::new(35.0, y)), Some(clip));
 }
 
+/// #3354: with the Shape tool a rounded rectangle's corner node takes a
+/// press half as far again as the pick distance, so a press beside it
+/// drags the corner instead of missing it; farther off it takes nothing.
+#[test]
+fn a_press_beside_a_corner_node_drags_the_corner() {
+    let (ctx, mut app, _) = setup();
+    let reach = app.settings.nodes.pick_px() as f32;
+    let mut grabbed = |app: &mut App, off: f32, dir: egui::Vec2| {
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(100.0, 100.0, 160.0, 140.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![id]);
+        crate::ui::propbar::edit_corners(app, crate::ui::propbar::CornerEdit::Size(0, 5.0));
+        app.set_tool(Tool::Shape);
+        app.select(vec![id]);
+        frame(&ctx, app, Vec::new(), Modifiers::NONE);
+        let s = app.doc().find_shape(id).cloned().expect("rect");
+        let (_, q) = crate::kind_nodes::nodes(&s)[0];
+        let at = app.view.to_screen(q) + dir.normalized() * off;
+        drag(
+            &ctx,
+            app,
+            at,
+            at + egui::vec2(15.0, 15.0),
+            Modifiers::NONE,
+            Vec::new(),
+        );
+        let r = app
+            .doc()
+            .find_shape(id)
+            .and_then(|s| s.page_corners())
+            .expect("corners")
+            .radii[0];
+        app.set_tool(Tool::Pick);
+        app.select(vec![id]);
+        app.delete_selection();
+        (r - 5.0).abs() > 0.5
+    };
+    for dir in [
+        egui::vec2(1.0, 1.0),
+        egui::vec2(-1.0, -1.0),
+        egui::vec2(1.0, 0.0),
+        egui::vec2(0.0, 1.0),
+    ] {
+        assert!(grabbed(&mut app, 0.0, dir), "on the node");
+        assert!(
+            grabbed(&mut app, reach * 1.3, dir),
+            "{dir:?}: beside the node, past the plain pick distance"
+        );
+        assert!(!grabbed(&mut app, reach * 2.5, dir), "{dir:?}: far off");
+    }
+}
+
+/// #3354: Relative corner scaling set from the Shape tool's bar decides
+/// what a later resize does to the corners: on, they grow with the
+/// rectangle; off, they keep their size on the page.
+#[test]
+fn relative_corner_scaling_set_with_the_shape_tool_changes_a_resize() {
+    use crate::ui::propbar::{edit_corners, CornerEdit};
+    let mut radii = Vec::new();
+    for relative in [true, false] {
+        let (_, mut app, _) = setup();
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(100.0, 100.0, 160.0, 140.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![id]);
+        edit_corners(&mut app, CornerEdit::Size(0, 5.0));
+        app.set_tool(Tool::Shape);
+        app.select(vec![id]);
+        edit_corners(&mut app, CornerEdit::Scaling(relative));
+        let c = app
+            .doc()
+            .find_shape(id)
+            .and_then(|s| s.page_corners())
+            .expect("corners");
+        assert_eq!(c.fixed, !relative, "the toggle reached the rectangle");
+        app.set_tool(Tool::Pick);
+        app.select(vec![id]);
+        app.transform_selection(Affine::scale(2.0));
+        radii.push(
+            app.doc()
+                .find_shape(id)
+                .and_then(|s| s.page_corners())
+                .expect("corners")
+                .radii[0],
+        );
+    }
+    assert!(close(radii[0], 10.0), "relative: {radii:?}");
+    assert!(close(radii[1], 5.0), "fixed: {radii:?}");
+}
+
 #[test]
 fn new_rounded_rectangles_keep_circular_corners_when_stretched() {
     use crate::ui::propbar::{edit_corners, CornerEdit};
@@ -7457,6 +7651,61 @@ fn freehand_clicks_add_nodes_and_a_double_click_ends_the_line() {
     assert!(app.curve.is_none());
     assert_eq!(shape_count(&app), before + 3);
     assert_eq!(pts_of(&app).len(), 2);
+}
+
+/// Freehand by clicks: a click on the first node of a line of three nodes
+/// or more closes it, where the pointer shows the close mark (#2339); it
+/// added a node there and the line went on, so a closed shape took a
+/// double-click. A double-click there closes it once and starts nothing.
+#[test]
+fn a_freehand_click_on_the_first_node_closes_the_line() {
+    for double in [false, true] {
+        let (ctx, mut app, _id) = setup();
+        app.set_tool(Tool::Freehand);
+        let view = app.view.clone();
+        let at = |x: f64, y: f64| view.to_screen(Point::new(x, y));
+        let before = shape_count(&app);
+        for q in [at(100.0, 100.0), at(160.0, 100.0), at(160.0, 160.0)] {
+            click_at(&ctx, &mut app, q, Modifiers::NONE);
+            for _ in 0..30 {
+                frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+            }
+        }
+        // A little off the first node, within reach.
+        let first = at(100.5, 100.3);
+        frame(&ctx, &mut app, vec![Event::PointerMoved(first)], Modifiers::NONE);
+        let clicks = if double { 2 } else { 1 };
+        for _ in 0..clicks {
+            for down in [true, false] {
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![button(first, down, PointerButton::Primary, Modifiers::NONE)],
+                    Modifiers::NONE,
+                );
+            }
+        }
+        for _ in 0..30 {
+            frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+        }
+        assert!(app.curve.is_none(), "double {double}: {:?}", app.curve);
+        assert_eq!(shape_count(&app), before + 1, "double {double}");
+        let s = app
+            .doc()
+            .find_shape(app.selection[0])
+            .expect("the closed line")
+            .clone();
+        let ShapeKind::Path { path, closed } = &s.kind else {
+            panic!("a curve: {:?}", s.kind);
+        };
+        assert!(*closed, "double {double}");
+        let corners = path
+            .elements()
+            .iter()
+            .filter(|e| matches!(e, tracedraw_core::geometry::PathEl::LineTo(_)))
+            .count();
+        assert_eq!(corners, 2, "three nodes, no extra one: {path:?}");
+    }
 }
 
 /// Space ends the curve being drawn with any of the line tools, as a
@@ -9178,7 +9427,7 @@ fn space_toggles_between_the_tool_and_the_pick_tool() {
     let toolbox = ctx
         .read_response(egui::Id::new((
             "bar_background",
-            crate::ui::bars::Bar::Toolbox as u8,
+            crate::ui::bars::Bar::Toolbox.salt(),
         )))
         .map(|r| r.rect)
         .expect("the toolbox");
@@ -17550,7 +17799,7 @@ fn a_right_click_on_any_toolbar_keeps_the_bar_menu_open() {
     use crate::ui::bars::{Bar, Dock};
     let (ctx, mut app, _) = setup();
     let background = |ctx: &egui::Context, bar: Bar| {
-        ctx.read_response(egui::Id::new(("bar_background", bar as u8)))
+        ctx.read_response(egui::Id::new(("bar_background", bar.salt())))
             .map(|r| r.rect)
             .expect("the bar's background")
     };
@@ -20239,6 +20488,58 @@ fn remove_background_brushes_paint_on_the_preview() {
         bg_state(&app).settings.backdrop,
         Some(crate::bg_remove::BgBackdrop::WHITE)
     );
+}
+
+/// While a stroke is painted the preview's settings hold it as their
+/// last stroke, so the result shows it before the pointer is let go;
+/// the dialog's own settings (and their undo steps) get it on release
+/// (#3422).
+#[test]
+fn remove_background_shows_the_stroke_being_painted() {
+    use crate::ui::bitmap_dialogs::{bg_preview_settings, BgRemoveState};
+    let mut st = BgRemoveState::default();
+    assert_eq!(bg_preview_settings(&st), st.settings);
+    st.brush = Some(false);
+    st.picking = true;
+    st.brush_size = 10.0;
+    // A brush that has painted nothing yet changes nothing.
+    assert_eq!(bg_preview_settings(&st), st.settings);
+    st.stroke = vec![[0.2, 0.5], [0.4, 0.5]];
+    let shown = bg_preview_settings(&st);
+    assert!(st.settings.strokes.is_empty());
+    assert_eq!(shown.strokes.len(), 1);
+    assert!(!shown.strokes[0].restore);
+    assert_eq!(shown.strokes[0].points, st.stroke);
+    assert!((shown.strokes[0].radius - 0.1).abs() < 1.0e-6);
+    // The picture follows: the painted part of the subject is gone.
+    let img = image::RgbaImage::from_fn(100, 100, |x, y| {
+        if (25..75).contains(&x) && (25..75).contains(&y) {
+            image::Rgba([200, 30, 30, 255])
+        } else {
+            image::Rgba([250, 250, 250, 255])
+        }
+    });
+    let before = crate::bg_remove::remove_background(&img, &st.settings, 1.0);
+    let during = crate::bg_remove::remove_background(&img, &shown, 1.0);
+    assert_eq!(before.get_pixel(35, 50).0[3], 255);
+    assert_eq!(during.get_pixel(35, 50).0[3], 0);
+    assert_eq!(during.get_pixel(65, 65).0[3], 255);
+    // The pressed brush is drawn as such: the dialog marks its buttons.
+    let (ctx, mut app) = bg_three_setup();
+    click_at(
+        &ctx,
+        &mut app,
+        preview_rect(&ctx, "bg_brush_restore").center(),
+        Modifiers::NONE,
+    );
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert_eq!(bg_state(&app).brush, Some(true));
+    let (erase, restore) = (
+        preview_rect(&ctx, "bg_brush_erase"),
+        preview_rect(&ctx, "bg_brush_restore"),
+    );
+    assert!(erase.width() > 40.0 && restore.width() > 40.0);
+    assert!(erase.right() <= restore.left(), "{erase:?} {restore:?}");
 }
 
 fn bg_state(app: &App) -> crate::ui::bitmap_dialogs::BgRemoveState {
@@ -28061,6 +28362,77 @@ fn a_guideline_over_a_picture_is_dragged_and_the_picture_stays() {
     assert_eq!(cursor(&app, on), ToolCursor::System(egui::CursorIcon::Move));
 }
 
+#[test]
+fn a_guideline_over_a_shape_or_a_group_is_dragged_and_they_stay() {
+    // #2640 (tested in 0.48): a guideline across a filled shape or a
+    // group showed no arrows and took no press, as only pictures let a
+    // guideline win. Guidelines lie above the layers, as in CorelDRAW:
+    // over any object that is not selected the guideline moves.
+    let (ctx, mut app, _) = setup();
+    let fill = tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(200, 30, 30));
+    let a = app
+        .new_shape(ShapeKind::Rect {
+            rect: Rect::new(20.0, 20.0, 80.0, 60.0),
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("rect");
+    app.select(vec![a]);
+    app.apply_fill(fill.clone());
+    let b = app
+        .new_shape(ShapeKind::Ellipse {
+            rect: Rect::new(100.0, 20.0, 160.0, 60.0),
+            arc: None,
+        })
+        .expect("ellipse");
+    app.select(vec![b]);
+    app.apply_fill(fill);
+    let c = app
+        .new_shape(ShapeKind::Ellipse {
+            rect: Rect::new(100.0, 70.0, 160.0, 90.0),
+            arc: None,
+        })
+        .expect("ellipse");
+    app.select(vec![b, c]);
+    app.group_selection();
+    let group = app.selection[0];
+    assert!(matches!(
+        app.doc().find_shape(group).map(|s| &s.kind),
+        Some(ShapeKind::Group { .. })
+    ));
+    app.select(Vec::new());
+    let y = 40.0;
+    app.add_guide(tracedraw_core::document::Guide::horizontal(y));
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let cursor = |app: &App, at: Pos2| for_tool(app, false, false, false, Some(at));
+    let guide_y = |app: &App| match app.page_guides()[0].line {
+        tracedraw_core::document::GuideLine::Horizontal { y } => y,
+        ref other => panic!("guideline turned into {other:?}"),
+    };
+    let mut y_now = y;
+    for (id, x) in [(a, 50.0), (group, 130.0)] {
+        let before = page_bounds(&app, id);
+        let at = app.view.to_screen(Point::new(x, y_now));
+        assert_eq!(
+            cursor(&app, at),
+            ToolCursor::System(egui::CursorIcon::ResizeVertical),
+            "the guideline's arrows over {id:?}"
+        );
+        let to = app.view.to_screen(Point::new(x, y_now + 5.0));
+        drag(&ctx, &mut app, at, to, Modifiers::NONE, Vec::new());
+        assert_eq!(page_bounds(&app, id), before, "{id:?} stays");
+        assert!((guide_y(&app) - (y_now + 5.0)).abs() < 0.5);
+        y_now = guide_y(&app);
+        app.select(Vec::new());
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    // Over a selected object the press still moves the selection.
+    app.select(vec![a]);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let on = app.view.to_screen(Point::new(50.0, y_now));
+    assert_eq!(cursor(&app, on), ToolCursor::System(egui::CursorIcon::Move));
+}
+
 /// Two pages: the red rectangle selected on the first, a grey one on
 /// the second (its id), the first page shown, and the second page's
 /// tab on screen.
@@ -29025,4 +29397,55 @@ fn control_handle_heads_follow_the_handle_size() {
     assert!(large > medium && medium > small, "{large} {medium} {small}");
     // A press still takes the whole head at every size.
     assert!(prefs.handle_pick_px() >= prefs.pick_px());
+}
+
+/// #3352: with the Speech Balloon tool, a balloon already on the page is
+/// clicked to select it, then another style is clicked on the property
+/// bar: the selected balloon takes the style at once, in the same place.
+#[test]
+fn a_balloon_picked_with_its_tool_takes_the_style_clicked_on_the_bar() {
+    use crate::balloons::{Balloon, BalloonStyle};
+    let (ctx, mut app, _) = setup();
+    app.set_tool(Tool::Balloon);
+    app.create_box_shape(Point::new(80.0, 60.0), Point::new(140.0, 100.0));
+    let (id, before, _) = app.selected_balloons()[0];
+    app.select(Vec::new());
+    let none = Modifiers::NONE;
+    for _ in 0..3 {
+        frame(&ctx, &mut app, Vec::new(), none);
+    }
+    // A click inside the balloon's body picks it.
+    let inside = app.view.to_screen(Point::new(110.0, 80.0));
+    click_at(&ctx, &mut app, inside, none);
+    assert_eq!(app.selection, vec![id], "the balloon is picked");
+    // Where the bar draws the Thought style.
+    let find = |ctx: &egui::Context, app: &mut App, events: Vec<Event>| {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(1600.0, 1000.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        crate::pen::filter_raw_input(ctx, &mut input);
+        let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+        out.textures_delta.clear();
+        out.shapes.iter().find_map(|c| match &c.shape {
+            egui::epaint::Shape::Text(t)
+                if t.galley.text() == crate::i18n::tr("balloon.thought") =>
+            {
+                Some(t.visual_bounding_rect().center())
+            }
+            _ => None,
+        })
+    };
+    let at = find(&ctx, &mut app, Vec::new()).expect("the Thought style on the bar");
+    click_at(&ctx, &mut app, at, none);
+    let s = app.doc().find_shape(id).expect("balloon");
+    let after = Balloon::of(s).expect("still a balloon");
+    assert_eq!(after.style, BalloonStyle::Thought, "the picked balloon");
+    assert_eq!(after.body, before.body, "same box");
+    assert_eq!(after.tip, before.tip, "same tail tip");
+    assert_eq!(app.selection, vec![id], "still selected");
 }

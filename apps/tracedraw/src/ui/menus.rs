@@ -4647,6 +4647,9 @@ fn tools_menu(app: &mut App, ui: &mut Ui) {
     if item(ui, "menu.tools.recolor", "", !app.selection.is_empty()) {
         app.recolor_dialog();
     }
+    if item(ui, "menu.tools.replace_color", "", app.has_document()) {
+        app.replace_color_dialog();
+    }
     sep(ui);
     sub(ui, "menu.tools.scripts", |ui| {
         if item(ui, "menu.tools.scripts_docker", "", true) {
@@ -4747,6 +4750,16 @@ pub(crate) fn toolbars_list(app: &mut App, ui: &mut Ui) {
     if check(ui, "menu.window.toolbar_time_tracker", "", tracker) {
         app.settings.time_tracker.show_bar = !tracker;
     }
+    // The toolbars the user made, by their names (#3264).
+    let slots: Vec<u8> = app.settings.bars.custom.iter().map(|c| c.slot).collect();
+    for slot in slots {
+        let bar = crate::ui::bars::Bar::Custom(slot);
+        let on = bar.visible(app);
+        let id = format!("menu.window.toolbar_{}", bar.id());
+        if check_label(ui, &bar.name(app), &id, on) {
+            bar.set_visible(app, !on);
+        }
+    }
 }
 
 fn window_menu(app: &mut App, ui: &mut Ui) {
@@ -4785,6 +4798,18 @@ fn window_menu(app: &mut App, ui: &mut Ui) {
             if item(ui, key, "", arranged) {
                 set_layout(app, WindowLayout::Tabs);
             }
+        }
+        // #2904: a drawing in a window of its own, for another monitor.
+        let detached = has && crate::ui::detached::is_detached(app, app.active_doc);
+        let can = has && !detached && crate::ui::detached::can_detach(ui.ctx());
+        if item(ui, "menu.window.detach_window", "", can) {
+            app.show_welcome = false;
+            let ctx = ui.ctx().clone();
+            crate::ui::detached::detach_active(app, &ctx);
+        }
+        if item(ui, "menu.window.attach_window", "", detached) {
+            let i = app.active_doc;
+            crate::ui::detached::attach(app, i);
         }
     }
     sep(ui);
