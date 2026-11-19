@@ -1405,7 +1405,7 @@ pub(crate) mod replay {
 
     /// Items that would block on a native file chooser, start another
     /// program (an editor or the web browser) or close the window.
-    const SKIP: [&str; 19] = [
+    const SKIP: [&str; 21] = [
         "menu.tools.plugin_install",
         "menu.object.insert_object_add",
         "menu.object.insert_object_file",
@@ -1419,6 +1419,8 @@ pub(crate) mod replay {
         "menu.file.save_as",
         "menu.file.save_as_template",
         "menu.file.import",
+        "menu.file.combine_files",
+        "menu.file.save_pages_as_files",
         "menu.file.exit",
         "menu.bitmaps.edit_bitmap",
         "menu.tools.scripts_run",
@@ -1829,7 +1831,8 @@ mod tests {
             [
                 "menu.object.create_arrowhead",
                 "menu.object.create_pattern",
-                "menu.object.add_common_shape"
+                "menu.object.add_common_shape",
+                "menu.object.shape_generator"
             ]
         );
         assert!(find("menu.table.create_new_table").is_some());
@@ -2435,8 +2438,12 @@ pub fn menu_bar(app: &mut App, ui: &mut Ui) {
         .filter(|(m, _)| m.alt && !(m.ctrl || m.command || m.shift))
         .map(|(_, k)| k)
         .collect();
+    // A dialog keeps Alt and its letters: Alt+O in Text > Edit Text
+    // opened the Object menu behind it (#3370).
+    let dialog_open = !matches!(app.dialog, crate::ui::dialogs::Dialog::None);
     let blocked = move |c: char| {
         capturing
+            || dialog_open
             || (symmetry_e && c == 'e')
             || access::key_of(c).is_some_and(|k| user_alt_keys.contains(&k))
     };
@@ -2774,6 +2781,14 @@ fn file_menu(app: &mut App, ui: &mut Ui) {
     if item(ui, "menu.file.import", "Ctrl+I", doc) {
         app.import();
     }
+    // The pages of other drawings added, and each page saved as a
+    // drawing of its own (#3358).
+    if item(ui, "menu.file.combine_files", "", doc) {
+        app.combine_files();
+    }
+    if item(ui, "menu.file.save_pages_as_files", "", doc) {
+        app.save_pages_as_files();
+    }
     if item(ui, "menu.file.export", "Ctrl+E", doc) {
         // Shift held shows the options even when they are set not to show.
         if !invoke::active() && ui.input(|i| i.modifiers.shift) {
@@ -3069,6 +3084,11 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
     }
     if item(ui, "menu.view.zoom_to_fit", "F4", true) {
         app.zoom_to_fit();
+    }
+    // Real size: the zoom box's 100%, as a command a key can be given
+    // in Options > Customization > Commands (#3103).
+    if item(ui, "menu.view.zoom_1to1", "", true) {
+        app.set_zoom_percent(100.0);
     }
     // The key held shows the Navigator while it is down (`view_navigator`);
     // the menu row opens it until a click.
@@ -3429,6 +3449,16 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
             !app.selection.is_empty(),
         ) {
             app.add_selection_as_common_shape();
+        }
+        // Patterns, line art, iso blocks and cone templates from
+        // settings (#3412, #3413).
+        if check(
+            ui,
+            "menu.object.shape_generator",
+            "",
+            effect_docker_open(app, DockerTab::ShapeGenerator),
+        ) {
+            app.open_docker(DockerTab::ShapeGenerator);
         }
     });
     sub(ui, "menu.object.insert", |ui| {
@@ -3894,6 +3924,14 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
             outside: true,
         };
     }
+    // The outline one step wider or narrower, for a key of one's own
+    // (#2905).
+    if item(ui, "menu.object.outline_thicker", "", has) {
+        app.step_outline_width(true);
+    }
+    if item(ui, "menu.object.outline_thinner", "", has) {
+        app.step_outline_width(false);
+    }
     if item(ui, "menu.object.join_curves", "", true) {
         app.show_dockers = true;
         app.docker_tab = crate::app::DockerTab::JoinCurves;
@@ -4023,6 +4061,7 @@ fn effects_menu(app: &mut App, ui: &mut Ui) {
         ("menu.effects.lens", "Alt+F3", DockerTab::Lens),
         ("menu.effects.picture_mosaic", "", DockerTab::PictureMosaic),
         ("menu.effects.vector_mosaic", "", DockerTab::VectorMosaic),
+        ("menu.effects.symbol_scatter", "", DockerTab::SymbolScatter),
     ] {
         if check(ui, key, shortcut, effect_docker_open(app, tab)) {
             app.open_docker(tab);
