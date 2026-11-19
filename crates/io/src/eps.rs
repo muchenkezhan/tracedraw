@@ -377,6 +377,14 @@ impl Writer<'_> {
                 return;
             }
             ShapeKind::ClipFrame { frame, contents } => {
+                // An outline behind the frame's fill goes beneath the fill
+                // and the contents (#3110).
+                let behind = frame.stroke.as_ref().is_some_and(|st| st.behind_fill);
+                let mut outline = (**frame).clone();
+                outline.fill = Fill::None;
+                if behind {
+                    self.shape(&outline, transform);
+                }
                 let mut fill_only = (**frame).clone();
                 fill_only.stroke = None;
                 self.shape(&fill_only, transform);
@@ -387,9 +395,9 @@ impl Writer<'_> {
                     self.shape(c, transform);
                 }
                 let _ = writeln!(self.out, "grestore");
-                let mut outline = (**frame).clone();
-                outline.fill = Fill::None;
-                self.shape(&outline, transform);
+                if !behind {
+                    self.shape(&outline, transform);
+                }
                 return;
             }
             ShapeKind::Bitmap { rect, png, .. } => {
@@ -574,7 +582,11 @@ impl Writer<'_> {
                 let _ = writeln!(self.out, "[] 0 setdash");
             }
             let _ = writeln!(self.out, "{} setmiterlimit", f(s.miter_ratio()));
-            self.path_ops(&path);
+            // A line with arrowheads ends under them, as drawn (#2981).
+            match tracedraw_core::arrowhead_stroke_path(&shape.page_path(), s) {
+                Some(cut) => self.path_ops(&(parent * cut)),
+                None => self.path_ops(&path),
+            }
             let _ = writeln!(self.out, "stroke");
             // Arrowheads (presets and custom): the page-space path already
             // carries the shape's own transform, so only the parent applies.

@@ -751,15 +751,12 @@ impl App {
             para: Default::default(),
             on_path: None,
         };
-        if let Some(id) = self.new_shape(kind) {
-            self.run(Command::SetFill {
-                shapes: vec![id],
-                fill,
-            });
-            self.run(Command::SetStroke {
-                shapes: vec![id],
-                stroke,
-            });
+        // One step to undo: the text, its fill and its outline were three.
+        if let Some(id) = self.new_shape_styled(kind, |s| {
+            s.fill = fill;
+            s.stroke = stroke;
+        }) {
+            self.bring_pasted_into_edited_frame(&[id]);
             self.select(vec![id]);
         }
     }
@@ -771,14 +768,18 @@ impl App {
         };
         match tracedraw_io::svg_import::parse(svg, &mut tracedraw_core::id::IdSource::default()) {
             Ok(imported) => {
-                let mut cmds = Vec::new();
                 let mut ids = Vec::new();
+                let mut shapes = Vec::new();
                 for s in imported.shapes {
                     let id = self.engine.new_shape_id();
-                    let shape = crate::app::reid_pub(s, id, &mut self.engine);
                     ids.push(id);
-                    cmds.push(Command::AddShape { layer, shape });
+                    shapes.push(crate::app::reid_pub(s, id, &mut self.engine));
                 }
+                self.bring_into_edited_frame(&mut shapes);
+                let cmds: Vec<Command> = shapes
+                    .into_iter()
+                    .map(|shape| Command::AddShape { layer, shape })
+                    .collect();
                 if let Err(e) = self.engine.run_batch("Paste", &cmds) {
                     self.status = e.to_string();
                 }
@@ -822,14 +823,20 @@ impl App {
         let Some(layer) = self.active_layer() else {
             return false;
         };
-        let mut cmds = Vec::new();
         let mut new_ids = Vec::new();
+        let mut copies = Vec::new();
         for s in shapes {
             let id = self.engine.new_shape_id();
-            let shape = crate::app::reid_pub(s, id, &mut self.engine);
             new_ids.push(id);
-            cmds.push(Command::AddShape { layer, shape });
+            copies.push(crate::app::reid_pub(s, id, &mut self.engine));
         }
+        // While a clip frame's contents are edited: where the frame shows
+        // them (#2044).
+        self.bring_into_edited_frame(&mut copies);
+        let cmds: Vec<Command> = copies
+            .into_iter()
+            .map(|shape| Command::AddShape { layer, shape })
+            .collect();
         if let Err(e) = self.engine.run_batch("Paste", &cmds) {
             self.status = e.to_string();
             return false;
@@ -841,6 +848,7 @@ impl App {
     /// Paste the system clipboard's image as a bitmap object.
     pub fn paste_as_bitmap(&mut self, img: image::RgbaImage) {
         if let Some(id) = self.place_image(img, Some(tr("kind.bitmap_short"))) {
+            self.bring_pasted_into_edited_frame(&[id]);
             self.select(vec![id]);
         }
     }
@@ -1520,6 +1528,109 @@ mod eframe_paste_gate;
 mod tests {
     use super::*;
 
+    /// Text another program copied pastes as one step to undo: the text,
+    /// its fill and its outline were three, so the first two Undos took
+    /// off only colours.
+    #[test]
+    fn pasted_text_is_one_step() {
+        let mut app = App::headless();
+        let steps = app.engine.history_labels().0.len();
+        app.paste_from(ClipboardContent {
+            text: Some("hello".into()),
+            ..Default::default()
+        });
+        assert_eq!(app.selection.len(), 1);
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+        let id = app.selection[0];
+        app.undo();
+        assert!(app.doc().find_shape(id).is_none(), "one Undo takes it off");
+    }
+
+    /// SVG, a picture or text from another program, pasted while a clip
+    /// frame's contents are edited, goes where the frame shows it, in one
+    /// step, as a copy made here does (#2044). The SVG came in where the
+    /// other program had it, the picture and the text at the page centre:
+    /// away from the frame, Finish put them in it and it cut them away.
+    #[test]
+    fn pastes_from_other_programs_land_inside_an_edited_clip_frame() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm" viewBox="0 0 20 20"><rect x="0" y="0" width="5" height="5" fill="red"/></svg>"#;
+        let picture = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255]));
+        for (what, content) in [
+            (
+                "svg",
+                ClipboardContent {
+                    text: Some(svg.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vector",
+                ClipboardContent {
+                    vector: Some(svg.as_bytes().to_vec()),
+                    image: Some(picture.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "picture",
+                ClipboardContent {
+                    image: Some(picture.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "text",
+                ClipboardContent {
+                    text: Some("abc".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut app = App::headless();
+            let rect = |app: &mut App, r: tracedraw_core::geometry::Rect| {
+                app.new_shape(ShapeKind::Rect {
+                    rect: r,
+                    radius: 0.0,
+                    corners: None,
+                })
+                .expect("rect")
+            };
+            use tracedraw_core::geometry::Rect;
+            // Well away from the page centre and from the pasted SVG.
+            let frame = rect(&mut app, Rect::new(150.0, 230.0, 190.0, 270.0));
+            let inner = rect(&mut app, Rect::new(160.0, 240.0, 170.0, 250.0));
+            app.place_inside(vec![inner], frame);
+            app.select(vec![frame]);
+            app.edit_clip_frame();
+            assert!(app.editing_clip_contents());
+            let steps = app.engine.history_labels().0.len();
+            app.paste_from(content);
+            assert_eq!(
+                app.engine.history_labels().0.len(),
+                steps + 1,
+                "{what}: one step"
+            );
+            let pasted = app.selection.clone();
+            assert!(!pasted.is_empty(), "{what}");
+            let b = app.selection_bounds().expect("bounds");
+            let frame_box = Rect::new(150.0, 230.0, 190.0, 270.0);
+            assert!(
+                (b.center() - frame_box.center()).hypot() < 1e-6,
+                "{what}: {b:?}"
+            );
+            app.finish_clip_frame_edit();
+            match &app.doc().find_shape(frame).expect("frame").kind {
+                ShapeKind::ClipFrame { contents, .. } => {
+                    assert!(
+                        pasted.iter().all(|id| contents.iter().any(|c| c.id == *id)),
+                        "{what}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     /// The picture a copy offers (#2288) is 150 dpi, and smaller for a
     /// selection whose longer side would pass 4000 pixels; the copied
     /// objects drawn alone fill it.
@@ -1693,6 +1804,90 @@ mod tests {
             ..picture()
         });
         assert!(is_bitmap(&app));
+    }
+
+    /// #3104: a copy in AutoCAD puts a metafile of the drawing on the
+    /// clipboard beside text (its settings), and no picture. The metafile
+    /// is level and plumb lines drawn under a clip rectangle; those were
+    /// dropped as outside the clip, the metafile read as empty and the
+    /// paste gave the text. The drawing's lines are pasted, not the text.
+    #[test]
+    fn a_metafile_copied_with_text_pastes_the_drawing_not_the_text() {
+        fn le(v: &mut Vec<u8>, xs: &[i32]) {
+            for x in xs {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        fn rec(ty: i32, body: &[i32]) -> Vec<u8> {
+            let mut r = Vec::new();
+            le(&mut r, &[ty, 8 + 4 * body.len() as i32]);
+            le(&mut r, body);
+            r
+        }
+        fn line16(a: (i16, i16), b: (i16, i16)) -> Vec<u8> {
+            let mut r = Vec::new();
+            le(&mut r, &[87, 8 + 16 + 4 + 8, 0, 0, 0, 0, 2]);
+            for v in [a.0, a.1, b.0, b.1] {
+                r.extend_from_slice(&v.to_le_bytes());
+            }
+            r
+        }
+        // Header: bounds 1000 x 500 px, frame 100 x 50 mm, 1000 x 500 px
+        // for 100 x 50 mm of device.
+        let mut emf = Vec::new();
+        le(&mut emf, &[1, 108, 0, 0, 999, 499, 0, 0, 10_000, 5_000]);
+        emf.extend_from_slice(b" EMF");
+        le(
+            &mut emf,
+            &[0x10000, 0, 0, 0x0001_0010, 0, 0, 0, 1000, 500, 100, 50],
+        );
+        emf.resize(108, 0);
+        let records = [
+            rec(17, &[8]),
+            rec(9, &[10_000, -5_000]),
+            rec(10, &[0, 5_000]),
+            rec(11, &[1000, 500]),
+            rec(30, &[0, 0, 10_000, 5_000]),
+            rec(95, &[1, 0, 0, 0, 0, 0x10000, 0, 0, 0, 0]),
+            rec(37, &[1]),
+            line16((1000, 1000), (9000, 1000)),
+            line16((9000, 1000), (9000, 4000)),
+            line16((9000, 4000), (1000, 4000)),
+            line16((1000, 4000), (1000, 1000)),
+            rec(14, &[0, 0, 0]),
+        ];
+        for r in &records {
+            emf.extend_from_slice(r);
+        }
+        let n = emf.len() as i32;
+        emf[48..52].copy_from_slice(&n.to_le_bytes());
+        let mut app = App::headless();
+        app.paste_from(ClipboardContent {
+            text: Some("LTSCALE 1.0000 DIMSCALE 1.0000 UNITS Millimeters".into()),
+            vector: Some(emf),
+            ..Default::default()
+        });
+        fn lines(s: &tracedraw_core::document::Shape) -> usize {
+            match &s.kind {
+                ShapeKind::Group { children } => children.iter().map(lines).sum(),
+                ShapeKind::ClipFrame { contents, .. } => contents.iter().map(lines).sum(),
+                ShapeKind::Text { .. } => 0,
+                _ => usize::from(s.stroke.is_some()),
+            }
+        }
+        let shapes: Vec<_> = app.doc().all_layers().flat_map(|l| &l.shapes).collect();
+        assert!(
+            !shapes
+                .iter()
+                .any(|s| matches!(s.kind, ShapeKind::Text { .. })),
+            "the drawing, not the settings text"
+        );
+        assert_eq!(
+            shapes.iter().copied().map(lines).sum::<usize>(),
+            4,
+            "the four lines"
+        );
+        assert!(!app.selection.is_empty(), "selected");
     }
 
     /// Paste in View with nothing copied here pastes what another program
