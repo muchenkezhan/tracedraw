@@ -26,6 +26,8 @@ tracedraw-core.workspace = true
 tracedraw-cdr.workspace = true
 tracedraw-io.workspace = true
 tracedraw-text.workspace = true
+# Letters of the fonts the trace compares small print with (trace_text.rs).
+ttf-parser.workspace = true
 tracedraw-render.workspace = true
 tracedraw-vba.workspace = true
 tracedraw-vba-project.workspace = true
@@ -47,11 +49,19 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Reading CMYK TIFF files with their inks (Edit Bitmap, #1834); the same
 # version the image crate reads TIFF with.
 tiff = "0.11"
+# Writing a PNG a strip of rows at a time, for pictures too large to hold
+# whole (#3039); the same version the image crate writes PNG with.
+png = "0.18"
 # Reading the four channels of a CMYK JPEG as they are stored, to show
 # them through the colour management and keep them as inks (#2163); the
 # same versions the image crate reads JPEG with.
 zune-jpeg = "0.5"
 zune-core = { version = "0.5", default-features = false }
+# JPEG XL pictures (#3210, #3063), both in pure Rust: reading with
+# jxl-oxide through the image crate's decoder interface, and writing
+# lossless with zune-jpegxl. No thread pools, so the browser build works.
+jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
+zune-jpegxl = { version = "0.5", default-features = false, features = ["std"] }
 log.workspace = true
 env_logger.workspace = true
 flate2 = "1"
@@ -80,6 +90,9 @@ ureq = { version = "3", features = ["platform-verifier"] }
 # Lossy WebP export (libwebp, BSD licence): the pure-Rust encoder writes
 # lossless files only (#592).
 webp = { version = "0.3", default-features = false }
+# Enlarge before tracing: the matrix products of the AI enlargement
+# (MIT OR Apache-2.0, pure Rust).
+matrixmultiply = "0.3"
 
 # The system clipboard (text, images, copied files): the desktop builds;
 # a browser hands over clipboard contents in paste events only and
@@ -115,7 +128,7 @@ winit = { version = "0.30", default-features = false }
 # system drag sends no pointer moves (#1142).
 [target.'cfg(windows)'.dependencies]
 # The spell checker of Windows (COM, #1405).
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry"] }
 # The window's message hook: characters input methods send that the
 # windowing layer drops (#1151). The same winit eframe uses.
 winit = { version = "0.30", default-features = false }

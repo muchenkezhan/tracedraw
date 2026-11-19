@@ -52,11 +52,11 @@ impl App {
         if self.pending_palette_sample {
             // The document palette's eyedropper: the colour under the
             // pointer joins the palette; Ctrl keeps sampling.
-            let more = response.ctx.input(|i| i.modifiers.ctrl);
+            let (more, outline) = response
+                .ctx
+                .input(|i| (i.modifiers.ctrl, i.modifiers.shift));
             self.pending_palette_sample = more;
-            if let Some(c) = self.sample_color_at(p, false) {
-                self.add_to_document_palette(c);
-            }
+            self.sample_into_document_palette(p, outline);
             return true;
         }
         if self.pending_merge_frame {
@@ -461,7 +461,10 @@ impl App {
     /// that show count as walls: a line hidden under an object's opaque
     /// fill does not cut the area, #1281) and create a filled object from
     /// it. The area can be anywhere, on the page or off it on the desktop,
-    /// and a drawing of any size (#499).
+    /// and a drawing of any size (#499). With the bar's "Up to outline
+    /// edges" on, each outline counts as wide as it is drawn: the area
+    /// stops at its inner edge, and lines whose middles miss each other
+    /// but whose widths overlap still close it (#3321).
     pub fn area_fill_at(&mut self, p: Point) {
         let shapes: Vec<Shape> = self
             .doc()
@@ -473,7 +476,13 @@ impl App {
             .collect();
         // Bottom to top: each outline and whether its fill hides what
         // lies beneath it.
-        fn collect(s: &Shape, parent: Affine, out: &mut Vec<(BezPath, bool)>) {
+        fn collect(
+            s: &Shape,
+            parent: Affine,
+            edges: bool,
+            out: &mut Vec<(BezPath, bool)>,
+            bands: &mut Vec<BezPath>,
+        ) {
             let t = parent * s.transform;
             if !s.effects.is_empty() {
                 // What the object draws, in drawing order: the objects its
@@ -498,13 +507,33 @@ impl App {
                 return;
             }
             match &s.kind {
-                ShapeKind::Group { children } => children.iter().for_each(|c| collect(c, t, out)),
-                _ => out.push((t * s.local_path(), hides_below(s))),
+                ShapeKind::Group { children } => children
+                    .iter()
+                    .for_each(|c| collect(c, t, edges, out, bands)),
+                _ => {
+                    out.push((t * s.local_path(), hides_below(s)));
+                    // The band the outline draws, as an opaque object: its
+                    // edges are the walls and the middle line under it is
+                    // cut away.
+                    if edges && s.stroke.as_ref().is_some_and(|st| st.width > 0.0) {
+                        let mut on_page = s.clone();
+                        on_page.transform_by(parent);
+                        if let Some(band) = crate::tools2::outline_object_path(&on_page) {
+                            bands.push(band.clone());
+                            out.push((band, true));
+                        }
+                    }
+                }
             }
         }
-        let mut parts = Vec::new();
+        let edges = self.area_fill_outline_edges;
+        let (mut parts, mut bands) = (Vec::new(), Vec::new());
         for s in &shapes {
-            collect(s, Affine::IDENTITY, &mut parts);
+            collect(s, Affine::IDENTITY, edges, &mut parts, &mut bands);
+        }
+        // A click on a drawn outline fills nothing, as on a thin one.
+        if edges && bands.iter().any(|b| kurbo::Shape::winding(b, p) != 0) {
+            return;
         }
         // The area the outlines close off around the click, its sides
         // their own curves (#734); a click in an open area or on an
@@ -592,6 +621,23 @@ impl App {
     /// the node follows the pointer, snapping where it lands (#2004,
     /// discussion #2073).
     pub fn effect_node_input(&mut self, response: &Response, p: Point) -> bool {
+        // Checked before the click, which the second click of a
+        // double-click also is.
+        if response.double_clicked() {
+            // Double-click on a mesh node: the grid lines through it go,
+            // as with Delete and as in CorelDRAW; a row or column could
+            // not be taken out with the mouse (d#2889).
+            let on_node = self.effect_node_at(p).filter(|h| {
+                !crate::mesh_tool::is_mesh_handle(h.1)
+                    && crate::mesh_tool::mesh_node_of(h.1).is_some()
+            });
+            if let Some(hit) = on_node {
+                self.selected_effect_node = Some(hit);
+                self.mesh_more_nodes = None;
+                self.delete_mesh_lines();
+                return true;
+            }
+        }
         if response.clicked_by(PointerButton::Primary) {
             if let Some(hit) = self.effect_node_at(p) {
                 // A handle keeps its node selected. Shift+click on a

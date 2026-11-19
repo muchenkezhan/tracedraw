@@ -254,7 +254,7 @@ pub fn tab_strip(app: &mut App, ui: &mut Ui, place: DockerPlace) {
                         let pic = pic
                             .as_ref()
                             .map(|f| f as &dyn Fn(&egui::Painter, egui::Rect));
-                        if crate::ui::menus::check_pic(ui, tab.key(), open, pic) {
+                        if crate::ui::menus::check_pic(ui, tab.key(), "", open, pic) {
                             if open {
                                 app.close_docker(tab);
                             } else {
@@ -690,7 +690,7 @@ pub fn floating_dockers(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-type TabIcon = fn(&egui::Painter, egui::Rect);
+pub(crate) type TabIcon = fn(&egui::Painter, egui::Rect);
 
 /// A docker tab's height: the close slot, the picture (`icon_h`) and the
 /// name running downwards (`name_w` long), or no name when `compact`.
@@ -712,7 +712,7 @@ fn icons_only(tabs: &[DockerTab], chosen: bool) -> bool {
 }
 
 /// The small picture above a docker tab's name.
-fn tab_icon(tab: DockerTab) -> Option<TabIcon> {
+pub(crate) fn tab_icon(tab: DockerTab) -> Option<TabIcon> {
     match tab {
         DockerTab::Hints => Some(|p, r| {
             // A pointer with a question mark.
@@ -4295,6 +4295,10 @@ fn outline_editor_mixed(
                 (vec![4.0, 2.0], "docker.dash_dashed"),
                 (vec![1.0, 1.0], "docker.dash_dotted"),
                 (vec![6.0, 2.0, 1.0, 2.0], "docker.dash_dash_dot"),
+                (
+                    tracedraw_core::Stroke::ROUND_DOTS.to_vec(),
+                    "docker.dash_round_dots",
+                ),
             ];
             let size = editor_choice_size(ui, choices.len(), 44.0);
             for (d, n) in choices {
@@ -4305,7 +4309,10 @@ fn outline_editor_mixed(
                     );
                     crate::ui::outline_pen::dash_line(p, line, &d, ink);
                 }) {
-                    s.dash = d;
+                    // Round dots take round caps (#3404).
+                    if s.set_dash(&d) {
+                        touched.push(StrokeField::Cap);
+                    }
                     touched.push(StrokeField::Dash);
                     changed = true;
                 }
@@ -4542,6 +4549,23 @@ pub fn kind_id(k: &ShapeKind) -> &'static str {
         ShapeKind::Table(_) => "Table",
         ShapeKind::SymbolInstance { .. } => "Symbol",
     }
+}
+
+/// What an object is, with what makes it more than its kind: a
+/// symmetry (#2997) or an object clone (#2877).
+pub fn tagged_kind(s: &tracedraw_core::document::Shape, kind: String) -> String {
+    let mut kind = kind;
+    if s
+        .effects
+        .iter()
+        .any(|e| matches!(e, tracedraw_core::live::Effect::Symmetry { .. }))
+    {
+        kind = trf("status.symmetry_kind", &[("k", &kind)]);
+    }
+    if crate::object_clone::clone_link(&s.data).is_some() {
+        kind = trf("status.clone_kind", &[("k", &kind)]);
+    }
+    kind
 }
 
 pub fn kind_name(k: &ShapeKind) -> String {
@@ -6669,6 +6693,7 @@ pub(crate) mod tests {
                 sharpness: 50.0,
                 complex: None,
                 twist: 0.0,
+                bend: 0.0,
             })
             .expect("polygon");
         app.start_text(Point::new(20.0, 80.0), None);

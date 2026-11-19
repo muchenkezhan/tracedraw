@@ -5,6 +5,18 @@ has none (new, or opened from a format TraceDraw only reads or converts,
 `.cdr` included), and File > Save As (Ctrl+Shift+S), open the Save
 Drawing dialog.
 
+A save never loses the file it replaces (`files::replace_with`): the new
+file is written whole under a `.part` name beside it first, and only
+then copied over the old one in place (keeping its permissions, links
+and an open drawing's hold on it) and the `.part` file removed. When the
+write fails half way (a full disk, an error while the drawing is
+written, the program stopped), the old file is as it was; it was
+written over from the start and left cut short, so both the old and the
+new drawing were lost. Should the copy into place fail, the `.part` file
+keeps the whole new file and the error on the status line names it. A
+new file is the `.part` file renamed. Exports and every other file the
+desktop writes go the same way (`files::tests::a_failed_write_keeps_the_file_it_was_replacing`).
+
 ## Save Drawing
 
 One window, 760 px wide, the same on every system:
@@ -118,6 +130,15 @@ One window, 760 px wide, the same on every system:
 - In the browser, where every save is a download, the dialog keeps the
   file name, type, version and properties, and says the browser saves
   the file in its downloads folder.
+- Options > General > Use the system's save dialog (on by default on
+  macOS, off elsewhere; not in the browser or on Android, #2965): Save
+  As, and Save of a drawing without a file, open the system's own save
+  dialog instead, in the folder and with the name the Save Drawing
+  dialog would offer, with TraceDraw and CorelDRAW as its types (the
+  drawing's own first). The extension chosen there sets the type, the
+  versions are the ones Options sets, the system asks before replacing a
+  file, and Cancel saves nothing
+  (`ui::save_as::tests::the_system_save_dialog_saves_in_the_type_chosen_there`).
 
 ## `.cdr` versions
 
@@ -151,6 +172,11 @@ version decides who can open a file:
 
 What each version's file holds is in `docs/cdr-format.md`, Writing.
 
+Layers keep their state from version 16: a hidden layer is saved
+hidden with its objects, and a locked layer or one kept from printing
+keeps that, as the program's own files hold them. Before version 16 a
+hidden layer is saved empty.
+
 Live effects and drop shadows are saved as what they draw (a distorted
 rectangle as its curve, a contour as its steps, a shadow as a picture
 of it beneath the object), which any program shows. From version 14
@@ -163,6 +189,25 @@ between opens as it was drawn. The objects themselves are kept whole in
 pictures and the end objects of its blends included), so the member grows
 with them; a member that inflates past 64 MB is not read, and its
 objects open as drawn.
+
+What the writer cannot write yet goes out with stand-ins any program
+shows: a pattern, texture, PostScript or mesh fill as one colour, a
+fountain with repeats, inversion, the shaped kind, midpoints or free
+nodes as the nearest plain fountain, an outline fill as the outline
+colour, and a line's arrowheads as curves of their own just above it,
+filled with the outline colour. From version 14 the same member keeps
+these objects as they were, so opened again in TraceDraw the fill, the
+arrowheads, the outline fill and overprint are all back; files of
+versions 7 to 13 open with the stand-ins.
+
+The document palette (with the names its colours go by), the spot inks,
+the colour styles and the object styles have no record written yet
+either, nor has the object style an object follows. From version 14
+the file carries them in members of its own (`tracedraw/document.json`,
+and the object's style in `tracedraw/data.json`), so opened again in
+TraceDraw they are all back and a spot colour names its ink again;
+other programs do not see them, and files of versions 7 to 13 lose
+them. A palette or ink the file itself gives wins over the member's.
 
 ## Open drawings keep their files (Windows, #2130)
 
@@ -191,6 +236,7 @@ another name.
 
 ## Checks
 
+- `files::tests::a_failed_write_keeps_the_file_it_was_replacing`
 - Each open drawing's file is held from the frame after it is opened or
   saved until it is closed or saved under another name, in the front tab
   or another, the file a drawing was opened from until it is saved under

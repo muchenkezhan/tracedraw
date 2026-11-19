@@ -57,6 +57,8 @@ pub struct Request {
     /// The preview copy's scale against the picture; the preview images
     /// come out at the copy's size.
     pub copy_scale: f32,
+    /// Trace a small picture enlarged first (see `upscale.rs`).
+    pub enlarge: bool,
 }
 
 /// The key of the Colors tab's colour edits of `s`.
@@ -80,6 +82,8 @@ pub struct Outcome {
     pub colors: Arc<Vec<([u8; 3], usize)>>,
     /// Mean centreline stroke width, pixels of what was traced.
     pub stroke_px: f64,
+    /// The size, pixels, of what was traced (`traced`'s space).
+    pub trace_size: (u32, u32),
     pub stats: Stats,
     pub after: ColorImage,
     pub wire: ColorImage,
@@ -100,6 +104,8 @@ pub struct Shown {
     pub traced: Arc<Vec<Traced>>,
     pub colors: Arc<Vec<([u8; 3], usize)>>,
     pub stroke_px: f64,
+    /// The size, pixels, of what was traced (`traced`'s space).
+    pub trace_size: (u32, u32),
     pub stats: Stats,
     pub after: TextureHandle,
     pub wire: TextureHandle,
@@ -160,6 +166,11 @@ pub struct Live {
     pub started: usize,
     /// How many times a trace on show was only given new colours.
     pub recolored: usize,
+    /// The threads the traces were made on that may still be running:
+    /// one stopped, or one whose last result is in, still asks for a
+    /// frame before it ends.
+    #[cfg(not(target_arch = "wasm32"))]
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Live {
@@ -297,6 +308,7 @@ impl Live {
             traced: o.traced,
             colors: o.colors,
             stroke_px: o.stroke_px,
+            trace_size: o.trace_size,
             stats: o.stats,
             after,
             wire,
@@ -334,7 +346,10 @@ impl Live {
             }
         };
         #[cfg(not(target_arch = "wasm32"))]
-        std::thread::spawn(work);
+        {
+            self.workers.retain(|t| !t.is_finished());
+            self.workers.push(std::thread::spawn(work));
+        }
         #[cfg(target_arch = "wasm32")]
         work();
         self.job = Some(Job {
@@ -406,6 +421,16 @@ impl Live {
     /// Whether Best optimization is running.
     pub fn optimizing(&self) -> bool {
         self.search.is_some()
+    }
+
+    /// Wait for every thread a trace was made on to end, so that none
+    /// asks for a frame later: what a test of the frames after a trace
+    /// waits for, instead of for some time to pass.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub fn join_workers(&mut self) {
+        for t in self.workers.drain(..) {
+            let _ = t.join();
+        }
     }
 
     /// Whether a trace is being made or waiting to start.
@@ -542,6 +567,7 @@ fn outcome(
         traced,
         colors,
         stroke_px,
+        trace_size: (tw, th),
         stats,
         after: color_image(&after),
         wire: color_image(&wire),
@@ -572,8 +598,10 @@ fn run(req: Request, cancel: &AtomicBool, mut send: impl FnMut(Outcome), defer_f
     // What changes the trace; the colour edits are put on after.
     let settings = req.settings.traced_part();
     let stage = |img: &RgbaImage, stage: Stage, done: bool| -> Option<Outcome> {
-        let raw = trace::trace_unless(img, &settings, Some(cancel))?;
-        let stroke_px = trace::last_stroke_width_px();
+        // Enlarged first when asked: the curves come back at the
+        // picture's own pixels.
+        let (raw, stroke_px) =
+            crate::upscale::trace_unless(img, &settings, req.enlarge, Some(cancel))?;
         outcome(
             &req,
             stage,
@@ -667,6 +695,7 @@ mod tests {
             settings: trace::Preset::Logo.settings(),
             image: Arc::new(img),
             copy_scale,
+            enlarge: false,
         }
     }
 
@@ -793,6 +822,7 @@ mod tests {
             settings: trace::Preset::Logo.settings(),
             image: img.clone(),
             copy_scale: 0.5,
+            enlarge: false,
         };
         live.want(&ctx, req(), false);
         live.poll(&ctx);
@@ -915,6 +945,7 @@ mod tests {
             settings: trace::Preset::Logo.settings(),
             image: img.clone(),
             copy_scale: 1.0,
+            enlarge: false,
         };
         live.want(&ctx, req(4), false);
         live.poll(&ctx);
@@ -952,6 +983,7 @@ mod tests {
             settings: trace::Preset::Logo.settings(),
             image: img.clone(),
             copy_scale: 1.0,
+            enlarge: false,
         };
         live.want(&ctx, req(1), false);
         live.poll(&ctx);
@@ -1012,6 +1044,7 @@ mod tests {
             settings,
             image: img.clone(),
             copy_scale: 1.0,
+            enlarge: false,
         };
         let plain = trace::Preset::Logo.settings();
         live.want(&ctx, req(plain.clone()), false);
@@ -1062,6 +1095,7 @@ mod tests {
             settings,
             image: Arc::new(big),
             copy_scale: 0.3,
+            enlarge: false,
         };
         live.want(&ctx, req, false);
         live.poll(&ctx);

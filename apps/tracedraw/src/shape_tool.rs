@@ -678,11 +678,24 @@ impl App {
                     return;
                 }
             }
-            // An edge of a selected polygon or star bends once dragged: it
-            // becomes a curve then (#2451).
+            // An edge of a selected polygon or star: a drag bends all its
+            // sides alike (#2451).
             if let Some(shape) = self.polygon_edge_at(p) {
-                self.drag = Drag::PolygonEdge { shape, from: p };
-                return;
+                let start = self
+                    .doc()
+                    .find_shape(shape)
+                    .map(|s| (s.kind.clone(), s.transform));
+                let parent = self.doc().parent_transform(shape);
+                if let (Some((start, t)), Some(parent)) = (start, parent) {
+                    self.drag = Drag::PolygonEdge {
+                        shape,
+                        from: p,
+                        start,
+                        to_local: (parent * t).inverse(),
+                        begun: false,
+                    };
+                    return;
+                }
             }
             // A marquee over the selected objects' nodes. It keeps the
             // selection, also when it starts over another object (the one
@@ -751,8 +764,44 @@ impl App {
                     };
                 }
                 Drag::NodeMove { .. } => self.node_move_to(p, mods),
+                Drag::PolygonEdge {
+                    shape,
+                    from,
+                    start,
+                    to_local,
+                    begun,
+                } if !matches!(
+                    start,
+                    ShapeKind::Polygon {
+                        complex: Some(_),
+                        ..
+                    }
+                ) =>
+                {
+                    // Every side bends alike as the pointer goes across
+                    // the edge grabbed; one undo step for the drag.
+                    if begun || (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
+                        if let Some(kind) =
+                            crate::kind_nodes::polygon_bent(&start, to_local * from, to_local * p)
+                        {
+                            let cmd = Command::SetShapeKind { shape, kind };
+                            let _ = if begun {
+                                self.engine.amend(&cmd)
+                            } else {
+                                self.engine.run_with_label(&cmd, "Bend Sides")
+                            };
+                        }
+                        self.drag = Drag::PolygonEdge {
+                            shape,
+                            from,
+                            start,
+                            to_local,
+                            begun: true,
+                        };
+                    }
+                }
                 Drag::PolygonEdge { from, .. } => {
-                    // The first move: curve first, then the edge bends.
+                    // A complex star: curve first, then the edge bends.
                     if (p - from).hypot() * self.view.zoom as f64 >= 2.0 {
                         self.drag = Drag::None;
                         if self.polygon_edge_to_curve(from) {
@@ -812,6 +861,11 @@ impl App {
                     index,
                     which,
                 } => {
+                    // A handle dragged is not chosen: no ring follows it,
+                    // and none stays once the button is let go. A click
+                    // without a drag chooses it for the arrow keys
+                    // (#2819, #3041, #3042).
+                    self.chosen_handle = None;
                     if let Some((path, closed, t)) = self.path_of(shape) {
                         // The handle snaps like a node does; Ctrl or Shift
                         // keeps it to the constrain angle about its node,
@@ -1405,9 +1459,24 @@ impl App {
             .filter(|k| self.handle_point(*k).is_some())
     }
 
-    /// Where the chosen control handle is, on the page (drawn ringed).
-    pub(crate) fn chosen_handle_point(&self) -> Option<Point> {
-        self.handle_point(self.chosen_handle()?)
+    /// The chosen control handle's node and tip, on the page: the ring
+    /// goes round the handle's head, which points from the node to the
+    /// tip (#3041).
+    /// While a handle is dragged the ring stays on it, as long as the
+    /// button is held, and goes when it is let go (#3141).
+    pub(crate) fn chosen_handle_ends(&self) -> Option<(Point, Point)> {
+        let dragged = match self.drag {
+            Drag::Handle {
+                shape,
+                index,
+                which,
+            } if self.tool == crate::tools::Tool::Shape => Some((shape, index, which)),
+            _ => None,
+        };
+        let key = dragged.or_else(|| self.chosen_handle())?;
+        let (path, _, t) = self.path_of(key.0)?;
+        let n = nodes::nodes(&path).into_iter().find(|n| n.index == key.1)?;
+        Some((t * n.pos, self.handle_point(key)?))
     }
 
     /// Move the chosen control handle by `d` (page millimetres), one undo
@@ -1512,8 +1581,7 @@ impl App {
             if let Err(e) = self.engine.run_batch("Delete Nodes", &cmds) {
                 self.status = e.to_string();
             }
-            self.selection
-                .retain(|id| self.engine.document().find_shape(*id).is_some());
+            self.engine.document().retain_existing(&mut self.selection);
         }
         // The chosen nodes of a curve go together: neighbouring ones
         // become one curve keeping the outline's shape (#675).
