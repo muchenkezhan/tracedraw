@@ -369,6 +369,11 @@ fn object_menu_for(app: &mut App, ui: &mut Ui, close: &mut bool, source: Option<
                     close,
                     "docker.move_to_layer",
                 );
+            }
+        }
+        "docker.copy_to_layer" => {
+            if let Some(id) = source {
+                crate::ui::objects_docker::row_menu_item(app, ui, id, close, "docker.copy_to_layer");
                 sep(ui);
             }
         }
@@ -683,6 +688,19 @@ fn object_menu_for(app: &mut App, ui: &mut Ui, close: &mut bool, source: Option<
             if ci(ui, close, "menu.object.add_common_shape", "", true) {
                 app.add_selection_as_common_shape();
             }
+        }
+        "menu.edit.select_similar" => {
+            sub(ui, "menu.edit.select_similar", |ui| {
+                use crate::select_similar::Similar;
+                let keys = Similar::ALL.map(Similar::key);
+                for key in crate::ui::context_menu_filter::ordered_keys(&keys).iter().copied() {
+                    if let Some(how) = Similar::ALL.into_iter().find(|how| how.key() == key) {
+                        if ci(ui, close, key, "", true) {
+                            app.select_similar(how);
+                        }
+                    }
+                }
+            });
         }
         "menu.object.order" => {
             sep(ui);

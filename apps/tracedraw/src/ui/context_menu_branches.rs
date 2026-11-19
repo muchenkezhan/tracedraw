@@ -27,6 +27,12 @@ pub(crate) fn children(scene: &str, parent: &str) -> &'static [&'static str] {
             "menu.bitmaps.trace_high_quality",
             "menu.bitmaps.trace_optimized",
         ],
+        ("canvas_object" | "objects_object", "menu.edit.select_similar") => &[
+            "menu.edit.similar_fill",
+            "menu.edit.similar_outline",
+            "menu.edit.similar_text_format",
+            "menu.edit.similar_kind",
+        ],
         ("canvas_object" | "objects_object", "menu.object.order") => &[
             "menu.object.to_front_of_page",
             "menu.object.to_back_of_page",
@@ -226,7 +232,11 @@ fn order_roots(scene: &str, items: &mut [&'static str]) {
         "palette.reset_name",
     ];
     let first: &[&str] = match scene {
-        "objects_object" => &["docker.rename", "docker.move_to_layer"],
+        "objects_object" => &[
+            "docker.rename",
+            "docker.move_to_layer",
+            "docker.copy_to_layer",
+        ],
         "palette" | "palette_swatch" | "palette_document" | "palette_document_swatch" => &palette,
         _ => return,
     };
@@ -244,7 +254,10 @@ pub(crate) fn is_dynamic_branch(scene: &str, key: &str) -> bool {
     matches!(
         (scene, key),
         ("canvas_object" | "objects_object", "docker.object_styles")
-            | ("objects_object", "docker.move_to_layer")
+            | (
+                "objects_object",
+                "docker.move_to_layer" | "docker.copy_to_layer"
+            )
             | ("objects_layer", "docker.move_to_page")
             | ("font", "font_manager.add_to_collection")
             | (
@@ -261,6 +274,7 @@ pub(crate) fn is_root(scene: &str, key: &str) -> bool {
             "menu.bitmaps.trace",
             "menu.bitmaps.centerline_trace",
             "menu.bitmaps.outline_trace",
+            "menu.edit.select_similar",
             "menu.object.order",
             "context.frame_type",
             "context.internet_links",
@@ -483,8 +497,18 @@ mod tests {
         let roots = siblings("objects_object", &[]);
         assert_eq!(roots.first(), Some(&"docker.rename"));
         assert_eq!(roots.get(1), Some(&"docker.move_to_layer"));
+        assert_eq!(roots.get(2), Some(&"docker.copy_to_layer"));
         assert!(is_dynamic_branch("objects_object", "docker.move_to_layer"));
         assert!(!is_dynamic_branch("canvas_object", "docker.move_to_layer"));
         assert!(siblings("objects_object", &["docker.move_to_layer"]).is_empty());
+    }
+
+    #[test]
+    fn the_select_similar_branch_lists_the_real_actions() {
+        let keys = crate::select_similar::Similar::ALL.map(crate::select_similar::Similar::key);
+        for scene in ["canvas_object", "objects_object"] {
+            assert!(siblings(scene, &[]).contains(&"menu.edit.select_similar"));
+            assert_eq!(siblings(scene, &["menu.edit.select_similar"]), keys);
+        }
     }
 }

@@ -137,7 +137,7 @@ pub(crate) const ARG_CLIP_CONTENTS: u32 = 8005;
 const ARG_PAGE_SIZE: u32 = 19130;
 /// A symbol definition's record in its `sytr` group's `loda`: an
 /// identifier and the symbol's name (#2177, a version 15 file).
-const ARG_SYMBOL: u32 = 19201;
+pub(crate) const ARG_SYMBOL: u32 = 19201;
 /// Master page `loda` argument holding the document's page background.
 const ARG_PAGE_BACKGROUND: u32 = 17000;
 /// Object argument 16016: 1 hides the object (version 21).
@@ -2451,6 +2451,31 @@ impl<'a> Ctx<'a> {
                         }
                         _ => spans.push(span),
                     }
+                }
+            }
+        }
+        // Artistic text whose first lines are empty shows its first line
+        // with letters at its origin, its box that line's alone (#3215: a
+        // version 14 title starting with a paragraph break, which the
+        // same drawing saved as version 13 holds as curves on that
+        // baseline): the empty lines are dropped rather than pushing the
+        // letters down a line each.
+        if frame.is_none() && kind_code == OBJ_ARTISTIC_TEXT {
+            let lead = text::leading_breaks(&spans);
+            if lead > 0 && lead < spans.iter().map(|s| s.text.chars().count()).sum::<usize>() {
+                text::drop_leading_chars(&mut spans, lead);
+                // Paragraphs that started among the dropped lines start at
+                // the text's start; the last of them is the one shown.
+                let first = own
+                    .iter()
+                    .rposition(|(start, _, _)| *start <= lead)
+                    .unwrap_or(0);
+                own.drain(..first);
+                for (start, _, _) in own.iter_mut() {
+                    *start = start.saturating_sub(lead);
+                }
+                if let Some((_, _, fmt)) = own.first() {
+                    para_fmt = fmt.clone();
                 }
             }
         }
@@ -5962,7 +5987,11 @@ fn decode_bitmap(
     let mut r = Reader::new(d, v < 6);
     r.pos = h.body;
     let mut palette: Vec<[u8; 3]> = Vec::new();
-    if bpp < 24 && h.model != 5 && h.model != 6 {
+    // Model 99 is a grey picture of one byte per pixel with no palette,
+    // as transparency bitmaps and masks are stored (#2691); a palette is
+    // only read where the chunk has room for it before the pixels.
+    let palette_room = d.len().saturating_sub(h.body) >= h.size as usize + 4;
+    if bpp < 24 && h.model != 5 && h.model != 6 && h.model != BITMAP_GREY_MASK && palette_room {
         r.skip(2);
         let n = r.u16().unwrap_or(0) as usize;
         let n = n.min(r.remaining() / 3).min(256);
@@ -6217,6 +6246,10 @@ fn bitmap_mask(d: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 
 /// The bitmap colour model of CMYK images.
 const BITMAP_CMYK: u32 = 3;
+
+/// The bitmap colour model of grey pictures with no palette: the masks
+/// of pictures and the pictures of bitmap transparencies (#2691).
+const BITMAP_GREY_MASK: u32 = 99;
 
 /// One CMYK pixel (ink bytes, 255 = full ink) as opaque RGBA: through
 /// `lut` when given, else one minus the ink times one minus the black.
@@ -10469,6 +10502,44 @@ pub(crate) mod tests {
             .all(|p| tracedraw_core::SharedBytes::ptr_eq(p, pictures[0])));
     }
 
+    /// A picture of colour model 99 (one grey byte per pixel, no palette),
+    /// as a bitmap transparency stores its picture, is read as greys; it
+    /// was dropped, so a picture fill naming it had no image and its
+    /// object came in opaque (#2691, a version 22 file).
+    #[test]
+    fn grey_model_99_bitmaps_have_no_palette() {
+        // 2 x 2, model 99, 8 bpp, stride 4: bottom row 10, 200; top 0, 255.
+        let mut bmp = u32s(&[5]);
+        bmp.extend_from_slice(&[0; 50]);
+        bmp.extend_from_slice(&u32s(&[BITMAP_GREY_MASK, 1, 2, 2, 1, 8, 4, 8]));
+        bmp.extend_from_slice(&[0; 32]);
+        bmp.extend_from_slice(&[10, 200, 0, 0, 0, 255, 0, 0]);
+        let mut c = i32s(&[0, 0, 254000, 254000]);
+        c.extend_from_slice(&[0; 32]);
+        c.extend_from_slice(&u32s(&[5]));
+        c.extend_from_slice(&[0; 20]);
+        c.extend_from_slice(&u32s(&[0]));
+        let obj = list(
+            b"obj ",
+            &chunk(b"loda", &loda(OBJ_BITMAP, &[(ARG_COORDS, c)])),
+        );
+        let body = [
+            chunk(b"mcfg", &mcfg(13, 2_540_000, 2_540_000)),
+            chunk(b"bmp ", &bmp),
+            list(b"page", &list(b"layr", &obj)),
+        ]
+        .concat();
+        let (doc, rep) = parse(&riff(b"CDRD", &body), 13);
+        assert_eq!(rep.shapes, 1, "{:?}", rep.warnings);
+        let ShapeKind::Bitmap { png, .. } = &first_shape(&doc).kind else {
+            panic!("a bitmap");
+        };
+        let raw = raw_rows(png);
+        // Top row first: 0 and 255, then 10 and 200, as opaque greys.
+        assert_eq!(&raw[1..9], &[0, 0, 0, 255, 255, 255, 255, 255]);
+        assert_eq!(&raw[10..18], &[10, 10, 10, 255, 200, 200, 200, 255]);
+    }
+
     #[test]
     fn bitmap_masks_make_pixels_clear() {
         // 2 x 2, 24 bpp, then a mask block: "RI", its length, 4 zero bytes,
@@ -12436,6 +12507,63 @@ pub(crate) mod tests {
         match &first_shape(&doc).kind {
             ShapeKind::Text { origin, .. } => {
                 assert!(origin.x.abs() < 1e-9 && origin.y.abs() < 1e-9, "{origin:?}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Artistic text starting with a paragraph break shows its letters
+    /// on its origin, not a line below it (#3215).
+    #[test]
+    fn artistic_text_starting_with_a_break_keeps_its_letters_on_the_origin() {
+        let v = 18u16;
+        let mut t = u32s(&[0xffff_ffff]);
+        t.extend_from_slice(&[0; 32]);
+        t.extend_from_slice(&u16s(&[1700]));
+        t.extend_from_slice(&[0; 3]);
+        t.extend_from_slice(&u32s(&[1, 1]));
+        t.extend_from_slice(&[0; 48]);
+        t.extend_from_slice(&u32s(&[0]));
+        t.extend_from_slice(&[0; 8]);
+        t.extend_from_slice(&u32s(&[1]));
+        t.extend_from_slice(&u32s(&[0]));
+        t.push(0);
+        t.push(0);
+        t.extend_from_slice(&style_string(
+            v,
+            r#"{"character":{"latin":{"font":"Arial","size":"128819","weight":"400","italic":"0"}}}"#,
+        ));
+        t.extend_from_slice(&u32s(&[0]));
+        t.extend_from_slice(&u32s(&[3]));
+        for _ in 0..3 {
+            t.extend_from_slice(&u16s(&[0]));
+            t.push(0xfe);
+            t.extend_from_slice(&[0; 5]);
+        }
+        t.extend_from_slice(&u32s(&[3]));
+        t.extend_from_slice(b"\rHi");
+        t.push(0);
+        let obj = list(
+            b"obj ",
+            &[
+                chunk(b"bbox", &i32s(&[0, 100_000, 100_000, 0])),
+                chunk(b"loda", &loda(OBJ_ARTISTIC_TEXT, &[])),
+                chunk(b"trfd", &trfd(v, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0])),
+                chunk(b"txsm", &t),
+            ]
+            .concat(),
+        );
+        let body = [
+            chunk(b"mcfg", &mcfg(v, 2_540_000, 2_540_000)),
+            list(b"page", &list(b"layr", &obj)),
+        ]
+        .concat();
+        let (doc, rep) = parse(&riff(b"CDRI", &body), v);
+        assert_eq!(rep.shapes, 1, "{:?}", rep.warnings);
+        match &first_shape(&doc).kind {
+            ShapeKind::Text { spans, .. } => {
+                let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+                assert_eq!(text, "Hi");
             }
             other => panic!("{other:?}"),
         }

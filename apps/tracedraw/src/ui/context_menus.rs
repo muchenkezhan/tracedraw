@@ -173,6 +173,11 @@ macro_rules! object_items {
             "menu.edit.delete",
             "menu.object.add_to_shelf",
             "menu.object.add_common_shape",
+            "menu.edit.select_similar",
+            "menu.edit.similar_fill",
+            "menu.edit.similar_outline",
+            "menu.edit.similar_text_format",
+            "menu.edit.similar_kind",
             "menu.object.order",
             "menu.object.to_front_of_page",
             "menu.object.to_back_of_page",
@@ -459,6 +464,7 @@ pub(crate) const CATALOG: &[MenuDefinition] = &[
             "docker.show_hide",
             "docker.print_layer",
             "docker.lock_layer",
+            "docker.edit_across_layers",
             "docker.move_up",
             "docker.move_down",
             "docker.show_on",
@@ -476,7 +482,11 @@ pub(crate) const CATALOG: &[MenuDefinition] = &[
     MenuDefinition {
         id: "objects_object",
         key: "context_menu.objects_object",
-        items: object_items!("docker.rename", "docker.move_to_layer"),
+        items: object_items!(
+            "docker.rename",
+            "docker.move_to_layer",
+            "docker.copy_to_layer"
+        ),
     },
     MenuDefinition {
         id: "objects_new_master",
@@ -708,8 +718,9 @@ mod tests {
             .find(|menu| menu.id == "objects_object")
             .expect("object panel menu");
         assert!(canvas.items.iter().all(|key| panel.items.contains(key)));
-        assert_eq!(panel.items.len(), canvas.items.len() + 2);
+        assert_eq!(panel.items.len(), canvas.items.len() + 3);
         assert!(panel.items.contains(&"docker.move_to_layer"));
+        assert!(panel.items.contains(&"docker.copy_to_layer"));
     }
 
     #[test]
@@ -766,6 +777,7 @@ mod tests {
             ("font", "font_manager.add_to_collection"),
             ("objects_layer", "docker.move_to_page"),
             ("objects_object", "docker.move_to_layer"),
+            ("objects_object", "docker.copy_to_layer"),
             ("palette", "palette.open_as_bar"),
             ("palette_swatch", "palette.add_from_bitmap"),
         ] {

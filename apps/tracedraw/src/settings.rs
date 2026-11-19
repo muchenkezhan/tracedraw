@@ -687,6 +687,10 @@ pub struct Settings {
     /// on and one with it off, to compare them.
     #[serde(default)]
     pub benchmarks: Vec<crate::benchmark::Measured>,
+    /// Help > Benchmark asked for a start with or without the graphics
+    /// card: open the benchmark at the next start and run this test.
+    #[serde(default)]
+    pub benchmark_resume: Option<crate::benchmark::Level>,
     /// Options > Tools > Zoom/Pan: how much one wheel notch zooms, in
     /// percent (15 by default); see [`Settings::wheel_zoom_factor`].
     #[serde(default = "default_wheel_zoom_step")]
@@ -809,6 +813,11 @@ pub struct Settings {
     /// (#1477).
     #[serde(default = "default_true")]
     pub objects_all_pages: bool,
+    /// Objects panel > Edit Across Layers: a click, a marquee and Select
+    /// All reach the objects of every layer; off, those of the active
+    /// layer alone (#3276).
+    #[serde(default = "default_true")]
+    pub edit_across_layers: bool,
     /// Page size changes apply to every page (the page bar's All pages
     /// and the Page Size dialog's Apply to all pages). Off by default so
     /// a new size changes only the current page, and kept between
@@ -1897,6 +1906,26 @@ impl Default for SnapPrefs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolPrefs {
+    /// The Common Shapes tool's shape, by the key of its name, and the
+    /// shape of My shapes picked instead: the choice went back to the
+    /// arrow at every start, as did the next ones.
+    pub common_shape: String,
+    pub my_shape: Option<u64>,
+    /// The Attributes eyedropper's groups and the colour eyedropper's
+    /// sample box (1, 2 or 5 pixels).
+    pub eyedropper_groups: crate::eyedropper::AttrGroups,
+    pub eyedropper_sample: u32,
+    /// The Free Transform tool's mode.
+    pub free_transform_mode: crate::app::FreeTransformMode,
+    /// The Shape tool's freehand marquee, and its Shift adding to the
+    /// nodes chosen.
+    pub node_lasso: bool,
+    pub node_lasso_keeps: bool,
+    /// The Blend tool's rotation and object and colour acceleration
+    /// (-1 to 1) for new blends; its steps were kept already.
+    pub blend_rotation: f64,
+    pub blend_accel_objects: f64,
+    pub blend_accel_colors: f64,
     pub polygon_points: u32,
     pub star_sharpness: f64,
     pub star_complex: bool,
@@ -1956,11 +1985,83 @@ pub struct ToolPrefs {
     pub knife: crate::knife::KnifeSettings,
     /// Segment Delete's drag is a freehand stroke, not a box (#1150).
     pub segment_freehand: bool,
+    /// The Brush Strokes tool's mode and settings: they went back to
+    /// the first start's at every start, as did the next three.
+    pub media: MediaPrefs,
+    /// The Speech Balloon tool's style, tail width and bend.
+    pub balloon: BalloonPrefs,
+    /// The Action Lines tool's settings.
+    pub action_lines: crate::action_lines::ActionLines,
+    /// The Painterly Brush tool's brush and size.
+    pub painterly: crate::painterly_tool::PainterlySettings,
+}
+
+/// The Brush Strokes tool's bar, kept between sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaPrefs {
+    pub mode: crate::media::MediaMode,
+    pub preset: usize,
+    /// mm.
+    pub width: f64,
+    /// Calligraphic nib angle, degrees.
+    pub angle: f64,
+    /// Sprayer spacing, mm.
+    pub spacing: f64,
+    /// Expression: how much the width follows the pressure, 0 to 1.
+    pub pressure: f64,
+    /// Freehand smoothing of the stroke, 0 to 100.
+    pub smoothing: f64,
+}
+
+impl Default for MediaPrefs {
+    fn default() -> Self {
+        MediaPrefs {
+            mode: crate::media::MediaMode::Calligraphic,
+            preset: 0,
+            width: 3.0,
+            angle: 45.0,
+            spacing: 8.0,
+            pressure: 0.5,
+            smoothing: 25.0,
+        }
+    }
+}
+
+/// The Speech Balloon tool's bar, kept between sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BalloonPrefs {
+    pub style: crate::balloons::BalloonStyle,
+    /// Tail width, percent of the body's smaller side.
+    pub width: f64,
+    /// Tail bend, -100 to 100.
+    pub bend: f64,
+}
+
+impl Default for BalloonPrefs {
+    fn default() -> Self {
+        BalloonPrefs {
+            style: Default::default(),
+            width: 30.0,
+            bend: 0.0,
+        }
+    }
 }
 
 impl Default for ToolPrefs {
     fn default() -> Self {
         ToolPrefs {
+            common_shape: crate::tools2::CommonShape::RightArrow.key().into(),
+            my_shape: None,
+            eyedropper_groups: Default::default(),
+            eyedropper_sample: 1,
+            free_transform_mode: crate::app::FreeTransformMode::Rotation,
+            node_lasso: false,
+            node_lasso_keeps: false,
+            blend_rotation: 0.0,
+            blend_accel_objects: 0.0,
+            blend_accel_colors: 0.0,
             polygon_points: 5,
             star_sharpness: 0.5,
             star_complex: false,
@@ -2004,6 +2105,10 @@ impl Default for ToolPrefs {
             sketch: Default::default(),
             knife: Default::default(),
             segment_freehand: false,
+            media: Default::default(),
+            balloon: Default::default(),
+            action_lines: Default::default(),
+            painterly: Default::default(),
         }
     }
 }
@@ -2310,6 +2415,7 @@ impl Default for Settings {
             smooth_zoom: true,
             light_zoom: false,
             benchmarks: Vec::new(),
+            benchmark_resume: None,
             wheel_zoom_step: default_wheel_zoom_step(),
             pan_right_click_out: false,
             pan_inertia: false,
@@ -2376,6 +2482,7 @@ impl Default for Settings {
             object_thumb_size: default_object_thumb(),
             master_in_front: [false; 3],
             objects_all_pages: true,
+            edit_across_layers: true,
             page_size_all: false,
             font_sample_px: default_font_sample(),
             workspace_parts: crate::workspace_file::WorkspaceParts::default(),

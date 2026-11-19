@@ -951,6 +951,37 @@ fn runs_lines_and_alignment_round_trip() {
     }
 }
 
+/// A line break inside a paragraph (Shift+Enter, U+2028) reads back as
+/// a line break from version 12: it came back as a paragraph break, so
+/// the line after it took the first-line indent, the space before and a
+/// bullet of its own (d#2238). Before 12 (Windows-1252 letters) it goes
+/// out as a paragraph break, and the other letters keep their accents.
+#[test]
+fn a_line_break_inside_a_paragraph_round_trips() {
+    let mut doc = doc_with(Vec::new());
+    let mut ids = doc.ids().clone();
+    doc.pages[0].layers[0].shapes = vec![text_shape(
+        &mut ids,
+        vec![TextSpan::new("oné\u{2028}two\nthree", "Arial", 12.0)],
+        TextAlign::Left,
+    )];
+    doc.set_ids(ids);
+    for v in versions() {
+        let (back, rep) =
+            crate::open_bytes(&document_to_cdr_version(&doc, v), "back").expect("reads back");
+        let ShapeKind::Text { spans, .. } = &back.pages[0].layers[0].shapes[0].kind else {
+            panic!("{v}: {:?}", rep.warnings);
+        };
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let want = if v >= 12 {
+            "oné\u{2028}two\nthree"
+        } else {
+            "oné\ntwo\nthree"
+        };
+        assert_eq!(text, want, "{v}: {spans:?}");
+    }
+}
+
 /// Paragraphs of one text with alignments of their own keep them in
 /// every version.
 #[test]
@@ -2605,7 +2636,9 @@ fn gradient_options_are_written_as_the_closest_plain_gradient() {
     doc.set_ids(ids);
     for v in [7u16, 13, 17] {
         let bytes = document_to_cdr_version(&doc, v);
-        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        // What other programs see: the package's own member gives
+        // TraceDraw the object back.
+        let back = open_as_drawn(&bytes);
         let fills: Vec<Fountain> = back.pages[0].layers[0]
             .shapes
             .iter()
@@ -3237,7 +3270,9 @@ fn fills_not_written_yet_go_out_as_their_mean_colour() {
         let doc = doc_with(vec![r]);
         for v in versions() {
             let bytes = document_to_cdr_version(&doc, v);
-            let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+            // What other programs see: the package's own member gives
+            // TraceDraw the object back.
+            let back = open_as_drawn(&bytes);
             let got = back.pages[0].layers[0].shapes[0]
                 .fill
                 .preview_color()
@@ -3299,7 +3334,9 @@ fn a_mesh_fill_goes_out_as_its_mean_colour_and_is_counted() {
     assert_eq!(mesh_fills_kept_as_one_colour(&doc_with(Vec::new())), 0);
     for v in versions() {
         let bytes = document_to_cdr_version(&doc, v);
-        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        // What other programs see: the package's own member gives
+        // TraceDraw the object back.
+        let back = open_as_drawn(&bytes);
         let got = back.pages[0].layers[0].shapes[0]
             .fill
             .preview_color()
@@ -3331,6 +3368,66 @@ fn a_page_background_colour_round_trips_from_version_21() {
         } else {
             assert_eq!(bg, None, "{v}");
         }
+    }
+}
+
+/// From version 16 a hidden layer goes out with its objects and its
+/// state as flags, so do a locked layer and one kept from print, as
+/// files of version 27 hold them (#2850); before, a hidden layer goes
+/// out empty and the other states plain.
+#[test]
+fn layer_state_and_hidden_layer_objects_are_kept_from_version_16() {
+    let mut doc = doc_with(Vec::new());
+    let mut ids = doc.ids().clone();
+    let shape = |ids: &mut tracedraw_core::id::IdSource, x: f64| {
+        let mut r = Shape::new(
+            ids.shape(),
+            ShapeKind::Rect {
+                rect: Rect::new(x, 10.0, x + 20.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        r.fill = Fill::Solid(Color::rgb8(255, 0, 0));
+        r
+    };
+    doc.pages[0].layers[0].shapes = vec![shape(&mut ids, 10.0)];
+    let mut hidden = Layer::new(ids.layer(), "Hidden");
+    hidden.visible = false;
+    hidden.shapes = vec![shape(&mut ids, 40.0), shape(&mut ids, 70.0)];
+    let mut locked = Layer::new(ids.layer(), "Locked");
+    locked.locked = true;
+    locked.shapes = vec![shape(&mut ids, 100.0)];
+    let mut no_print = Layer::new(ids.layer(), "No print");
+    no_print.printable = false;
+    no_print.shapes = vec![shape(&mut ids, 130.0)];
+    doc.pages[0].layers.extend([hidden, locked, no_print]);
+    doc.set_ids(ids);
+    for v in versions() {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, rep) = crate::open_bytes(&bytes, "back").expect("reads back");
+        assert_eq!(rep.skipped_objects, 0, "{v}: {:?}", rep.warnings);
+        let layer = |name: &str| {
+            back.pages[0]
+                .layers
+                .iter()
+                .find(|l| l.name == name)
+                .unwrap_or_else(|| panic!("{v}: no layer {name}"))
+                .clone()
+        };
+        let (h, l, p) = (layer("Hidden"), layer("Locked"), layer("No print"));
+        assert_eq!(layer("Ink").shapes.len(), 1, "{v}");
+        if v < 16 {
+            assert!(h.shapes.is_empty(), "{v}");
+            continue;
+        }
+        assert!(!h.visible, "{v}");
+        assert_eq!(h.shapes.len(), 2, "{v}");
+        assert!(h.shapes.iter().all(|s| s.visible), "{v}");
+        assert!(l.locked && l.visible && l.printable, "{v}");
+        assert_eq!(l.shapes.len(), 1, "{v}");
+        assert!(!p.printable && p.visible && !p.locked, "{v}");
+        assert_eq!(p.shapes.len(), 1, "{v}");
     }
 }
 
@@ -9965,4 +10062,303 @@ fn object_data_and_clone_links_open_again() {
     let mut all = Vec::new();
     shapes_on_page(&back.pages[0].layers[0].shapes, Affine::IDENTITY, &mut all);
     assert!(all.iter().all(|(_, s)| s.data.is_empty()));
+}
+
+/// A rectangle with `fill` saved and opened again, alone on the page.
+fn kept_rect(fill: Fill) -> Document {
+    let mut doc = effect_rect(Vec::new());
+    doc.pages[0].layers[0].shapes[0].fill = fill;
+    doc
+}
+
+/// Fills these files cannot hold yet go out as one colour or the
+/// nearest plain fountain, and an outline fill and overprint go out
+/// plain; from version 14 the package's own member keeps the object, so
+/// it opens here as it was saved, and stays so saved once more.
+#[test]
+fn fills_the_files_cannot_hold_open_again_as_saved() {
+    use tracedraw_core::style::{
+        FountainHandles, FountainRepeat, Mesh, Pattern, PatternPlacement, PatternTile, Procedural,
+        ProceduralPattern, Texture, TextureKind,
+    };
+    let red = Color::rgb8(255, 0, 0);
+    let blue = Color::rgb8(0, 0, 255);
+    let mut repeated = tracedraw_core::Fountain::two(FountainKind::Linear, red, blue, 0.0);
+    repeated.repeat = FountainRepeat::Repeat;
+    repeated.repeats = 3;
+    let mut placed = tracedraw_core::Fountain::two(FountainKind::Linear, red, blue, 0.0);
+    placed.handles = Some(FountainHandles {
+        start: Point::new(22.0, 22.0),
+        end: Point::new(50.0, 40.0),
+        skew: Point::new(22.0, 40.0),
+    });
+    let mut mesh = Mesh::new(Rect::new(20.0, 20.0, 60.0, 50.0), 1, 1, Color::WHITE);
+    mesh.nodes[0].color = red;
+    let fills = [
+        Fill::Pattern(Pattern::TwoColor {
+            tile: PatternTile::Bricks,
+            front: Color::BLACK,
+            back: Color::rgb8(255, 255, 0),
+            size_mm: 5.0,
+            placement: PatternPlacement::default(),
+        }),
+        Fill::Texture(Texture {
+            kind: TextureKind::Wood,
+            color_a: red,
+            color_b: blue,
+            scale: 2.0,
+            seed: 7,
+        }),
+        Fill::Procedural(Procedural::new(ProceduralPattern::default(), Color::BLACK)),
+        Fill::Mesh(mesh),
+        Fill::Fountain(repeated),
+        Fill::Fountain(tracedraw_core::Fountain::two(
+            FountainKind::Shaped,
+            red,
+            blue,
+            0.0,
+        )),
+        Fill::Fountain(placed),
+    ];
+    for fill in fills {
+        let doc = kept_rect(fill.clone());
+        for v in versions() {
+            let bytes = document_to_cdr_version(&doc, v);
+            let (back, rep) = crate::open_bytes(&bytes, "back").expect("reads back");
+            assert_eq!(rep.skipped_objects, 0, "{v}: {:?}", rep.warnings);
+            let read = &back.pages[0].layers[0].shapes;
+            assert_eq!(read.len(), 1, "{v}");
+            if v < 14 {
+                // RIFF files have no member: the stand-in opens.
+                assert_ne!(read[0].fill, fill, "{v}");
+                continue;
+            }
+            assert_eq!(read[0].fill, fill, "{v}");
+            assert!(matches!(read[0].kind, ShapeKind::Rect { .. }), "{v}");
+            // Other programs see the stand-in.
+            let shown = open_as_drawn(&bytes);
+            assert_ne!(shown.pages[0].layers[0].shapes[0].fill, fill, "{v}");
+            let (twice, _) =
+                crate::open_bytes(&document_to_cdr_version(&back, v), "twice").expect("reads back");
+            assert_eq!(twice.pages[0].layers[0].shapes[0].fill, fill, "{v}");
+        }
+    }
+    // An outline with a fill of its own, and overprint.
+    let mut doc = kept_rect(Fill::Solid(red));
+    {
+        let s = &mut doc.pages[0].layers[0].shapes[0];
+        let mut st = Stroke::new(Color::BLACK, 2.0);
+        st.fill = Some(Box::new(Fill::Fountain(tracedraw_core::Fountain::two(
+            FountainKind::Linear,
+            Color::BLACK,
+            Color::WHITE,
+            0.0,
+        ))));
+        s.stroke = Some(st);
+        s.overprint_fill = true;
+        s.overprint_outline = true;
+    }
+    let want = doc.pages[0].layers[0].shapes[0].clone();
+    for v in 14..=NEWEST_VERSION {
+        let (back, _) =
+            crate::open_bytes(&document_to_cdr_version(&doc, v), "back").expect("reads back");
+        let s = &back.pages[0].layers[0].shapes[0];
+        assert_eq!(s.stroke, want.stroke, "{v}");
+        assert!(s.overprint_fill && s.overprint_outline, "{v}");
+    }
+}
+
+/// A line's arrowheads, which `outl` has no place for, go out as curves
+/// above it in the outline's colour, so every reader shows them; from
+/// version 14 the line opens here again with its arrowheads.
+#[test]
+fn arrowheads_go_out_as_curves_and_open_again_on_the_line() {
+    let mut doc = doc_with(Vec::new());
+    let mut ids = doc.ids().clone();
+    let mut p = BezPath::new();
+    p.move_to((20.0, 20.0));
+    p.curve_to((40.0, 60.0), (70.0, 60.0), (90.0, 20.0));
+    let mut line = Shape::new(
+        ids.shape(),
+        ShapeKind::Path {
+            path: p,
+            closed: false,
+        },
+    );
+    line.fill = Fill::None;
+    let mut st = Stroke::new(Color::rgb8(0, 0, 200), 1.0);
+    st.start_arrow = tracedraw_core::Arrowhead::Circle;
+    st.end_arrow = tracedraw_core::Arrowhead::Arrow;
+    line.stroke = Some(st.clone());
+    let heads: Vec<Rect> = tracedraw_core::arrowhead_paths(&line.page_path(), &st)
+        .iter()
+        .map(|h| h.bounding_box())
+        .collect();
+    assert_eq!(heads.len(), 2);
+    doc.pages[0].layers[0].shapes = vec![line.clone()];
+    doc.set_ids(ids);
+    for v in versions() {
+        let bytes = document_to_cdr_version(&doc, v);
+        // What other readers (and RIFF files here) show: the line, then
+        // its two heads filled with the outline's colour.
+        let shown = if v < 14 {
+            crate::open_bytes(&bytes, "back").expect("reads back").0
+        } else {
+            open_as_drawn(&bytes)
+        };
+        let drawn = &shown.pages[0].layers[0].shapes;
+        assert_eq!(drawn.len(), 3, "{v}: {drawn:?}");
+        let ds = drawn[0].stroke.as_ref().expect("outline");
+        assert_eq!(ds.start_arrow, tracedraw_core::Arrowhead::None, "{v}");
+        for (h, want) in drawn[1..].iter().zip(&heads) {
+            assert_eq!(h.fill, Fill::Solid(Color::rgb8(0, 0, 200)), "{v}");
+            assert!(h.stroke.is_none(), "{v}");
+            assert!(
+                near(h.bounds(), *want, 0.05),
+                "{v}: {:?} {want:?}",
+                h.bounds()
+            );
+        }
+        if v < 14 {
+            continue;
+        }
+        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        let read = &back.pages[0].layers[0].shapes;
+        assert_eq!(read.len(), 1, "{v}: {read:?}");
+        assert_eq!(read[0].stroke, line.stroke, "{v}");
+    }
+}
+
+/// An emoji or a mathematical letter (beyond U+FFFF) is two letters of a
+/// file, a surrogate pair of marked UTF-16 units, from version 12. They
+/// went out as "?", and read back, every run after such a letter started
+/// one letter late (it took the letter before it), in every version.
+#[test]
+fn letters_beyond_u_ffff_round_trip_with_their_runs() {
+    let mut ids = tracedraw_core::id::IdSource::default();
+    let mut bold = TextSpan::new("B\u{1F600}b", "Arial", 20.0);
+    bold.bold = true;
+    let spans = vec![
+        TextSpan::new("a\u{1F600}\u{1D538}", "Arial", 12.0),
+        bold,
+        TextSpan::new(
+            "\u{e9}\u{1F44D}\u{1F3FD} family \u{1F468}\u{200d}\u{1F467}z",
+            "Arial",
+            12.0,
+        ),
+    ];
+    let t = text_shape(&mut ids, spans.clone(), TextAlign::Left);
+    let doc = doc_with(vec![t]);
+    for v in 12u16..=*crate::write::versions().end() {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        let runs: Vec<(String, bool)> = back
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .filter_map(|s| match &s.kind {
+                ShapeKind::Text { spans, .. } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|sp| (sp.text.clone(), sp.bold))
+            .collect();
+        let want: Vec<(String, bool)> = spans.iter().map(|sp| (sp.text.clone(), sp.bold)).collect();
+        assert_eq!(runs, want, "{v}");
+    }
+}
+
+/// A drawing's symbols are saved as symbols (#3250): the definition once
+/// in the document's `LIST sytr` and the table naming it, each instance
+/// a `LIST symb` placing it. Opened again, the symbol is there with its
+/// name and the instances stand where they stood; they used to be
+/// written as groups of the definition's objects.
+#[test]
+fn symbols_are_saved_as_symbols_and_their_instances() {
+    use tracedraw_core::document::Symbol;
+    let mut doc = Document::new("w", Size::new(200.0, 100.0));
+    let mut ids = doc.ids().clone();
+    let mut def = Shape::new(
+        tracedraw_core::id::ShapeId(0),
+        ShapeKind::Ellipse {
+            rect: Rect::new(-10.0, -5.0, 10.0, 5.0),
+            arc: None,
+        },
+    );
+    def.fill = Fill::Solid(Color::rgb8(200, 30, 30));
+    def.stroke = None;
+    doc.symbols.push(Symbol {
+        name: "Logo".into(),
+        shape: def,
+    });
+    let placements = [
+        Affine::translate((40.0, 30.0)),
+        Affine::translate((120.0, 60.0)) * Affine::rotate(0.5),
+        Affine::translate((160.0, 20.0)) * Affine::scale_non_uniform(2.0, 0.5),
+    ];
+    for t in placements {
+        let mut inst = Shape::new(ids.shape(), ShapeKind::SymbolInstance { index: 0 });
+        inst.transform = t;
+        inst.fill = Fill::None;
+        inst.stroke = None;
+        doc.pages[0].layers[0].shapes.push(inst);
+    }
+    doc.set_ids(ids);
+    let before: Vec<Rect> = doc.pages[0].layers[0]
+        .shapes
+        .iter()
+        .map(|s| {
+            s.expand(&doc.symbols)
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+                .expect("drawn")
+        })
+        .collect();
+    for v in [14, 27] {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "w.cdr").expect("reopens");
+        assert_eq!(back.symbols.len(), 1, "version {v}");
+        assert_eq!(back.symbols[0].name, "Logo", "version {v}");
+        let shapes: Vec<&Shape> = back
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .collect();
+        assert_eq!(shapes.len(), 3, "version {v}");
+        let mut after: Vec<Rect> = Vec::new();
+        for s in &shapes {
+            assert!(
+                matches!(s.kind, ShapeKind::SymbolInstance { index: 0 }),
+                "version {v}: {:?}",
+                s.kind
+            );
+            let b = s
+                .expand(&back.symbols)
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+                .expect("drawn");
+            after.push(b);
+        }
+        for b in &before {
+            assert!(
+                after.iter().any(|a| (a.x0 - b.x0).abs() < 0.05
+                    && (a.y0 - b.y0).abs() < 0.05
+                    && (a.x1 - b.x1).abs() < 0.05
+                    && (a.y1 - b.y1).abs() < 0.05),
+                "version {v}: {b:?} not among {after:?}"
+            );
+        }
+    }
 }
