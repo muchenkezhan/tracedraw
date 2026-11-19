@@ -238,6 +238,8 @@ pub fn docker_topic(t: DockerTab) -> &'static str {
         DockerTab::Coordinates => "objects/transforming#coordinates",
         DockerTab::VectorMosaic => "effects/mosaics#vector-mosaic",
         DockerTab::PictureMosaic => "effects/mosaics#picture-mosaic",
+        DockerTab::ShapeGenerator => "objects/shape-generator",
+        DockerTab::SymbolScatter => "effects/symbol-scatter",
         DockerTab::Shelf => "objects/shelf",
         DockerTab::Export => "web-graphics/export-docker",
         DockerTab::Comments => "objects/comments",

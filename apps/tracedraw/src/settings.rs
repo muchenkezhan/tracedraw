@@ -1392,10 +1392,10 @@ pub struct NodePrefs {
     pub secondary_rgb: [u8; 3],
     /// Unselected nodes are filled white (Ctrl+Shift+G).
     pub unselected_filled: bool,
-    /// Arrows at the first node of every subpath and the last node of
-    /// every open one show the curve's direction. On by default, as the
-    /// reference program shows it, so the parts of a broken curve show
-    /// which way a cutting plotter follows them (#2578).
+    /// The first node of every subpath and the last node of every open
+    /// one are triangles turned along the curve, showing its direction
+    /// (#3038). On by default, so the parts of a broken curve show which
+    /// way a cutting plotter follows them (#2578).
     pub show_direction: bool,
     /// How near, in screen pixels, a press must land on a node or a
     /// control handle to take it (Shape tool, and the curve tools'
@@ -2036,6 +2036,8 @@ pub struct ToolPrefs {
     pub balloon: BalloonPrefs,
     /// The Action Lines tool's settings.
     pub action_lines: crate::action_lines::ActionLines,
+    /// The Shape Generator panel's settings (#3412).
+    pub shape_gen: crate::shape_gen::ShapeGenSettings,
     /// The Painterly Brush tool's brush and size.
     pub painterly: crate::painterly_tool::PainterlySettings,
 }
@@ -2153,6 +2155,7 @@ impl Default for ToolPrefs {
             media: Default::default(),
             balloon: Default::default(),
             action_lines: Default::default(),
+            shape_gen: Default::default(),
             painterly: Default::default(),
         }
     }
