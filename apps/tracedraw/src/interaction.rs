@@ -1786,6 +1786,7 @@ impl App {
             grab,
             mods: crate::app::HandleMods::of(mods),
             snapped: (false, false),
+            start_geometry: None,
         };
     }
 
@@ -2146,8 +2147,15 @@ impl App {
                 // a click sampled or applied nothing (#2897).
                 if response.clicked() || response.drag_stopped_by(PointerButton::Primary) {
                     let attrs = self.tool == Tool::AttributesEyedropper;
-                    // Ctrl samples again in Apply mode (#1302).
-                    self.eyedropper_click(p, attrs, mods.shift, mods.ctrl);
+                    if !attrs && self.eyedropper_wants_screen(p, mods.shift, mods.ctrl) {
+                        // No object gives a colour here (the desk, the
+                        // empty page): the colour shown there (#3040).
+                        let at = response.interact_pointer_pos().unwrap_or(screen);
+                        self.ask_screen_sample(at, mods.shift);
+                    } else {
+                        // Ctrl samples again in Apply mode (#1302).
+                        self.eyedropper_click(p, attrs, mods.shift, mods.ctrl);
+                    }
                 }
             }
             Tool::InteractiveFill => self.fill_input(response, p, mods),
@@ -2799,11 +2807,27 @@ impl App {
                     && self.snap.objects
                     && (p - *start).hypot() > self.snap_tolerance()
             }
+            // A scale handle likewise, once the point it stands for has
+            // left where it started (#3074).
+            Drag::Scale {
+                handle,
+                start_bounds,
+                grab,
+                start_geometry: None,
+                ..
+            } => {
+                self.snap_enabled()
+                    && self.snap.objects
+                    && (p - *grab - handle_point(*start_bounds, *handle)).hypot()
+                        > self.snap_tolerance()
+            }
             _ => false,
         };
         if away {
             let g = std::rc::Rc::new(self.selection_start_geometry());
-            if let Drag::Move { start_geometry, .. } = &mut self.drag {
+            if let Drag::Move { start_geometry, .. } | Drag::Scale { start_geometry, .. } =
+                &mut self.drag
+            {
                 *start_geometry = Some(g);
             }
         }
@@ -2925,7 +2949,9 @@ impl App {
                 ..
             } => {
                 // The handle snaps to other objects, guidelines, the grid
-                // and the page, never to the selection's own points.
+                // and the page, and to where the selection stood once away
+                // from its start (#3074), never to the selection as it
+                // changes.
                 *current = snapped_handle;
                 *snapped = scale_snapped;
                 *m = crate::app::HandleMods::of(mods);
@@ -3292,6 +3318,26 @@ impl App {
                     p
                 };
                 self.three_point_circle = circle;
+            }
+        }
+    }
+
+    /// A last node of the Freehand line of clicks where the pointer is
+    /// (snapped and constrained as a click there would be), for Space to
+    /// end the line there (#3192). Nothing when no line has begun, the
+    /// pointer is off the drawing or on the last node already.
+    pub(crate) fn freehand_node_at_pointer(&mut self, mods: Modifiers) {
+        let Some(at) = self.pointer_page else {
+            return;
+        };
+        if self.curve.as_ref().is_none_or(|c| c.nodes.is_empty() || c.bspline) {
+            return;
+        }
+        let q = self.curve_point(self.snap_point(at), self.constrain_held(&mods));
+        let zoom = self.view.zoom as f64;
+        if let Some(c) = self.curve.as_mut() {
+            if c.nodes.last().is_some_and(|n| (n.0 - q).hypot() * zoom > 2.0) {
+                c.nodes.push((q, None));
             }
         }
     }
@@ -5482,6 +5528,12 @@ impl App {
         if pressed(Key::Space, Modifiers::NONE)
             && matches!(self.tool, Tool::Bezier | Tool::Freehand)
         {
+            // A Freehand line of clicks ends where the pointer is: a last
+            // node there, unless the pointer is on the last node or off
+            // the drawing (#3192).
+            if self.tool == Tool::Freehand {
+                self.freehand_node_at_pointer(ctx.input(|i| i.modifiers));
+            }
             self.finish_curve();
         }
         // Esc with a menu or a list open only closes it.
