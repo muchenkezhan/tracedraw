@@ -25,6 +25,12 @@ pub enum Effect {
         /// true = outside, false = inside; `to_center` ignores `steps`.
         outside: bool,
         to_center: bool,
+        /// Steps on both sides of a closed outline at once, as many
+        /// inside as outside, with the same spacing and colours (#3085);
+        /// `outside` and `to_center` are then not read. Older files have
+        /// none (one side).
+        #[serde(default, skip_serializing_if = "is_false")]
+        both: bool,
         fill_to: Color,
         outline_to: Option<Color>,
         /// The last step's colour for the end of a fountain fill (#1265):
@@ -208,6 +214,17 @@ pub enum Effect {
         to: Color,
         angle: f64,
         opacity: f64,
+    },
+    /// Sprayer (#3435): objects of one of the sprayer's shapes (`preset`:
+    /// circles, stars, squares, hearts, leaves) in `color` along the
+    /// object's path, about `size` mm across and `spacing` mm apart, drawn
+    /// above it as one group. The path stays editable and the objects
+    /// follow it; Break Effect Apart leaves the group.
+    Spray {
+        preset: u8,
+        size: f64,
+        spacing: f64,
+        color: Color,
     },
     /// Gaussian blur (#1141): the object drawn blurred by `radius` mm.
     /// Drawn by the renderer.
@@ -1030,6 +1047,143 @@ fn overlay(main: &Shape, fill: Fill, line: Color, opacity: f64) -> Option<Shape>
     Some(s)
 }
 
+/// The sprayer's object number `k` of shape `preset` centred on `c`,
+/// `size` across (#3435).
+pub fn spray_object(preset: u8, c: Point, size: f64, k: usize) -> BezPath {
+    let r = size / 2.0;
+    let rect = Rect::new(c.x - r, c.y - r, c.x + r, c.y + r);
+    match preset {
+        0 => crate::geometry::ellipse_path(rect),
+        1 => crate::geometry::polygon_path(rect, 5, 0.5),
+        2 => crate::geometry::rect_path(rect, 0.0),
+        3 => {
+            // Heart: two circles and a triangle, welded.
+            let top = crate::geometry::ellipse_path(Rect::new(c.x - r, c.y, c.x, c.y + r));
+            let top2 = crate::geometry::ellipse_path(Rect::new(c.x, c.y, c.x + r, c.y + r));
+            let tri = crate::effects::polygon(&[
+                Point::new(c.x - r, c.y + r * 0.5),
+                Point::new(c.x + r, c.y + r * 0.5),
+                Point::new(c.x, c.y - r),
+            ]);
+            let a = crate::shaping::overlay(&top, &top2, crate::shaping::Op::Weld);
+            crate::shaping::overlay(&a, &tri, crate::shaping::Op::Weld)
+        }
+        _ => {
+            // Leaf: a lens shape turned with the index.
+            let mut p = BezPath::new();
+            p.move_to((c.x - r, c.y));
+            p.curve_to(
+                (c.x - r * 0.3, c.y + r),
+                (c.x + r * 0.3, c.y + r),
+                (c.x + r, c.y),
+            );
+            p.curve_to(
+                (c.x + r * 0.3, c.y - r),
+                (c.x - r * 0.3, c.y - r),
+                (c.x - r, c.y),
+            );
+            p.close_path();
+            Affine::rotate_about((k as f64 * 0.7).sin() * 0.8, c) * p
+        }
+    }
+}
+
+/// The sprayer's objects along `path` (its own space): one every
+/// `spacing` along each part, from its start, the size varying a little
+/// from one to the next (#3435).
+pub fn spray_paths(path: &BezPath, preset: u8, size: f64, spacing: f64) -> Vec<BezPath> {
+    let spacing = if spacing.is_finite() {
+        spacing.max(0.5)
+    } else {
+        1.0
+    };
+    let size = if size.is_finite() {
+        size.max(0.01)
+    } else {
+        1.0
+    };
+    let mut parts: Vec<Vec<Point>> = Vec::new();
+    crate::geometry::flatten(path, 0.05, &mut |el| match el {
+        PathEl::MoveTo(p) => parts.push(vec![p]),
+        PathEl::LineTo(p) => {
+            if let Some(part) = parts.last_mut() {
+                part.push(p);
+            }
+        }
+        PathEl::ClosePath => {
+            if let Some(part) = parts.last_mut() {
+                if let Some(&first) = part.first() {
+                    part.push(first);
+                }
+            }
+        }
+        _ => {}
+    });
+    let mut out = Vec::new();
+    let mut k = 0usize;
+    for pts in parts.iter().filter(|p| p.len() >= 2) {
+        let mut cum = vec![0.0];
+        for w in pts.windows(2) {
+            cum.push(cum.last().copied().unwrap_or(0.0) + (w[1] - w[0]).hypot());
+        }
+        let total = cum.last().copied().unwrap_or(0.0);
+        let mut s = 0.0;
+        while s <= total + 1e-9 && out.len() < 20_000 {
+            let i = cum
+                .partition_point(|c| *c <= s)
+                .saturating_sub(1)
+                .min(pts.len() - 2);
+            let seg = pts[i + 1] - pts[i];
+            let len = seg.hypot().max(1e-9);
+            let u = ((s - cum[i]) / len).clamp(0.0, 1.0);
+            let c = pts[i] + seg * u;
+            let d = size * (0.7 + 0.3 * ((k as f64 * 1.3).sin().abs()));
+            let p = spray_object(preset, c, d, k);
+            if !p.elements().is_empty() {
+                out.push(p);
+            }
+            s += spacing;
+            k += 1;
+        }
+    }
+    out
+}
+
+/// The group of objects a sprayer effect draws along `main` (#3435).
+fn spray_group(main: &Shape, preset: u8, size: f64, spacing: f64, color: Color) -> Option<Shape> {
+    let path = match &main.kind {
+        ShapeKind::Group { .. }
+        | ShapeKind::ClipFrame { .. }
+        | ShapeKind::Table(_)
+        | ShapeKind::SymbolInstance { .. }
+        | ShapeKind::Bitmap { .. } => return None,
+        _ => main.local_path(),
+    };
+    let children: Vec<Shape> = spray_paths(&path, preset, size, spacing)
+        .into_iter()
+        .map(|p| {
+            let mut c = Shape::new(
+                main.id,
+                ShapeKind::Path {
+                    path: p,
+                    closed: true,
+                },
+            );
+            c.fill = Fill::Solid(color);
+            c.stroke = None;
+            c.name = Some("Sprayed object".into());
+            c
+        })
+        .collect();
+    if children.is_empty() {
+        return None;
+    }
+    let mut g = Shape::new(main.id, ShapeKind::Group { children });
+    g.transform = main.transform;
+    g.name = Some("Sprayed objects".into());
+    Some(g)
+}
+
 /// Result of evaluating a shape's effect stack.
 #[derive(Clone)]
 pub struct Evaluated {
@@ -1191,6 +1345,7 @@ fn evaluate_now(shape: &Shape) -> Evaluated {
                 offset,
                 outside,
                 to_center,
+                both,
                 fill_to,
                 outline_to,
                 fill_end_to,
@@ -1199,28 +1354,36 @@ fn evaluate_now(shape: &Shape) -> Evaluated {
                 accel_objects,
                 accel_colors,
             } => {
-                let shapes = contour(
-                    &main,
-                    area_rule(shape),
-                    &ContourParams {
-                        steps: *steps,
-                        offset: *offset,
-                        outside: *outside,
-                        to_center: *to_center,
-                        fill_to: *fill_to,
-                        outline_to: *outline_to,
-                        fill_end_to: *fill_end_to,
-                        color_blend: *color_blend,
-                        corners: corners.unwrap_or(crate::shaping::Join::Round),
-                        accel_objects: *accel_objects,
-                        accel_colors: *accel_colors,
-                    },
-                );
-                if *outside {
-                    // Outermost first so the object stays on top.
-                    below.extend(shapes.into_iter().rev());
+                let params = |outside: bool, to_center: bool| ContourParams {
+                    steps: *steps,
+                    offset: *offset,
+                    outside,
+                    to_center,
+                    fill_to: *fill_to,
+                    outline_to: *outline_to,
+                    fill_end_to: *fill_end_to,
+                    color_blend: *color_blend,
+                    corners: corners.unwrap_or(crate::shaping::Join::Round),
+                    accel_objects: *accel_objects,
+                    accel_colors: *accel_colors,
+                };
+                // Both sides: the outside steps behind the object and the
+                // inside ones in front, each as a one-sided contour draws
+                // them (#3085).
+                let sides: &[bool] = if *both {
+                    &[true, false]
                 } else {
-                    above.extend(shapes);
+                    std::slice::from_ref(outside)
+                };
+                for &out in sides {
+                    let shapes =
+                        contour(&main, area_rule(shape), &params(out, *to_center && !*both));
+                    if out {
+                        // Outermost first so the object stays on top.
+                        below.extend(shapes.into_iter().rev());
+                    } else {
+                        above.extend(shapes);
+                    }
                 }
             }
             Effect::Blend {
@@ -1349,6 +1512,14 @@ fn evaluate_now(shape: &Shape) -> Evaluated {
                     *angle,
                 );
                 above.extend(overlay(&main, Fill::Fountain(f), *to, *opacity));
+            }
+            Effect::Spray {
+                preset,
+                size,
+                spacing,
+                color,
+            } => {
+                above.extend(spray_group(&main, *preset, *size, *spacing, *color));
             }
             Effect::FillOpacity { .. } => {}
             Effect::Lens(_)
@@ -1617,6 +1788,10 @@ fn mix(a: Color, b: Color, t: f64, mode: u8) -> Color {
     )
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
@@ -1733,6 +1908,45 @@ fn has_loose_end(path: &BezPath) -> bool {
 /// object's transformation applied and brought back to its local
 /// coordinates, so a scaled or stretched object keeps the distance the
 /// user typed (#754).
+/// The object of a group whose fill and outline its contour steps take
+/// (#3245): the first one inside it with a fill, else the first with an
+/// outline; a group has neither of its own.
+fn group_style(shape: &Shape) -> Option<&Shape> {
+    fn leaves<'a>(s: &'a Shape, out: &mut Vec<&'a Shape>) {
+        match &s.kind {
+            ShapeKind::Group { children } => children.iter().for_each(|c| leaves(c, out)),
+            ShapeKind::ClipFrame { frame, .. } => leaves(frame, out),
+            _ => out.push(s),
+        }
+    }
+    let mut all = Vec::new();
+    leaves(shape, &mut all);
+    all.iter()
+        .find(|s| !matches!(s.fill, Fill::None))
+        .or_else(|| all.iter().find(|s| s.stroke.is_some()))
+        .copied()
+}
+
+/// The area a group covers, in the group's space: the union of what its
+/// objects cover, so where they overlap the contour goes round them all
+/// as one (#3245).
+fn group_area(shape: &Shape) -> BezPath {
+    let ShapeKind::Group { children } = &shape.kind else {
+        return shape.local_path();
+    };
+    let mut acc = BezPath::new();
+    for c in children {
+        let part = crate::shaping::overlay_with(
+            &c.page_path(),
+            &BezPath::new(),
+            crate::shaping::Op::Weld,
+            area_rule(c),
+        );
+        acc = crate::shaping::overlay(&acc, &part, crate::shaping::Op::Weld);
+    }
+    acc
+}
+
 fn contour(shape: &Shape, rule: crate::shaping::FillRule, p: &ContourParams) -> Vec<Shape> {
     let to_page = shape.transform;
     let to_local = if to_page.determinant().abs() > 1e-12 {
@@ -1740,9 +1954,21 @@ fn contour(shape: &Shape, rule: crate::shaping::FillRule, p: &ContourParams) -> 
     } else {
         return Vec::new();
     };
-    let base = to_page * shape.local_path();
-    let from_fill = shape.fill.preview_color().unwrap_or(Color::WHITE);
-    let from_outline = shape.stroke.as_ref().map(|s| s.color);
+    // A group: its objects' area as one, read even-odd as the union is,
+    // and the look of the first object in it (#3245).
+    let group = matches!(shape.kind, ShapeKind::Group { .. });
+    let (base, rule) = if group {
+        (to_page * group_area(shape), crate::shaping::FillRule::EvenOdd)
+    } else {
+        (to_page * shape.local_path(), rule)
+    };
+    let style = if group {
+        group_style(shape).unwrap_or(shape)
+    } else {
+        shape
+    };
+    let from_fill = style.fill.preview_color().unwrap_or(Color::WHITE);
+    let from_outline = style.stroke.as_ref().map(|s| s.color);
     let sign = if p.outside && !p.to_center { 1.0 } else { -1.0 };
     let offset = if p.offset.is_finite() {
         p.offset.abs().max(1e-3)
@@ -1799,7 +2025,11 @@ fn contour(shape: &Shape, rule: crate::shaping::FillRule, p: &ContourParams) -> 
             s.effects.clear();
             s.shadow = None;
             s.kind = ShapeKind::Path { path, closed: true };
-            match &shape.fill {
+            if group {
+                s.fill = style.fill.clone();
+                s.stroke = style.stroke.clone();
+            }
+            match &style.fill {
                 Fill::None => {}
                 // A fountain stays a fountain (#1265): each stop goes
                 // toward the last step's colour at its place between the
@@ -3581,6 +3811,7 @@ mod tests {
             offset: 1.0,
             outside: false,
             to_center: false,
+            both: false,
             fill_to: Color::BLACK,
             outline_to: None,
             fill_end_to: None,
@@ -3625,6 +3856,7 @@ mod tests {
                 sharpness: 0.0,
                 complex: None,
                 twist: 0.0,
+                bend: 0.0,
             },
         );
         s.fill = Fill::Solid(Color::rgb8(255, 0, 0));
@@ -3636,6 +3868,7 @@ mod tests {
             offset: 20.0,
             outside: false,
             to_center: false,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: None,
@@ -3699,6 +3932,7 @@ mod tests {
             offset,
             outside: true,
             to_center: false,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: None,
@@ -3750,6 +3984,7 @@ mod tests {
             offset: 2.0,
             outside: true,
             to_center: false,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: None,
@@ -3792,6 +4027,7 @@ mod tests {
             offset: 2.0,
             outside: true,
             to_center: false,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: end,
@@ -3827,6 +4063,123 @@ mod tests {
         assert!(outer.iter().all(|c| *c == Color::WHITE.to_rgb8()), "{outer:?}");
     }
 
+    /// #3085: a contour on both sides draws its steps inside and outside
+    /// at once, the outside ones behind the object and the inside ones in
+    /// front, as the one-sided contours draw them; it is saved and read
+    /// back, and a contour of an older file (no `both`) stays one-sided.
+    #[test]
+    fn a_group_takes_a_contour_round_all_its_objects() {
+        // #3245: two overlapping squares in a group, outlined round both
+        // as one area, in the colour of the first; before, a group took
+        // no contour.
+        let mut a = rect_shape();
+        a.id = crate::ShapeId(2);
+        let mut b = rect_shape();
+        b.id = crate::ShapeId(3);
+        b.fill = Fill::Solid(Color::rgb8(0, 0, 255));
+        b.transform = Affine::translate((10.0, 10.0));
+        let mut g = Shape::new(
+            crate::ShapeId(4),
+            ShapeKind::Group {
+                children: vec![a, b],
+            },
+        );
+        g.effects.push(Effect::Contour {
+            steps: 2,
+            offset: 1.0,
+            outside: true,
+            to_center: false,
+            both: false,
+            fill_to: Color::WHITE,
+            outline_to: None,
+            fill_end_to: None,
+            color_blend: 0,
+            corners: Some(crate::shaping::Join::Miter),
+            accel_objects: 0.0,
+            accel_colors: 0.0,
+        });
+        let ev = evaluate(&g);
+        assert_eq!(ev.below.len(), 2, "two steps");
+        // The outer step goes round both squares: from -2 to 32.
+        let outer = ev.below[0].page_path().bounding_box();
+        assert!((outer.x0 + 2.0).abs() < 1e-6 && (outer.x1 - 32.0).abs() < 1e-6, "{outer:?}");
+        assert!((outer.y0 + 2.0).abs() < 1e-6 && (outer.y1 - 32.0).abs() < 1e-6, "{outer:?}");
+        // One ring round the union: the corner where the squares meet
+        // inside (15, 15) is covered, the empty corner (25, 5) of the box
+        // only by the band near the edge, not its middle.
+        let ring = ev.below[0].page_path();
+        assert!(ring.contains(Point::new(15.0, 15.0)));
+        assert!(!ring.contains(Point::new(26.0, 4.0)), "it follows the L shape");
+        // The steps take the first square's fill towards white.
+        match &ev.below[1].fill {
+            Fill::Solid(c) => {
+                let [r, _, b] = c.to_rgb8();
+                assert!(r > b, "reddish: {c:?}");
+            }
+            f => panic!("{f:?}"),
+        }
+    }
+
+    #[test]
+    fn a_contour_can_go_inside_and_outside_at_once() {
+        let effect = |outside: bool, both: bool| Effect::Contour {
+            steps: 3,
+            offset: 2.0,
+            outside,
+            to_center: false,
+            both,
+            fill_to: Color::WHITE,
+            outline_to: None,
+            fill_end_to: None,
+            color_blend: 0,
+            corners: Some(crate::shaping::Join::Miter),
+            accel_objects: 0.0,
+            accel_colors: 0.0,
+        };
+        let with = |e: Effect| {
+            let mut s = rect_shape();
+            s.effects.push(e);
+            evaluate(&s)
+        };
+        let out = with(effect(true, false));
+        let inn = with(effect(false, false));
+        let both = with(effect(true, true));
+        assert_eq!(both.below.len(), 3);
+        assert_eq!(both.above.len(), 3);
+        let paths = |v: &[Shape]| v.iter().map(Shape::local_path).collect::<Vec<_>>();
+        assert_eq!(paths(&both.below), paths(&out.below));
+        assert_eq!(paths(&both.above), paths(&inn.above));
+        // `outside` is not read with both sides on.
+        let both_in = with(effect(false, true));
+        assert_eq!(paths(&both_in.below), paths(&out.below));
+        assert_eq!(paths(&both_in.above), paths(&inn.above));
+        // Saved with the flag, read back the same.
+        let json = serde_json::to_string(&effect(true, true)).expect("json");
+        assert!(json.contains("\"both\":true"), "{json}");
+        let back: Effect = serde_json::from_str(&json).expect("back");
+        assert_eq!(back, effect(true, true));
+        // One side: no flag written, so older versions read it as before;
+        // an older file without it reads as one side.
+        let json = serde_json::to_string(&effect(true, false)).expect("json");
+        assert!(!json.contains("both"), "{json}");
+        let back: Effect = serde_json::from_str(&json).expect("back");
+        assert_eq!(back, effect(true, false));
+        // A whole document through the .tdraw format.
+        let mut doc = crate::Document::default();
+        let layer = doc.pages[0].layers[0].id;
+        let mut s = rect_shape();
+        s.effects.push(effect(true, true));
+        doc.layer_mut(layer).expect("layer").shapes.push(s);
+        let mut packed = Vec::new();
+        doc.write_tdraw_version(&mut packed, crate::document::TDRAW_FORMAT_VERSION)
+            .expect("write");
+        let back = crate::Document::from_tdraw_bytes(&packed).expect("read");
+        assert_eq!(
+            back.pages[0].layers[0].shapes[0].effects,
+            vec![effect(true, true)]
+        );
+    }
+
     #[test]
     fn contour_outside_three_steps() {
         let mut s = rect_shape();
@@ -3835,6 +4188,7 @@ mod tests {
             offset: 2.0,
             outside: true,
             to_center: false,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: None,
@@ -3867,6 +4221,7 @@ mod tests {
             offset: 2.0,
             outside: false,
             to_center: true,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: None,
@@ -4242,6 +4597,7 @@ mod tests {
             offset: 2.0,
             outside: true,
             to_center: false,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: None,
@@ -5357,6 +5713,7 @@ mod warped_extrusion_tests {
             offset: 2.0,
             outside: true,
             to_center: false,
+            both: false,
             fill_to: Color::WHITE,
             outline_to: None,
             fill_end_to: None,
@@ -5581,6 +5938,7 @@ mod symmetry_tests {
                 offset: 2.0,
                 outside: true,
                 to_center: false,
+                both: false,
                 fill_to: crate::color::Color::WHITE,
                 outline_to: None,
                 fill_end_to: None,

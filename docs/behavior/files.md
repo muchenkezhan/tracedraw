@@ -130,6 +130,15 @@ One window, 760 px wide, the same on every system:
 - In the browser, where every save is a download, the dialog keeps the
   file name, type, version and properties, and says the browser saves
   the file in its downloads folder.
+- Options > General > Use the system's save dialog (on by default on
+  macOS, off elsewhere; not in the browser or on Android, #2965): Save
+  As, and Save of a drawing without a file, open the system's own save
+  dialog instead, in the folder and with the name the Save Drawing
+  dialog would offer, with TraceDraw and CorelDRAW as its types (the
+  drawing's own first). The extension chosen there sets the type, the
+  versions are the ones Options sets, the system asks before replacing a
+  file, and Cancel saves nothing
+  (`ui::save_as::tests::the_system_save_dialog_saves_in_the_type_chosen_there`).
 
 ## `.cdr` versions
 
@@ -191,6 +200,15 @@ these objects as they were, so opened again in TraceDraw the fill, the
 arrowheads, the outline fill and overprint are all back; files of
 versions 7 to 13 open with the stand-ins.
 
+The document palette (with the names its colours go by), the spot inks,
+the colour styles and the object styles have no record written yet
+either, nor has the object style an object follows. From version 14
+the file carries them in members of its own (`tracedraw/document.json`,
+and the object's style in `tracedraw/data.json`), so opened again in
+TraceDraw they are all back and a spot colour names its ink again;
+other programs do not see them, and files of versions 7 to 13 lose
+them. A palette or ink the file itself gives wins over the member's.
+
 ## Open drawings keep their files (Windows, #2130)
 
 On Windows the file of every open drawing (the front tab's and the
@@ -215,6 +233,26 @@ open, and Save writes it again.
 The open drawings are compared with the holds once a frame (paths only);
 a file is opened only when a drawing was opened, closed or saved under
 another name.
+
+## Combine Files and Save Pages as Files (#3358)
+
+- File > Combine Files... picks one or more drawings (`.tdraw`, `.cdr`,
+  `.cdt`, `.cdrt`, `.cmx`) and adds every page of each, in the order
+  picked, after the last page of the open drawing: the page's name and
+  size, and its objects (the objects of all its layers, in their order, on
+  one layer named as its first). The symbols those objects show come
+  along, carried fonts too, and imported colours follow the colour
+  management policy of File > Import. All of it is one undo step; the
+  first page added becomes the current page and the status bar says how
+  many pages came from how many files. A file that cannot be read is left
+  out and named on the status bar.
+- File > Save Pages as Files... asks for a file name and saves each page
+  as a TraceDraw drawing beside it, named after it with the page number
+  (`Poster-1.tdraw`, `Poster-2.tdraw`). Each holds that page with its
+  layers, guides and background, and what the drawing keeps for all its
+  pages (symbols, styles, colours, inks, fonts). The open drawing stays as
+  it was, unsaved changes and all.
+- `combine_files::tests::pages_saved_as_files_combine_back`
 
 ## Checks
 
