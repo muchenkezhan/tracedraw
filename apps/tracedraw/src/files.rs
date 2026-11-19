@@ -44,6 +44,10 @@ thread_local! {
     static PICKED: RefCell<HashMap<String, PathBuf>> = RefCell::new(HashMap::new());
     /// Uploaded files by synthetic path (browser only).
     static STORE: RefCell<HashMap<PathBuf, Vec<u8>>> = RefCell::new(HashMap::new());
+    /// Uploads whose job ran but that the app still reads on a later
+    /// frame (an import waiting for its place, a PDF question), freed
+    /// once nothing does (#3231).
+    static LINGERING: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
 /// True in the browser build: no file system, downloads instead of saves.
@@ -365,7 +369,7 @@ pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result
     if let Some(uri) = document_uri(path) {
         return crate::android::documents::write(&uri, bytes.as_ref());
     }
-    std::fs::write(path, bytes)
+    replace_with(path, |w| std::io::Write::write_all(w, bytes.as_ref()))
 }
 
 /// Write a file as `fill` makes it, without holding the whole file in
@@ -382,9 +386,83 @@ pub fn write_with(
         fill(&mut bytes)?;
         return write(path, bytes);
     }
-    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-    fill(&mut w)?;
-    std::io::Write::flush(&mut w)
+    replace_with(path, fill)
+}
+
+/// Write the file `path` as `fill` makes it, never losing the file that
+/// was there when the write fails half way (a full disk, an error while
+/// the drawing is written, the program stopped): the new file is made
+/// whole under a `.part` name beside it first, and only then takes the
+/// old one's place. A file that was there is written over in place from
+/// the `.part` file, so it keeps its permissions and links and an open
+/// drawing's hold on it (`file_hold`) stays; should that copy fail, the
+/// `.part` file stays with the whole new file and the error names it. A
+/// new file is the `.part` file renamed. Where no `.part` file can be
+/// made (a folder that takes no new files, a device), the file is
+/// written directly, as before.
+fn replace_with(
+    path: &Path,
+    fill: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let direct = |fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>| {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        fill(&mut w)?;
+        w.flush()
+    };
+    let mut fill = Some(fill);
+    let mut once = |w: &mut dyn std::io::Write| match fill.take() {
+        Some(f) => f(w),
+        None => Ok(()),
+    };
+    let existing = std::fs::metadata(path).ok();
+    if existing.as_ref().is_some_and(|m| !m.is_file()) {
+        return direct(&mut once);
+    }
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let Ok(file) = std::fs::File::create(&part) else {
+        return direct(&mut once);
+    };
+    let written = (|| {
+        let mut w = std::io::BufWriter::new(file);
+        once(&mut w)?;
+        w.flush()?;
+        w.get_ref().sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    if existing.is_none() {
+        return match std::fs::rename(&part, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                Err(e)
+            }
+        };
+    }
+    let copied = std::fs::File::open(&part).and_then(|mut from| {
+        let mut to = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.flush()?;
+        to.sync_all()
+    });
+    match copied {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&part);
+            Ok(())
+        }
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("{e}; the whole file is in {}", part.display()),
+        )),
+    }
 }
 
 /// Write a file as `fill` makes it, creating its folder first
@@ -1345,8 +1423,29 @@ pub fn run_finished(app: &mut App) {
     let jobs: Vec<(Job, PathBuf)> = FINISHED.with(|f| std::mem::take(&mut *f.borrow_mut()));
     for (job, path) in jobs {
         job(app, path.clone());
-        forget(&path);
+        linger(path);
     }
+    // An upload is freed once the app no longer reads it: File > Import
+    // reads it again when the placement cursor is clicked or a PDF's
+    // question is answered, frames after its job ran (#3231).
+    let lingering: Vec<PathBuf> = LINGERING.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    for path in lingering {
+        if app.reads_later(&path) {
+            linger(path);
+        } else {
+            forget(&path);
+        }
+    }
+}
+
+/// Free `path` on a frame when the app no longer reads it.
+fn linger(path: PathBuf) {
+    LINGERING.with(|l| {
+        let mut l = l.borrow_mut();
+        if !l.contains(&path) {
+            l.push(path);
+        }
+    });
 }
 
 /// The paths whose extension is one of `exts` (lower case; any case in
@@ -1837,8 +1936,8 @@ impl Dialog {
             let job: Job = Box::new(move |app: &mut App, _| {
                 let rest = paths.clone();
                 then(app, paths);
-                for p in rest.iter().skip(1) {
-                    forget(p);
+                for p in rest.into_iter().skip(1) {
+                    linger(p);
                 }
             });
             FINISHED.with(|f| f.borrow_mut().push((job, first)));
@@ -1925,6 +2024,45 @@ pub mod test_save {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write that fails half way (a full disk, an error while the
+    /// drawing is written) leaves the file it was replacing as it was:
+    /// it was written over from the start and left cut short. A write
+    /// that succeeds replaces it and leaves no `.part` file; a new file
+    /// is made the same way.
+    #[test]
+    fn a_failed_write_keeps_the_file_it_was_replacing() {
+        let dir =
+            std::env::temp_dir().join(format!("tracedraw-replace-{}", crate::recovery::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("drawing.tdraw");
+        std::fs::write(&path, b"the old drawing").expect("old");
+        let failed = write_with(&path, |w| {
+            w.write_all(b"half of the new")?;
+            Err(std::io::Error::other("no space left on device"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(&path).expect("read"), b"the old drawing");
+        let names = |dir: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .expect("list")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&dir), vec!["drawing.tdraw"], "no .part left");
+        write_with(&path, |w| w.write_all(b"the new drawing")).expect("save");
+        assert_eq!(std::fs::read(&path).expect("read"), b"the new drawing");
+        write(&path, b"shorter").expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"shorter");
+        let new = dir.join("new.cdr");
+        write(&new, b"made").expect("new");
+        assert_eq!(std::fs::read(&new).expect("read"), b"made");
+        assert_eq!(names(&dir), vec!["drawing.tdraw", "new.cdr"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Names in every script stay as typed; only direction marks, control
     /// characters and what the system refuses change.
@@ -2043,6 +2181,61 @@ mod tests {
         run_finished(&mut app);
         assert_eq!(app.status, "got /upload/t.txt");
         assert!(STORE.with(|s| s.borrow().get(&path).is_none()));
+    }
+
+    /// An upload File > Import still reads on a later frame (the file
+    /// waiting for its place, the ones picked with it, a PDF's question)
+    /// stays until nothing does; it was freed as soon as the picker's job
+    /// ran, so the import found nothing in a browser (#3231).
+    #[test]
+    fn an_upload_stays_while_an_import_still_reads_it() {
+        let mut app = App::headless();
+        let first = PathBuf::from("/upload/two-pages.ai");
+        let second = PathBuf::from("/upload/second.pdf");
+        store(&first, b"%PDF-1.4".to_vec());
+        store(&second, b"%PDF-1.4".to_vec());
+        let paths = vec![first.clone(), second.clone()];
+        FINISHED.with(|f| {
+            f.borrow_mut().push((
+                Box::new(move |app: &mut App, _| {
+                    app.import_placing = Some(crate::import_place::ImportPlacing {
+                        path: paths[0].clone(),
+                        drag_from: None,
+                    });
+                    app.import_queue = paths[1..].iter().cloned().collect();
+                    linger(paths[1].clone());
+                }),
+                first.clone(),
+            ))
+        });
+        let kept = |p: &PathBuf| STORE.with(|s| s.borrow().contains_key(p));
+        run_finished(&mut app);
+        run_finished(&mut app);
+        assert!(kept(&first) && kept(&second));
+        // Placed: the PDF asks how to read its text, then reads it again.
+        app.import_placing = None;
+        app.dialog =
+            crate::ui::dialogs::Dialog::PdfText(crate::ui::pdf_import_dialog::PdfTextState {
+                path: first.clone(),
+                import: true,
+                curves: false,
+                paragraphs: false,
+                picture: false,
+                dpi: 300.0,
+                page_size: None,
+                all_pages: true,
+                range: "1".into(),
+                reduce_pictures: true,
+                dont_ask: false,
+            });
+        run_finished(&mut app);
+        assert!(kept(&first) && kept(&second));
+        app.dialog = crate::ui::dialogs::Dialog::None;
+        run_finished(&mut app);
+        assert!(!kept(&first) && kept(&second));
+        app.import_queue.clear();
+        run_finished(&mut app);
+        assert!(!kept(&second));
     }
 
     /// A document the Android picker returned is named by its URI and its

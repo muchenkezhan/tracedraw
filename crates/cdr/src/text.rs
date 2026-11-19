@@ -528,11 +528,30 @@ impl RunStyle {
 
     /// The style with its East Asian font in place of the Latin one, for
     /// the letters set in it.
+    ///
+    /// A Latin font in its vertical form (named with a leading `@`) makes
+    /// the text vertical, whatever East Asian font the run names: a
+    /// version 22 file of #3217 sets one column in `@站酷文艺体` for Latin
+    /// letters and `站酷文艺体`, `Arial` and `@宋体` for the ideographs of
+    /// its three runs, and the program that wrote it draws the whole
+    /// column with its ideographs upright. The East Asian font then takes
+    /// the `@` too, so the text reads as vertical (see
+    /// `vertical_font_text`); the face itself is found without it.
     pub fn for_east_asian(&self) -> RunStyle {
         let Some(a) = &self.asian else {
             return self.clone();
         };
-        self.with_script_font(a)
+        let mut s = self.with_script_font(a);
+        let latin_vertical = self
+            .family
+            .as_deref()
+            .is_some_and(|f| f.starts_with('@') && f.len() > 1);
+        if latin_vertical {
+            if let Some(f) = s.family.as_mut().filter(|f| !f.starts_with('@')) {
+                f.insert(0, '@');
+            }
+        }
+        s
     }
 
     /// The style with its right-to-left font in place of the Latin one,
@@ -1602,14 +1621,16 @@ fn split_by_lengths<'t, T>(
     runs
 }
 
-/// Cut `text` into runs of `n` characters per style (see
-/// [`split_by_lengths`]).
+/// Cut `text` into runs of `n` letters per style (see
+/// [`split_by_lengths`]). A letter is a UTF-16 unit, as files count them:
+/// a letter beyond U+FFFF (an emoji) is two, a surrogate pair. Counted in
+/// characters, every run after such a letter started one letter late.
 fn split_runs(text: &str, styles: &[(usize, RunStyle)]) -> Vec<TextRun> {
-    let chars: Vec<char> = text.chars().collect();
-    split_by_lengths(&chars, styles)
+    let units: Vec<u16> = text.encode_utf16().collect();
+    split_by_lengths(&units, styles)
         .into_iter()
-        .map(|(c, style)| TextRun {
-            text: c.iter().collect(),
+        .map(|(u, style)| TextRun {
+            text: String::from_utf16_lossy(u),
             style,
             raw: None,
         })
@@ -1729,6 +1750,7 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
         frame_text_styles: Vec::new(),
         columns: None,
     };
+    let mut graphics = 0;
     for _ in 0..np {
         let style_id = r.u32()?;
         r.skip(1);
@@ -1760,6 +1782,20 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
             let _st1 = r.u16()?;
             let st2 = r.u16()?;
             let st3 = r.u16()?;
+            // Bit 1: the run is a graphic placed in the line as a letter.
+            // A word (0 in the samples), the graphic's byte count (u32)
+            // and its bytes (a compressed Corel metafile that starts
+            // "CMX3") come first (a version 18 file's two texts, each a
+            // word with a graphic after its first letter, #3181: read
+            // without them, the style string's length was taken from the
+            // graphic and both texts were skipped). The graphic is not
+            // drawn; its letter stays.
+            if st3 & 0x02 != 0 {
+                r.skip(2);
+                let len = r.u32()? as usize;
+                r.skip(len);
+                graphics += 1;
+            }
             if st2 == 0x3fff && st3 & 0x11 == 0x11 {
                 let len = r.u32()? as usize;
                 r.skip(if v >= 17 { len } else { len.saturating_mul(2) });
@@ -1842,10 +1878,15 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
         } else {
             decode_utf16le(text)
         };
-        // Group consecutive characters sharing a style record.
+        // Group consecutive characters sharing a style record. Each
+        // record is a letter's, a UTF-16 unit: a letter beyond U+FFFF (an
+        // emoji) has two, and the letters after it name the records after
+        // its second.
         let mut runs: Vec<TextRun> = Vec::new();
-        for (i, ch) in text.chars().enumerate() {
+        let mut i = 0usize;
+        for ch in text.chars() {
             let idx = overrides.get(i).copied().unwrap_or(usize::MAX);
+            i += ch.len_utf16();
             let style = match records.get(idx) {
                 Some(s) => s.over(&default),
                 None => default.clone(),
@@ -1872,18 +1913,50 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
             runs,
         });
     }
+    if graphics > 0 {
+        warn(format!(
+            "{graphics} graphic(s) placed in the text not drawn; their letters kept"
+        ));
+    }
     Some(out)
 }
 
-/// Text with its line breaks as `\n`: files end lines with a carriage
-/// return (`\r`, version 21 artistic text), a CR LF pair, a line or
-/// paragraph separator or a vertical tab.
+/// How many line breaks a text's spans start with.
+pub(crate) fn leading_breaks(spans: &[tracedraw_core::TextSpan]) -> usize {
+    spans
+        .iter()
+        .flat_map(|s| s.text.chars())
+        .take_while(|c| *c == '\n')
+        .count()
+}
+
+/// Drop the first `n` characters of a text's spans, and the spans left
+/// empty.
+pub(crate) fn drop_leading_chars(spans: &mut Vec<tracedraw_core::TextSpan>, mut n: usize) {
+    for s in spans.iter_mut() {
+        if n == 0 {
+            break;
+        }
+        let len = s.text.chars().count();
+        let k = n.min(len);
+        s.text = s.text.chars().skip(k).collect();
+        n -= k;
+    }
+    spans.retain(|s| !s.text.is_empty());
+}
+
+/// Text with its paragraph ends as `\n`: files end lines with a carriage
+/// return (`\r`, version 21 artistic text), a CR LF pair, a paragraph
+/// separator or a vertical tab. A line separator (U+2028) stays: it is
+/// the line break inside a paragraph (Shift+Enter), which TraceDraw
+/// writes as it is, so a saved break came back as a new paragraph, with
+/// the first-line indent, the space before and a bullet of its own.
 pub(crate) fn line_breaks(text: &str) -> String {
-    if !text.contains(['\r', '\u{2028}', '\u{2029}', '\u{0B}']) {
+    if !text.contains(['\r', '\u{2029}', '\u{0B}']) {
         return text.to_string();
     }
     text.replace("\r\n", "\n")
-        .replace(['\r', '\u{2028}', '\u{2029}', '\u{0B}'], "\n")
+        .replace(['\r', '\u{2029}', '\u{0B}'], "\n")
 }
 
 /// Minimal JSON value for the version 16+ style strings.
@@ -2489,11 +2562,15 @@ pub(crate) fn object_transparency_mask(style: &str) -> Option<(tracedraw_core::F
             return None;
         };
         let mut parts = s.split(',');
-        if !parts.next()?.starts_with("GRAY") {
-            return None;
+        if parts.next()?.starts_with("GRAY") {
+            let v: f32 = parts.nth(1)?.trim().parse().ok()?;
+            return Some((v / 255.0).clamp(0.0, 1.0));
         }
-        let v: f32 = parts.nth(1)?.trim().parse().ok()?;
-        Some((v / 255.0).clamp(0.0, 1.0))
+        // A node given in another model (RGB, CMYK) counts by its
+        // lightness, as the record's fountain does (#3095: only greys
+        // were read, and such a transparency opened solid).
+        let [r, g, b] = parse_color_spec(&s)?.to_rgb_f32_builtin();
+        Some((r * 0.2126 + g * 0.7152 + b * 0.0722).clamp(0.0, 1.0))
     };
     let (mut first, mut last) = (grey("primaryColor")?, grey("secondaryColor")?);
     // The section's start and end amounts run the nodes' transparency
@@ -3213,7 +3290,7 @@ mod tests {
         assert_eq!(line_breaks("Fazendo\rum bolo"), "Fazendo\num bolo");
         assert_eq!(
             line_breaks("a\r\nb\u{2028}c\u{2029}d\u{0B}e"),
-            "a\nb\nc\nd\ne"
+            "a\nb\u{2028}c\nd\ne"
         );
         assert_eq!(line_breaks("plain"), "plain");
     }
@@ -3242,6 +3319,28 @@ mod tests {
         assert_eq!(s.bold, Some(true));
         assert_eq!(parse_style_string("").size_pt, None);
         assert_eq!(parse_style_string("{broken").size_pt, None);
+    }
+
+    /// A Latin font in its vertical form (`@`) gives the East Asian font
+    /// of the run the `@` too, as the ideographs of a version 22 column
+    /// of #3217 are set in faces named without it under an `@` Latin face.
+    #[test]
+    fn a_vertical_latin_font_makes_the_east_asian_one_vertical() {
+        for (east, read) in [
+            ("站酷文艺体", "@站酷文艺体"),
+            ("Arial", "@Arial"),
+            ("@宋体", "@宋体"),
+        ] {
+            let s = parse_style_string(&format!(
+                r#"{{"character":{{"latin":{{"font":"@站酷文艺体"}},"farEast":{{"font":"{east}"}}}}}}"#
+            ));
+            assert_eq!(s.for_east_asian().family.as_deref(), Some(read), "{east}");
+        }
+        // Under a horizontal Latin face the East Asian one stays as named.
+        let s = parse_style_string(
+            r#"{"character":{"latin":{"font":"Arial"},"farEast":{"font":"SimSun"}}}"#,
+        );
+        assert_eq!(s.for_east_asian().family.as_deref(), Some("SimSun"));
     }
 
     #[test]
@@ -3593,6 +3692,82 @@ mod tests {
         // A record cut inside the field name is not read past the end.
         for cut in 0..d.len() {
             let _ = read_txsm(&d[..cut], 24, 0, &mut |_| {});
+        }
+    }
+
+    /// A version 18 artistic text whose second style record is a graphic
+    /// placed in the line (bit 1 of its third word: a word, the graphic's
+    /// byte count and its bytes before the locale), as the two texts of
+    /// the file of #3181 hold one after their first letter. The text is
+    /// read, the graphic left out with a warning.
+    #[test]
+    fn version_18_text_with_a_graphic_in_the_line_is_read() {
+        fn style(b: &mut Vec<u8>, s: &str) {
+            b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        }
+        let graphic = b"CMX3\x1b\0\0\0\x16\0\0\0Corel Binary Meta File\x01\0\0\0";
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes()); // frame layout
+        b.extend_from_slice(&[0; 32]);
+        b.extend_from_slice(&1700u16.to_le_bytes());
+        b.extend_from_slice(&[0; 3]);
+        b.extend_from_slice(&1u32.to_le_bytes()); // one frame
+        b.extend_from_slice(&32u32.to_le_bytes());
+        b.extend_from_slice(&[0; 48]);
+        b.extend_from_slice(&0u32.to_le_bytes()); // not on a path
+        b.extend_from_slice(&[0; 8]);
+        b.extend_from_slice(&1u32.to_le_bytes()); // one paragraph
+        b.extend_from_slice(&66u32.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        style(
+            &mut b,
+            r#"{"character":{"latin":{"font":"Arial","size":"12700"}}}"#,
+        );
+        b.extend_from_slice(&2u32.to_le_bytes()); // two records
+        for (st, picture) in [([6u16, 0, 0x04], false), ([1, 0x3fff, 0x06], true)] {
+            for w in st {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+            if picture {
+                b.extend_from_slice(&0u16.to_le_bytes());
+                b.extend_from_slice(&(graphic.len() as u32).to_le_bytes());
+                b.extend_from_slice(graphic);
+            }
+            b.extend_from_slice(&3u32.to_le_bytes());
+            for u in "ENS".encode_utf16() {
+                b.extend_from_slice(&u.to_le_bytes());
+            }
+            if picture {
+                style(&mut b, r#"{"character":{"latin":{"font":"Gabriola"}}}"#);
+            } else {
+                style(&mut b, r#"{"character":{}}"#);
+            }
+        }
+        let text = b"G\xa0rass";
+        b.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        for k in 0..text.len() {
+            let idx = if k == 1 { 1u8 } else { 0 };
+            b.extend_from_slice(&[0, 0, idx << 1, 0, 0, 0, 0, 0]);
+        }
+        b.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        b.extend_from_slice(text);
+        b.push(0); // no letter positions
+        let mut warnings = Vec::new();
+        let t = read_txsm(&b, 18, 0, &mut |w| warnings.push(w)).expect("txsm");
+        let all: String = t.paragraphs[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(all, "G\u{a0}rass");
+        assert_eq!(
+            t.paragraphs[0].runs[1].style.family.as_deref(),
+            Some("Gabriola")
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("graphic")),
+            "{warnings:?}"
+        );
+        // A record cut inside the graphic is not read past the end.
+        for cut in 0..b.len() {
+            let _ = read_txsm(&b[..cut], 18, 0, &mut |_| {});
         }
     }
 }
