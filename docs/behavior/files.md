@@ -130,6 +130,15 @@ One window, 760 px wide, the same on every system:
 - In the browser, where every save is a download, the dialog keeps the
   file name, type, version and properties, and says the browser saves
   the file in its downloads folder.
+- Options > General > Use the system's save dialog (on by default on
+  macOS, off elsewhere; not in the browser or on Android, #2965): Save
+  As, and Save of a drawing without a file, open the system's own save
+  dialog instead, in the folder and with the name the Save Drawing
+  dialog would offer, with TraceDraw and CorelDRAW as its types (the
+  drawing's own first). The extension chosen there sets the type, the
+  versions are the ones Options sets, the system asks before replacing a
+  file, and Cancel saves nothing
+  (`ui::save_as::tests::the_system_save_dialog_saves_in_the_type_chosen_there`).
 
 ## `.cdr` versions
 
@@ -190,6 +199,15 @@ filled with the outline colour. From version 14 the same member keeps
 these objects as they were, so opened again in TraceDraw the fill, the
 arrowheads, the outline fill and overprint are all back; files of
 versions 7 to 13 open with the stand-ins.
+
+The document palette (with the names its colours go by), the spot inks,
+the colour styles and the object styles have no record written yet
+either, nor has the object style an object follows. From version 14
+the file carries them in members of its own (`tracedraw/document.json`,
+and the object's style in `tracedraw/data.json`), so opened again in
+TraceDraw they are all back and a spot colour names its ink again;
+other programs do not see them, and files of versions 7 to 13 lose
+them. A palette or ink the file itself gives wins over the member's.
 
 ## Open drawings keep their files (Windows, #2130)
 

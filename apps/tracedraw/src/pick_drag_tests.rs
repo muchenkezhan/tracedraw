@@ -301,6 +301,86 @@ fn repeat_replays_the_last_group_of_actions_on_one_selection() {
     assert!(close(bounds(&app, a).y0, a_box.y0), "A not moved");
 }
 
+/// A copy left by a right click during a turn about a moved centre (or
+/// during a move), then Ctrl+D: each new copy takes the same step again,
+/// round the same point, as after a Duplicate turned by hand; every copy
+/// used to land on top of the last one (#3272).
+#[test]
+fn ctrl_d_after_a_copy_left_by_a_drag_repeats_its_step() {
+    let (ctx, mut app, id) = setup();
+    let none = Modifiers::NONE;
+    let ctrl_d = |ctx: &egui::Context, app: &mut App| {
+        frame(
+            ctx,
+            app,
+            vec![key(egui::Key::D, Modifiers::COMMAND)],
+            Modifiers::COMMAND,
+        );
+        frame(
+            ctx,
+            app,
+            vec![key_up(egui::Key::D, Modifiers::COMMAND)],
+            none,
+        );
+        frame(ctx, app, Vec::new(), none);
+    };
+    let t = |app: &App, s: ShapeId| app.doc().find_shape(s).expect("shape").transform;
+    let near = |x: Affine, y: Affine| {
+        x.as_coeffs()
+            .iter()
+            .zip(y.as_coeffs())
+            .all(|(p, q)| (p - q).abs() < 1e-6)
+    };
+    // Rotate mode, the centre moved onto a corner, then a turn with a
+    // right click on the way: a turned copy.
+    app.rotate_mode = true;
+    frame(&ctx, &mut app, Vec::new(), none);
+    let pivot = app.view.to_screen(app.rotation_center().expect("centre"));
+    let corner = app.view.to_screen(Point::new(10.0, 10.0));
+    drag(&ctx, &mut app, pivot, corner, none, Vec::new());
+    let ne = handle(&app, Handle::NE);
+    let centre = app.view.to_screen(app.rotation_center().expect("centre"));
+    let r = ne - centre;
+    let to = centre + egui::vec2(r.x * 0.9 - r.y * 0.4, r.y * 0.9 + r.x * 0.4);
+    let right = |p: Pos2, down: bool| button(p, down, PointerButton::Secondary, none);
+    let mid = ne + (to - ne) * 0.5;
+    drag(
+        &ctx,
+        &mut app,
+        ne,
+        to,
+        none,
+        vec![right(mid, true), right(mid, false)],
+    );
+    assert_eq!(shape_count(&app), 2);
+    let first = app.selection[0];
+    assert_ne!(first, id);
+    let step = t(&app, first) * t(&app, id).inverse();
+    assert!(!near(step, Affine::IDENTITY), "turned");
+    // Ctrl+D: the next copy is turned as far again, not on top.
+    ctrl_d(&ctx, &mut app);
+    assert_eq!(shape_count(&app), 3);
+    let second = app.selection[0];
+    assert!(second != first && second != id);
+    assert!(
+        near(t(&app, second), step * t(&app, first)),
+        "{:?}",
+        t(&app, second)
+    );
+    ctrl_d(&ctx, &mut app);
+    let third = app.selection[0];
+    assert!(near(t(&app, third), step * t(&app, second)));
+    // Another object picked: Ctrl+D is the plain Duplicate again.
+    app.select(vec![id]);
+    frame(&ctx, &mut app, Vec::new(), none);
+    ctrl_d(&ctx, &mut app);
+    let plain = app.selection[0];
+    assert!(near(
+        t(&app, plain),
+        Affine::translate(app.duplicate_offset) * t(&app, id)
+    ));
+}
+
 /// Repeat after a copy made with a right click during a drag makes
 /// another copy, as far again from the last one (#363).
 #[test]
@@ -981,6 +1061,44 @@ fn handle_modifiers_shape_the_scale() {
         both,
     );
     assert!(close(at(t, 40.0, 10.0).x, -20.0));
+    // Ctrl+Alt on a corner: width and height grow by the same distance
+    // (#3330): the pointer 10 right and 6 up of the corner adds 8 to
+    // both, 48 x 28; with Shift 8 on every side, 56 x 36 about the
+    // centre; dragged inwards both lose the same.
+    let even = HandleMods {
+        steps: true,
+        free: true,
+        even: true,
+        ..none
+    };
+    let t = scale(
+        Handle::NE,
+        Point::new(0.0, 0.0),
+        Point::new(50.0, 26.0),
+        even,
+    );
+    assert!(close(at(t, 40.0, 20.0).x, 48.0) && close(at(t, 40.0, 20.0).y, 28.0));
+    assert!(close(at(t, 0.0, 0.0).x, 0.0) && close(at(t, 0.0, 0.0).y, 0.0));
+    let t = scale(
+        Handle::NE,
+        Point::new(0.0, 0.0),
+        Point::new(48.0, 28.0),
+        HandleMods {
+            from_center: true,
+            ..even
+        },
+    );
+    assert!(close(at(t, 40.0, 20.0).x, 48.0) && close(at(t, 40.0, 20.0).y, 28.0));
+    assert!(close(at(t, 0.0, 0.0).x, -8.0) && close(at(t, 0.0, 0.0).y, -8.0));
+    let t = scale(
+        Handle::NE,
+        Point::new(0.0, 0.0),
+        Point::new(35.0, 15.0),
+        even,
+    );
+    assert!(close(at(t, 40.0, 20.0).x, 35.0) && close(at(t, 40.0, 20.0).y, 15.0));
+    assert!(HandleMods::of(Modifiers::CTRL | Modifiers::ALT).even);
+    assert!(!HandleMods::of(Modifiers::ALT).even);
     // A corner keeps the proportions unless Alt frees it, by where the
     // pointer falls along the box's diagonal (#383): (2 * 40² + 1 * 20²) /
     // (40² + 20²) = 1.8; on the diagonal the corner follows the pointer.
@@ -4257,6 +4375,7 @@ fn a_drawing_tool_resizes_by_the_handles() {
         Tool::CommonShapes,
         Tool::ThreePointRectangle,
         Tool::ThreePointEllipse,
+        Tool::Text,
     ] {
         let (ctx, mut app, id) = setup();
         app.set_tool(tool);
@@ -4304,6 +4423,38 @@ fn a_drawing_tool_resizes_by_the_handles() {
             assert_eq!(shape_count(&app), count + 1, "{tool:?}");
         }
     }
+}
+
+/// A text just typed with the Text tool shows its handles, and a drag
+/// from one resizes it with the Text tool still chosen (#3258).
+#[test]
+fn a_text_just_typed_resizes_by_its_handles_with_the_text_tool() {
+    let (ctx, mut app, _) = setup();
+    app.set_tool(Tool::Text);
+    let at = app.view.to_screen(Point::new(100.0, 150.0));
+    click_at(&ctx, &mut app, at, Modifiers::NONE);
+    frame(
+        &ctx,
+        &mut app,
+        vec![Event::Text("Hello".into())],
+        Modifiers::NONE,
+    );
+    let id = app.text_edit.as_ref().map(|t| t.shape).expect("editing");
+    assert_eq!(app.selection, vec![id]);
+    let count = shape_count(&app);
+    let before = bounds(&app, id);
+    let from = handle(&app, Handle::E);
+    assert_eq!(
+        for_tool(&app, false, false, false, Some(from)),
+        ToolCursor::System(resize_icon(Handle::E))
+    );
+    let to = from + egui::vec2(80.0, 0.0);
+    drag(&ctx, &mut app, from, to, Modifiers::NONE, Vec::new());
+    let after = bounds(&app, id);
+    assert_eq!(shape_count(&app), count, "no new text");
+    assert_eq!(app.tool, Tool::Text);
+    assert!(after.width() > before.width() + 1.0, "{before:?} {after:?}");
+    assert!(close(after.x0, before.x0), "{before:?} {after:?}");
 }
 
 /// The middle button pans while a new rectangle is dragged: the shape
@@ -15194,6 +15345,60 @@ fn area_fill_keeps_the_curves_it_fills_between() {
     assert!(overlap.segments().count() <= 4, "{overlap:?}");
 }
 
+/// Area Fill with "Up to outline edges" (#3321): four lines 2 mm wide
+/// whose middles leave a 0.5 mm gap at a corner close the square all
+/// the same, the area stops at their inner edges, and a click on a wide
+/// outline fills nothing. Off, the gap lets the fill out.
+#[test]
+fn area_fill_can_stop_at_the_edges_of_wide_outlines() {
+    let mut app = App::headless();
+    app.select(Vec::new());
+    let mut ids = Vec::new();
+    for (a, b) in [
+        ((10.0, 10.0), (30.0, 10.0)),
+        ((30.0, 10.0), (30.0, 30.0)),
+        ((30.0, 30.0), (10.0, 30.0)),
+        ((10.0, 30.0), (10.0, 10.5)),
+    ] {
+        let mut path = tracedraw_core::BezPath::new();
+        path.move_to(a);
+        path.line_to(b);
+        ids.push(
+            app.new_shape(ShapeKind::Path {
+                path,
+                closed: false,
+            })
+            .expect("line"),
+        );
+    }
+    app.run(tracedraw_core::Command::SetStroke {
+        shapes: ids,
+        stroke: Some(tracedraw_core::style::Stroke::new(
+            tracedraw_core::Color::BLACK,
+            2.0,
+        )),
+    });
+    let count = |app: &App| {
+        app.doc()
+            .all_layers()
+            .map(|l| l.shapes.len())
+            .sum::<usize>()
+    };
+    let before = count(&app);
+    app.area_fill_outline_edges = false;
+    app.area_fill_at(Point::new(20.0, 20.0));
+    assert_eq!(count(&app), before, "the gap lets the fill out");
+    app.area_fill_outline_edges = true;
+    app.area_fill_at(Point::new(10.2, 20.0));
+    assert_eq!(count(&app), before, "a click on a wide outline");
+    app.area_fill_at(Point::new(20.0, 20.0));
+    assert_eq!(count(&app), before + 1);
+    let b = tracedraw_core::geometry::Shape::bounding_box(&last_path(&app));
+    for (got, want) in [(b.x0, 11.0), (b.y0, 11.0), (b.x1, 29.0), (b.y1, 29.0)] {
+        assert!((got - want).abs() < 0.01, "{b:?}");
+    }
+}
+
 /// Shift+F3 opens Text > Change Case for the selected text, and does
 /// nothing without one (#801).
 #[test]
@@ -22380,6 +22585,7 @@ fn ctrl_held_after_the_press_constrains_ellipse_and_star_nodes() {
             sharpness: 0.5,
             complex: None,
             twist: 0.0,
+            bend: 0.0,
         })
         .expect("star");
     app.select(vec![star]);
@@ -27517,6 +27723,73 @@ fn an_object_dropped_on_another_page_of_the_multipage_view_becomes_that_page_s()
 }
 
 #[test]
+fn objects_put_beside_the_page_go_on_the_desktop_when_it_takes_them() {
+    // #3100: an object moved or pasted wholly beside the page goes onto
+    // the desktop layer, shown from every page, while the desktop takes
+    // such objects; moved back onto the page it is the page's again.
+    let (ctx, mut app, id) = setup();
+    let page_layer = app.doc().pages[0].layers[0].id;
+    let desktop = app.desktop_layer().expect("desktop layer");
+    let holder = |app: &App, id: ShapeId| {
+        app.doc()
+            .all_layers()
+            .find(|l| l.shapes.iter().any(|s| s.id == id))
+            .map(|l| l.id)
+    };
+    // Room beside the page on screen.
+    let mid = app.view.to_screen(app.page_rect().center());
+    app.view.zoom_at(mid, 0.4);
+    for _ in 0..2 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    let beside = app.view.to_screen(Point::new(-60.0, 25.0));
+    let inside = app.view.to_screen(Point::new(35.0, 25.0));
+    // Off by default: beside the page it stays on the page's layer.
+    drag(&ctx, &mut app, inside, beside, Modifiers::NONE, Vec::new());
+    assert!(bounds(&app, id).x1 < 0.0, "{:?}", bounds(&app, id));
+    assert_eq!(holder(&app, id), Some(page_layer));
+    drag(&ctx, &mut app, beside, inside, Modifiers::NONE, Vec::new());
+    assert_eq!(holder(&app, id), Some(page_layer));
+    // On: let go beside the page, it goes onto the desktop, selected, in
+    // the move's one undo step.
+    app.settings.desktop_takes_objects_beside_page = true;
+    let steps = app.engine.history_labels().0.len();
+    drag(&ctx, &mut app, inside, beside, Modifiers::NONE, Vec::new());
+    assert_eq!(holder(&app, id), Some(desktop));
+    assert_eq!(app.selection, vec![id]);
+    assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+    // Shown and picked from a new page.
+    app.add_page();
+    assert_eq!(app.hit_test(Point::new(-60.0, 25.0)), Some(id));
+    app.goto_page(0);
+    // A paste of it lands beside the page too: on the desktop.
+    app.select(vec![id]);
+    app.copy();
+    app.paste();
+    let copy = app.selection[0];
+    assert_ne!(copy, id);
+    assert_eq!(holder(&app, copy), Some(desktop));
+    // The copy goes again, out of the way.
+    app.undo();
+    assert!(app.doc().find_shape(copy).is_none());
+    // Moved back onto the page: the page's layer again; one undo puts it
+    // back on the desktop beside the page. (The page change may have
+    // moved the view.)
+    app.select(vec![id]);
+    for _ in 0..2 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    let beside = app.view.to_screen(Point::new(-60.0, 25.0));
+    let inside = app.view.to_screen(Point::new(35.0, 25.0));
+    drag(&ctx, &mut app, beside, inside, Modifiers::NONE, Vec::new());
+    assert_eq!(holder(&app, id), Some(page_layer));
+    assert!(bounds(&app, id).x1 > 0.0);
+    app.undo();
+    assert_eq!(holder(&app, id), Some(desktop));
+    assert!(bounds(&app, id).x1 < 0.0);
+}
+
+#[test]
 fn break_curve_opens_a_closed_curve_at_the_chosen_nodes() {
     // #2314: a rectangle as a curve with a node in the middle of its
     // bottom side, broken there, came apart at that node and at its first
@@ -27877,20 +28150,52 @@ fn dragging_a_polygon_edge_bends_it() {
     let at = pentagon_edge_point(&ctx, &mut app);
     drag(&ctx, &mut app, at, at, Modifiers::NONE, Vec::new());
     assert!(
-        matches!(app.selected_shapes()[0].kind, ShapeKind::Polygon { .. }),
-        "a click converts nothing"
+        matches!(
+            app.selected_shapes()[0].kind,
+            ShapeKind::Polygon { bend, .. } if bend == 0.0
+        ),
+        "a click changes nothing"
     );
+    // Out of the pentagon: every side bows out alike, still a polygon
+    // (#2451: the reporter asked for the sides to follow each other).
     drag_between(&ctx, &mut app, at, at + egui::vec2(0.0, -40.0));
     let s = app.selected_shapes()[0].clone();
-    let ShapeKind::Path { path, .. } = &s.kind else {
+    let ShapeKind::Polygon {
+        bend, points, rect, ..
+    } = s.kind
+    else {
         panic!("{:?}", s.kind);
     };
+    assert_eq!(points, 5);
+    assert!(bend > 0.05, "bowed out: {bend}");
+    assert_eq!(app.engine.undo_label(), Some("Bend Sides"));
+    // The middles of the sides mirror each other across the pentagon's
+    // upright axis (its box is a little wider than tall, so they do not
+    // all lie as far from the centre).
+    let path = s.page_path();
+    let c = s.transform * rect.center();
+    let mids: Vec<f64> = path
+        .segments()
+        .map(|seg| (kurbo::ParamCurve::eval(&seg, 0.5) - c).hypot())
+        .collect();
+    assert_eq!(mids.len(), 5, "{mids:?}");
+    assert!((mids[0] - mids[4]).abs() < 0.01, "{mids:?}");
+    assert!((mids[1] - mids[3]).abs() < 0.01, "{mids:?}");
+    // Back in past straight: the sides bow in.
+    let side = path.segments().next().expect("side");
+    let at2 = app.view.to_screen(kurbo::ParamCurve::eval(&side, 0.5));
+    drag_between(&ctx, &mut app, at2, at2 + egui::vec2(-30.0, 60.0));
     assert!(
-        path.elements()
-            .iter()
-            .any(|e| matches!(e, kurbo::PathEl::CurveTo(..))),
-        "the edge is a curve now"
+        matches!(app.selected_shapes()[0].kind, ShapeKind::Polygon { bend, .. } if bend < 0.0),
+        "{:?}",
+        app.selected_shapes()[0].kind
     );
+    // One undo takes the whole second drag back.
+    app.undo();
+    assert!(matches!(
+        app.selected_shapes()[0].kind,
+        ShapeKind::Polygon { bend: b, .. } if (b - bend).abs() < 1e-9
+    ));
 }
 
 /// #2471: Copy Fill on the Interactive Fill bar waits for a click; the
@@ -29079,6 +29384,31 @@ fn a_clicked_handle_moves_with_the_arrow_keys() {
     );
     assert_eq!(app.node_selection, vec![(curve, 0)], "the node stays chosen");
     assert!(app.chosen_handle().is_none(), "no ring after a drag");
+    // While the button is held on the handle the ring stays on it, moved
+    // or not, and goes once the button is let go (#3141).
+    let from = app.view.to_screen(ctrl1(&app));
+    frame(&ctx, &mut app, vec![Event::PointerMoved(from)], Modifiers::NONE);
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(from, true, PointerButton::Primary, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    for i in 1..=4 {
+        let at = from + egui::vec2(10.0 * i as f32, 0.0);
+        frame(&ctx, &mut app, vec![Event::PointerMoved(at)], Modifiers::NONE);
+        let (_, tip) = app.chosen_handle_ends().expect("the ring stays while held");
+        assert!((tip - ctrl1(&app)).hypot() < 1e-9, "on the handle dragged");
+    }
+    let to = from + egui::vec2(40.0, 0.0);
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(to, false, PointerButton::Primary, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert!(app.chosen_handle_ends().is_none(), "gone once let go");
 }
 
 /// Options > Tools > Pick, "Ctrl and Shift keys", Windows standard
@@ -29522,4 +29852,159 @@ fn ctrl_and_shift_wheel_scroll_sideways_alt_wheel_up_and_down() {
         step(&mut app, Vec::new(), Modifiers::NONE);
     }
     assert!(app.view.zoom > zoom * 1.1);
+}
+
+/// Options > Tools > Zoom/Pan > Ctrl+wheel zooms (#3473): ticked, a
+/// Ctrl+wheel turn zooms about the pointer as the plain wheel does,
+/// without scrolling; unticked it scrolls sideways (#3087).
+#[test]
+fn ctrl_wheel_zooms_when_the_option_is_ticked() {
+    let (ctx, mut app, _) = setup();
+    assert!(app.settings.wheel_zooms && !app.settings.ctrl_wheel_zooms);
+    app.settings.ctrl_wheel_zooms = true;
+    let at = Pos2::new(700.0, 500.0);
+    let mut t = 10.0;
+    let mut step = |app: &mut App, events: Vec<Event>, modifiers: Modifiers| {
+        t += 1.0 / 60.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(1600.0, 1000.0),
+            )),
+            events: std::iter::once(Event::ModifiersChanged(modifiers))
+                .chain(events)
+                .collect(),
+            time: Some(t),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+        out.textures_delta.clear();
+    };
+    step(&mut app, vec![Event::PointerMoved(at)], Modifiers::NONE);
+    step(&mut app, vec![Event::PointerMoved(at)], Modifiers::NONE);
+    let zoom = app.view.zoom;
+    let under = app.view.to_page(at);
+    let wheel = Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 1.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: Modifiers::CTRL,
+    };
+    step(&mut app, vec![wheel], Modifiers::CTRL);
+    for _ in 0..30 {
+        step(&mut app, Vec::new(), Modifiers::CTRL);
+    }
+    assert!(app.view.zoom > zoom * 1.01, "zoomed in: {zoom} -> {}", app.view.zoom);
+    let still = app.view.to_page(at);
+    assert!(
+        (still.x - under.x).abs() < 1e-2 && (still.y - under.y).abs() < 1e-2,
+        "about the pointer: {under:?} -> {still:?}"
+    );
+}
+
+/// The steps of #3349 with the mouse and keys: Ctrl+D, the copy moved,
+/// turned or scaled by dragging (or nudged with the arrows), then Ctrl+D
+/// again and again: each new copy takes the same step from the last,
+/// until something else is picked. The copies stacked on the last one.
+#[test]
+fn ctrl_d_repeats_a_move_turn_or_scale_done_to_the_copy_with_the_mouse() {
+    let none = Modifiers::NONE;
+    let ctrl_d = |ctx: &egui::Context, app: &mut App| {
+        frame(ctx, app, vec![key(egui::Key::D, Modifiers::COMMAND)], Modifiers::COMMAND);
+        frame(ctx, app, vec![key_up(egui::Key::D, Modifiers::COMMAND)], none);
+        frame(ctx, app, Vec::new(), none);
+    };
+    let t = |app: &App, s: ShapeId| app.doc().find_shape(s).expect("shape").transform;
+    let near = |x: Affine, y: Affine| {
+        x.as_coeffs()
+            .iter()
+            .zip(y.as_coeffs())
+            .all(|(p, q)| (p - q).abs() < 1e-4)
+    };
+    for how in ["move", "turn", "scale", "nudge"] {
+        let (ctx, mut app, id) = setup();
+        app.duplicate_offset = Vec2::ZERO;
+        ctrl_d(&ctx, &mut app);
+        assert_eq!(shape_count(&app), 2, "{how}");
+        let first = app.selection[0];
+        assert_ne!(first, id);
+        match how {
+            "move" => {
+                let from = app.view.to_screen(Point::new(35.0, 25.0));
+                let to = app.view.to_screen(Point::new(65.0, 35.0));
+                drag(&ctx, &mut app, from, to, none, Vec::new());
+            }
+            "turn" => {
+                // A second click on the copy: the turning handles.
+                let at = app.view.to_screen(Point::new(35.0, 25.0));
+                frame(&ctx, &mut app, vec![Event::PointerMoved(at)], none);
+                frame(&ctx, &mut app, vec![button(at, true, PointerButton::Primary, none)], none);
+                frame(&ctx, &mut app, vec![button(at, false, PointerButton::Primary, none)], none);
+                frame(&ctx, &mut app, Vec::new(), none);
+                assert!(app.rotate_mode, "rotate mode");
+                let ne = handle(&app, Handle::NE);
+                let centre = app.view.to_screen(app.rotation_center().expect("centre"));
+                let r = ne - centre;
+                let to = centre + egui::vec2(r.x * 0.9 - r.y * 0.4, r.y * 0.9 + r.x * 0.4);
+                drag(&ctx, &mut app, ne, to, none, Vec::new());
+            }
+            "scale" => {
+                let e = handle(&app, Handle::E);
+                drag(&ctx, &mut app, e, e + egui::vec2(40.0, 0.0), none, Vec::new());
+            }
+            _ => {
+                for _ in 0..3 {
+                    frame(&ctx, &mut app, vec![key(egui::Key::ArrowRight, none)], none);
+                    frame(&ctx, &mut app, vec![key_up(egui::Key::ArrowRight, none)], none);
+                }
+                frame(&ctx, &mut app, Vec::new(), none);
+            }
+        }
+        assert_eq!(shape_count(&app), 2, "{how}: no copy left by the drag");
+        assert_eq!(app.selection, vec![first], "{how}: the copy stays picked");
+        let step = t(&app, first) * t(&app, id).inverse();
+        assert!(!near(step, Affine::IDENTITY), "{how}: the copy changed");
+        ctrl_d(&ctx, &mut app);
+        assert_eq!(shape_count(&app), 3, "{how}");
+        let second = app.selection[0];
+        assert!(
+            near(t(&app, second), step * t(&app, first)),
+            "{how}: {:?} not {:?}",
+            t(&app, second),
+            step * t(&app, first)
+        );
+        ctrl_d(&ctx, &mut app);
+        let third = app.selection[0];
+        assert!(near(t(&app, third), step * t(&app, second)), "{how}: third");
+    }
+}
+
+/// #3008: a double click on a guideline opens the Guidelines panel on it,
+/// one placed in code or dragged out of the ruler. The first click took
+/// the guideline and the second ended there too, so it was only selected.
+#[test]
+fn a_double_click_on_a_guideline_opens_the_guidelines_panel() {
+    use tracedraw_core::document::Guide;
+    let (ctx, mut app, _id) = setup();
+    app.add_guide(Guide::horizontal(150.0));
+    app.show_dockers = false;
+    let on_h = app.view.to_screen(Point::new(100.0, 150.0));
+    double_click_at(&ctx, &mut app, on_h);
+    assert!(app.show_dockers);
+    assert_eq!(app.docker_tab, crate::app::DockerTab::Guidelines);
+    assert_eq!(app.guide_form_for, Some(0));
+    assert_eq!(app.selected_guides, vec![0]);
+    assert!(app.guide_rotate.is_none(), "not left in rotate mode");
+
+    // Dragged out of the ruler above the drawing window.
+    let (_, mut app, _id) = setup();
+    app.show_dockers = false;
+    let top = egui::pos2(app.canvas_rect.center().x, app.canvas_rect.top() - 8.0);
+    let to = egui::pos2(top.x, app.canvas_rect.center().y + 60.0);
+    drag(&ctx, &mut app, top, to, Modifiers::NONE, Vec::new());
+    assert_eq!(app.page_guides().len(), 1, "a guideline from the ruler");
+    double_click_at(&ctx, &mut app, egui::pos2(to.x - 150.0, to.y));
+    assert!(app.show_dockers);
+    assert_eq!(app.docker_tab, crate::app::DockerTab::Guidelines);
+    assert_eq!(app.guide_form_for, Some(0));
 }

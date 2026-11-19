@@ -459,6 +459,8 @@ struct GState {
     leading: f64,
     rise: f64,
     render_mode: i64,
+    /// The luminosity soft mask objects are drawn under, as its fill.
+    soft_mask: Option<Fill>,
 }
 
 impl Default for GState {
@@ -485,6 +487,7 @@ impl Default for GState {
             leading: 0.0,
             rise: 0.0,
             render_mode: 0,
+            soft_mask: None,
         }
     }
 }
@@ -879,6 +882,20 @@ struct ActualText {
     broken: bool,
 }
 
+/// An object drawn under a soft mask fades as the mask's fill shows: a
+/// transparency on the whole object, white keeping it, black clearing it.
+fn masked(shape: &mut Shape, mask: &Option<Fill>) {
+    if let Some(mask) = mask {
+        shape
+            .effects
+            .push(tracedraw_core::live::Effect::Transparency {
+                mask: mask.clone(),
+                merge: Default::default(),
+                target: 2,
+            });
+    }
+}
+
 /// A run of text being assembled while inside BT ... ET.
 struct TextRun {
     text: String,
@@ -913,6 +930,8 @@ struct TextRun {
     /// The outline it is drawn with: render mode 1 or 5, or 2 or 6 in
     /// an outline colour of its own ([`text_outline`]).
     outline: Option<Stroke>,
+    /// The soft mask the run was drawn under.
+    mask: Option<Fill>,
 }
 
 /// A Devanagari consonant (with the nukta forms).
@@ -1828,7 +1847,7 @@ impl<'a> Importer<'a> {
                 }
                 "gs" => {
                     if let Some(name) = operands.first().and_then(|o| o.as_name().ok()) {
-                        self.apply_ext_gstate(resources, name, gs);
+                        self.apply_ext_gstate(resources, name, gs, depth);
                     }
                 }
                 // Path construction (points are mapped through the CTM now).
@@ -2420,7 +2439,13 @@ impl<'a> Importer<'a> {
         Colorant::Ink { id, cmyk }
     }
 
-    fn apply_ext_gstate(&mut self, resources: &Dictionary, name: &[u8], gs: &mut GState) {
+    fn apply_ext_gstate(
+        &mut self,
+        resources: &Dictionary,
+        name: &[u8],
+        gs: &mut GState,
+        depth: usize,
+    ) {
         let Some(eg) = self
             .get(resources, b"ExtGState")
             .and_then(|o| self.dict_of(o))
@@ -2450,12 +2475,65 @@ impl<'a> Importer<'a> {
                 gs.font_size = size;
             }
         }
-        if let Some(Object::Dictionary(sm)) = self.get(&eg, b"SMask") {
-            // Soft masks on groups are not modelled; keep the content opaque
-            // and say so.
-            if sm.has(b"G") {
-                self.warn("soft mask (SMask) in graphics state ignored");
+        match self.get(&eg, b"SMask").cloned() {
+            Some(Object::Name(n)) if n == b"None" => gs.soft_mask = None,
+            Some(Object::Dictionary(sm)) if sm.has(b"G") => {
+                gs.soft_mask = self.soft_mask_fill(&sm, gs, depth);
+                if gs.soft_mask.is_none() {
+                    self.warn("soft mask (SMask) in graphics state ignored");
+                }
             }
+            _ => {}
+        }
+    }
+
+    /// A luminosity soft mask whose group paints one fill (a fountain or
+    /// a flat colour, as the drawing window's transparencies write it) as
+    /// that fill: it comes in as the transparency of the objects drawn
+    /// under it. Any other mask is left out.
+    fn soft_mask_fill(&mut self, sm: &Dictionary, gs: &GState, depth: usize) -> Option<Fill> {
+        if depth >= MAX_FORM_DEPTH {
+            return None;
+        }
+        let luminosity = self
+            .get(sm, b"S")
+            .and_then(|o| o.as_name().ok())
+            .is_some_and(|n| n == b"Luminosity");
+        if !luminosity {
+            return None;
+        }
+        let Object::Stream(group) = self.get(sm, b"G").map(|o| self.deref(o).clone())? else {
+            return None;
+        };
+        // The group's content is collected apart from the page's, as a
+        // pattern tile's is.
+        let saved_open = self.open.take();
+        let saved = std::mem::take(&mut self.shapes);
+        let mut inner = GState {
+            ctm: gs.ctm,
+            ..GState::default()
+        };
+        let before = self.ops;
+        self.draw_form(&group, &mut inner, depth + 1);
+        self.ops = before + 1;
+        self.close_frame();
+        let shapes = std::mem::replace(&mut self.shapes, saved);
+        self.open = saved_open;
+        fn fills(shapes: &[Shape], out: &mut Vec<Fill>) {
+            for s in shapes {
+                match &s.kind {
+                    ShapeKind::ClipFrame { contents, .. } => fills(contents, out),
+                    ShapeKind::Group { children } => fills(children, out),
+                    _ if s.stroke.is_none() => out.push(s.fill.clone()),
+                    _ => out.push(Fill::None),
+                }
+            }
+        }
+        let mut found = Vec::new();
+        fills(&shapes, &mut found);
+        match found.as_slice() {
+            [f @ (Fill::Fountain(_) | Fill::Solid(_))] => Some(f.clone()),
+            _ => None,
         }
     }
 
@@ -2569,6 +2647,10 @@ impl<'a> Importer<'a> {
         };
         if even_odd && fill {
             shape.data.push(("fill.rule".into(), "evenodd".into()));
+        } else if fill && crate::nonzero_matters(path) {
+            // `f`, `B` and `b` fill by the nonzero rule: overlapping
+            // letters of a text in curves stay filled (#3224).
+            shape.fill_rule = tracedraw_core::shaping::FillRule::NonZero;
         }
         shape.stroke = if stroke {
             gs.stroke.map(|c| {
@@ -2613,6 +2695,7 @@ impl<'a> Importer<'a> {
         } else {
             gs.stroke_alpha
         };
+        masked(&mut shape, &gs.soft_mask);
         self.push(shape, &gs.clip);
     }
 
@@ -2694,6 +2777,7 @@ impl<'a> Importer<'a> {
         shape.stroke = None;
         shape.fill = Fill::None;
         shape.opacity = gs.fill_alpha;
+        masked(&mut shape, &gs.soft_mask);
         self.push(shape, &gs.clip);
     }
 
@@ -3194,6 +3278,7 @@ impl<'a> Importer<'a> {
         shape.fill = Fill::Fountain(f);
         shape.stroke = None;
         shape.opacity = gs.fill_alpha;
+        masked(&mut shape, &gs.soft_mask);
         self.push_free(shape);
     }
 
@@ -4135,6 +4220,7 @@ impl<'a> Importer<'a> {
                     })
                     .or_else(|| text_outline(gs));
                 shape.opacity = gs.fill_alpha;
+                masked(&mut shape, &gs.soft_mask);
                 let clip = gs.clip.clone();
                 self.push(shape, &clip);
             }
@@ -4197,6 +4283,7 @@ impl<'a> Importer<'a> {
                     && r.stroked_bold == fake_bold(gs)
                     && r.filled == text_filled(gs)
                     && r.outline == text_outline(gs)
+                    && r.mask == gs.soft_mask
                     && (r.size_pt - size_pt).abs() < 1e-6
                     && r.fill == gs.fill
                     && (same_line(&r.matrix, &trm, r.end_x, gs.font_size)
@@ -4215,17 +4302,31 @@ impl<'a> Importer<'a> {
             if let Some(mut r) = run.take() {
                 // An ActualText whose glyphs go on in another text: both
                 // texts keep their glyphs' own characters.
+                // Only spaces shown so far, for an ActualText that starts
+                // with a space or tab (a tab stop, then the word): the
+                // spaces stay here and the rest of it goes to the glyphs
+                // in the next text (#3177).
                 if given == Some(true) {
                     if let Some(a) = self.actual.as_mut() {
-                        a.broken = true;
                         if let Some(at) = a.at {
                             r.xs = None;
                             r.text.truncate(at);
                             r.text.push_str(&a.own);
                             r.typed.retain(|t| t.start < at);
                         }
+                        let rest = a.text.trim_start();
+                        if a.own.trim().is_empty() && !rest.is_empty() && rest.len() < a.text.len()
+                        {
+                            a.text = rest.to_string();
+                            a.shown = false;
+                            a.at = None;
+                            a.own.clear();
+                            given = Some(false);
+                        } else {
+                            a.broken = true;
+                            given = None;
+                        }
                     }
-                    given = None;
                 }
                 self.flush_run(r);
             }
@@ -4247,6 +4348,7 @@ impl<'a> Importer<'a> {
                     stroked_bold: fake_bold(gs),
                     filled: text_filled(gs),
                     outline: text_outline(gs),
+                    mask: gs.soft_mask.clone(),
                 });
             }
         } else if let (Some(r), Some((new_end, len))) = (run.as_mut(), along) {
@@ -4348,11 +4450,28 @@ impl<'a> Importer<'a> {
             .chain(std::iter::once(&(r.text.len()..r.text.len())))
         {
             if let Some(between) = r.text.get(from..part.start) {
-                text.push_str(&devanagari_typed_order(
-                    &devanagari_compose(between),
-                    r.reph_glyph,
-                    r.font.drawn_order,
-                ));
+                let between = devanagari_compose(between);
+                // A short i sign right after the letter an ActualText
+                // gave is typed after it: the text after an ActualText
+                // is read with that letter before it (#3177).
+                let before = text
+                    .chars()
+                    .last()
+                    .filter(|c| deva_consonant(*c) || *c == DEVA_NUKTA);
+                let ordered = match before {
+                    Some(b) if between.starts_with(DEVA_SIGN_I) => {
+                        let with = devanagari_typed_order(
+                            &format!("{b}{between}"),
+                            r.reph_glyph,
+                            r.font.drawn_order,
+                        );
+                        with.strip_prefix(b).map(str::to_string).unwrap_or_else(|| {
+                            devanagari_typed_order(&between, r.reph_glyph, r.font.drawn_order)
+                        })
+                    }
+                    _ => devanagari_typed_order(&between, r.reph_glyph, r.font.drawn_order),
+                };
+                text.push_str(&ordered);
             }
             if let Some(given) = r.text.get(part.clone()) {
                 text.push_str(&devanagari_compose(given));
@@ -4394,6 +4513,7 @@ impl<'a> Importer<'a> {
         };
         shape.stroke = r.outline;
         shape.opacity = r.alpha;
+        masked(&mut shape, &r.mask);
         let _ = r.font.type3_matrix;
         self.line_widths.insert(shape.id, r.reach * scale);
         if let Some(xs) = r.xs.filter(|xs| xs.len() == text_chars) {
@@ -5775,6 +5895,32 @@ mod tests {
         pdf(&objs)
     }
 
+    /// `f` fills by the nonzero rule, `f*` by even-odd: two overlapping
+    /// squares in one path stay filled where they overlap with `f`, as
+    /// a letter in curves does (#3224). A one-subpath fill stays as is.
+    #[test]
+    fn nonzero_fills_keep_their_overlaps() {
+        use tracedraw_core::shaping::FillRule;
+        let bytes = one_page(
+            "0 g 10 10 m 50 10 l 50 50 l 10 50 l h 30 30 m 70 30 l 70 70 l 30 70 l h f \
+             20 20 m 60 20 l 60 60 l 20 60 l h 40 40 m 80 40 l 80 80 l 40 80 l h f* \
+             10 10 m 50 10 l 50 50 l h f",
+            "<< >>",
+            &[],
+        );
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let shapes = &imp.pages[0].shapes;
+        assert_eq!(shapes.len(), 3, "{:?}", imp.warnings);
+        assert_eq!(shapes[0].fill_rule, FillRule::NonZero);
+        assert_eq!(shapes[1].fill_rule, FillRule::EvenOdd);
+        assert!(shapes[1]
+            .data
+            .iter()
+            .any(|(k, v)| k == "fill.rule" && v == "evenodd"));
+        assert_eq!(shapes[2].fill_rule, FillRule::EvenOdd);
+    }
+
     #[test]
     fn paths_fills_strokes_and_page_size() {
         let bytes = one_page(
@@ -6275,6 +6421,38 @@ mod tests {
         );
         // क्ष from one glyph, with the e sign: क्षे.
         assert_eq!(deva_page("BT /F1 12 Tf 10 50 Td (NK) Tj ET", ""), ["क्षे"]);
+    }
+
+    /// A word processor's Hindi PDF that gives some letters by ActualText
+    /// and the rest by the glyphs' own characters, already in typed order
+    /// (#3177): the short i sign after such a letter stays on it, and an
+    /// ActualText that starts with a tab keeps its letter when the tab
+    /// stop puts that letter in another text.
+    #[test]
+    fn hindi_typed_after_an_actual_text_letter_keeps_its_i_signs() {
+        // किताब: क by ActualText, then ि त ा ब as typed.
+        assert_eq!(
+            deva_page(
+                "BT /F1 12 Tf 10 50 Td /Span << /ActualText <FEFF0915> >> BDC (E) Tj EMC (BCDE) Tj ET",
+                ""
+            ),
+            ["किताब"]
+        );
+        // The same with the i sign drawn first and no ActualText still
+        // goes back to typed order.
+        assert_eq!(
+            deva_page("BT /F1 12 Tf 10 50 Td (BACDE) Tj ET", ""),
+            ["किताब"]
+        );
+        // A tab, then बु: the tab and ब in one ActualText over a space
+        // glyph and a glyph whose own character is the i sign.
+        assert_eq!(
+            deva_page(
+                "BT /F1 12 Tf 10 50 Td (A) Tj /Span << /ActualText <FEFF0009092C> >> BDC ( ) Tj 100 0 Td (B) Tj EMC (H) Tj ET",
+                ""
+            ),
+            ["क ", "बु"]
+        );
     }
 
     #[test]
@@ -7813,5 +7991,81 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["युक्ति", "मुश्किल", "स्कूल", "विश्वास", "उपयुक्त"]);
+    }
+}
+
+#[cfg(test)]
+mod soft_mask_tests {
+    use super::*;
+    use tracedraw_core::live::Effect;
+
+    /// A transparency that fades across an object goes out as a luminosity
+    /// soft mask (#2615) and comes back as the same fading transparency,
+    /// not as a solid object.
+    #[test]
+    fn a_fading_transparency_comes_back() {
+        let mut doc = tracedraw_core::Document::default();
+        let mut p = tracedraw_core::BezPath::new();
+        p.move_to((20.0, 20.0));
+        p.line_to((120.0, 20.0));
+        p.line_to((120.0, 80.0));
+        p.line_to((20.0, 80.0));
+        p.close_path();
+        let mut sq = Shape::new(
+            ShapeId(1),
+            ShapeKind::Path {
+                path: p,
+                closed: true,
+            },
+        );
+        sq.fill = Fill::Solid(Color::rgb8(200, 30, 30));
+        sq.stroke = None;
+        let mask = Fill::Fountain(Fountain {
+            kind: FountainKind::Linear,
+            stops: vec![
+                Stop::new(0.0, Color::rgb8(255, 255, 255)),
+                Stop::new(1.0, Color::rgb8(0, 0, 0)),
+            ],
+            angle: 0.0,
+            ..Default::default()
+        });
+        sq.effects.push(Effect::Transparency {
+            mask,
+            merge: Default::default(),
+            target: 2,
+        });
+        doc.pages[0].layers[0].shapes.push(sq);
+        let bytes = crate::pdf::document_to_pdf(&doc);
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let mut found = Vec::new();
+        fn walk<'a>(shapes: &'a [Shape], out: &mut Vec<&'a Shape>) {
+            for s in shapes {
+                match &s.kind {
+                    ShapeKind::ClipFrame { contents, .. } => walk(contents, out),
+                    ShapeKind::Group { children } => walk(children, out),
+                    _ => out.push(s),
+                }
+            }
+        }
+        walk(&imp.pages[0].shapes, &mut found);
+        let red: Vec<_> = found
+            .iter()
+            .filter(|s| matches!(s.fill, Fill::Solid(c) if c.to_rgb8() == [200, 30, 30]))
+            .collect();
+        assert_eq!(red.len(), 1, "{found:#?}");
+        let Some(Effect::Transparency { mask, .. }) = red[0].effects.first() else {
+            panic!("no transparency: {:?} {:?}", red[0].effects, imp.warnings);
+        };
+        let Fill::Fountain(f) = mask else {
+            panic!("{mask:?}");
+        };
+        assert_eq!(f.kind, FountainKind::Linear);
+        assert!(f.angle.abs() < 1.0, "{}", f.angle);
+        let first = f.stops.first().unwrap().color.to_rgb8();
+        let last = f.stops.last().unwrap().color.to_rgb8();
+        assert!(first[0] > 240 && last[0] < 15, "{first:?} {last:?}");
+        // Nothing else of the mask's own painting is left on the page.
+        assert_eq!(found.len(), 1, "{found:#?}");
     }
 }

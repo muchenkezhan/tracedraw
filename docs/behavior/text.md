@@ -301,6 +301,20 @@ formatting of the character before it, and linked frames reflow
 `ops2::text_dialog_tests::char_edits_keep_what_both_texts_share`).
 A double click on a text still edits it in place.
 
+The dialog is a window the user sizes, the box filling it (#3270), with
+a second row under the formatting row: the text's alignment (No align,
+Left, Centre, Right, Justify), set with OK in the same undo step; Change
+case (Sentence case, lowercase, UPPERCASE, Title Case, tOGGLE cASE) on
+the selected characters, all of them without a selection, each keeping
+its formatting; a zoom of the box from 50 to 400 % (the text on the page
+keeps its size); Show marks, spaces as grey dots and tabs as grey arrows,
+one character for one so the cursor keeps its place (paragraph ends are
+not marked); Import Text, which adds the characters of a TXT, RTF or
+DOCX file at the end of the box; and Spell Check, which keeps the box's
+text and opens Writing Tools on its Spell Check page
+(`ui::dialogs::edit_text_tests`). The box shows the characters in its
+own font, not the text's.
+
 ## Editing in place
 
 Clicking text with the Text tool (or double-clicking it with the Pick
@@ -317,9 +331,10 @@ concatenated spans; the layout's line boxes give its place on the page.
 | Up / Down | the same x on the previous / next line (the x is remembered across moves) |
 | Home / End, Ctrl+Home / End | line start / end, text start / end |
 | Ctrl+A | select all |
+| Text > Show Non-Printing Characters | while a text is edited, each space shows as a dot, a tab as an arrow across its width, a paragraph end (Enter) as a pilcrow after the line's last letter and a line break (Shift+Enter) as a bent arrow, blue on a white edge; they go when the editing ends and are never printed or exported. The option was kept and saved but showed nothing (#3271, `text_editing::tests::non_printing_characters_show_while_editing`) |
 | Mixed directions (an Arabic or Hebrew word in English text, or the other way round) | the Unicode bidirectional algorithm gives each character its level, the first strong letter setting the direction; it is worked out for each run of one formatting between tabs and line ends, so a direction change across differently formatted characters keeps them in text order. Each run of one level is shaped its own way; lines break in text order and each line shows its runs in display order: Arabic typed after "Asasa " reads right to left, joined, to the right of it, and a paragraph too narrow for "Hi مرحبا بك" keeps "Hi مرحبا" on the first line; digits inside right-to-left text read left to right (#628, `tracedraw_text::tests::mixed_text_is_cut_into_runs_of_one_direction`, `tracedraw_text::tests::lines_are_seen_in_bidi_order`, `tracedraw_text::tests::mixed_directions_lay_each_run_its_own_way`, `tracedraw_text::tests::mixed_paragraph_text_breaks_in_text_order`, `pick_drag_tests::right_to_left_typed_after_english_runs_right_to_left`) |
 | A text begun in Hebrew or Arabic | its first letters typed (or pasted) into an empty text that is left aligned or not aligned, the default, align it to the right: artistic text grows to the left of the click and paragraph text starts at the frame's right edge, as right-to-left text is read. A text whose first letter is Latin (digits and spaces do not count) keeps its alignment, and an alignment chosen later stays (discussion #2122, `text_editing::tests::a_text_begun_in_hebrew_runs_from_the_right`) |
-| Text direction (discussion #2670) | the Text docker's Paragraph section has Direction, Left to right (the default) or Right to left, for the paragraphs acted on. Right to left runs the bidirectional algorithm with a right-to-left base: each line starts at the right, Latin words and digits keep their order inside their run, a full stop or other neutral character at a run's end goes to the right-to-left side (the left), and a right-to-left word after Latin ones goes to their left. The left and right indents change sides and the first line's indent goes to the right. Turning text right to left aligns left-aligned (or not aligned) text right, and turning it back aligns right-aligned text left. Saved as `direction: right_to_left` in the paragraph's style; older files read as left to right (`tracedraw_text::tests::a_right_to_left_paragraph_runs_from_the_right`, `document::tests::text_direction_defaults_to_left_to_right_and_round_trips`) |
+| Text direction (discussion #2670) | the Text docker's Paragraph section has Direction, Left to right (the default) or Right to left, for the paragraphs acted on. Right to left runs the bidirectional algorithm with a right-to-left base: each line starts at the right, Latin words and digits keep their order inside their run, a full stop or other neutral character at a run's end goes to the right-to-left side (the left), and a right-to-left word after Latin ones goes to their left. The left and right indents change sides and the first line's indent goes to the right. Turning text right to left aligns left-aligned (or not aligned) text right, and turning it back aligns right-aligned text left. Saved as `direction: right_to_left` in the paragraph's style; older files read as left to right (`tracedraw_text::tests::a_right_to_left_paragraph_runs_from_the_right`, `document::tests::text_direction_defaults_to_left_to_right_and_round_trips`). Full justify sets a right-to-left paragraph's last line from the right edge (set right to left, or right to left by its first strong letter, Hebrew or Arabic); it was set from the left like a left-to-right one's (#3216, `tracedraw_text::tests::a_justified_right_to_left_paragraph_ends_at_the_right`) |
 | Right-to-left text (Arabic, Hebrew) | the caret before a letter is at its right end and the end of the text at its left; a selection shades the letters it holds, all of them after Ctrl+A, where it used to shade only the first letter (#629, `tracedraw_text::tests::right_to_left_carets_run_from_the_right`, `pick_drag_tests::select_all_in_right_to_left_text_highlights_all_of_it`); character backgrounds and a callout's box cover such text too, mixed directions included (`callouts::tests::text_boxes_and_backgrounds_cover_mixed_direction_text`) |
 | Ctrl+B / I / U | toggle bold, italic, underline on the selection, or on the whole text without one |
 | Ctrl+C / X / V, Edit > Cut / Copy / Paste / Delete, the toolbar's buttons, the right-click menu | act on the characters of the text being edited, never on the object (#1377): Copy keeps the selected characters with their formatting (font, size, colours, outline, every character setting) for a paste into a text here and puts their plain text on the system clipboard for other programs (line breaks as the system's line end); Paste puts them back with their formatting while the clipboard still holds that text, also into another text (characters showing their text's own fill or outline get it as theirs where the texts differ), and pastes text copied elsewhere as it is, in the style at the caret. Objects copied with Edit > Copy (SVG on the system clipboard) paste their text with its formatting, never the SVG markup; Cut and Paste are one undo step each. Copied characters are the last copy (they replace objects copied before) and, pasted with the Pick tool, make an artistic text of them with their formatting and their text's fill and outline (`text_editing::tests::copied_characters_pasted_outside_a_text_keep_their_colours`). The right-click menu while editing has Undo, Cut, Copy, Paste, Delete, Select All (and Insert Placeholder Text in a paragraph frame) and Properties. On the desktop the clipboard is read when Paste is chosen from a menu; in the browser a menu's Paste has only the characters copied here, Ctrl+V the clipboard's text; on Android the system clipboard is read first (#1378, `text_editing::tests::copied_characters_keep_their_colours_when_pasted`, `text_editing::tests::copied_objects_paste_their_text_not_their_markup`) |
@@ -604,6 +619,16 @@ on its own line, which is why the lines are joined first.
   afterwards flows on into the empty one (picked first, the empty frame
   took the whole text and the frame it came from was left empty;
   `textflow::tests::linking_to_an_empty_frame_keeps_the_source_text_whatever_the_order`).
+- The flow joins the step of the change that made it: linking, an edit
+  of the text (typing, Edit Text) and a move, scale or resize of a frame
+  are one Undo each, the text going back to the frames it was in. The
+  flow was a step of its own, so one Undo left the frames linked, or the
+  frame at its new size, with the text flowed as before
+  (`textflow::tests::a_change_to_linked_frames_and_its_flow_are_one_undo`).
+- Copies of a whole chain (Duplicate, Paste, Step and Repeat and the
+  Transformations docker's copies) are a chain of their own; a copy of
+  only some of its frames is in no chain
+  (`textflow::tests::transformation_copies_of_a_chain_are_linked`).
 - Deleting a frame of a chain (Delete, Cut, a group or clip frame
   holding it, or the page or layer it is on) removes only the frame: the frames left are linked to one
   another in their order and the chain's whole text flows anew over them,
@@ -1162,6 +1187,9 @@ alternates (`salt`), Swash (`swsh`); then Superscript and Subscript.
   space. The Interactive vertical spacing arrow, below the lower left
   corner, changes line spacing so the last baseline follows the pointer:
   `leading' = leading * (pitch - dy / (lines - 1)) / pitch`.
+  Each arrow has a head at both ends, left and right or up and down, as
+  the spacing goes both ways (#2985,
+  `canvas::node_look_tests::spacing_arrows_point_both_ways`).
 - The arrows act on every paragraph of the text, those with spacing of
   their own too, so they keep their differences: the character or word
   spacing change (in percent) is added to each paragraph's, and each
@@ -1663,6 +1691,16 @@ stand-in next to each missing family: "Arial (Liberation Sans)".
   the end one (and back), the centre one staying
   (`ops2::tests::text_goes_where_the_path_is_clicked_and_mirrors_keep_it_there`,
   `ops2::tests::the_horizontal_mirror_keeps_text_on_a_line_in_place`).
+  The Pick tool's own Mirror horizontally and Mirror vertically (the
+  object fields, the Arrange menu, the toolbar) on a selection holding a
+  fitted text, alone or with its circle or curve, mirror the text's path
+  and leave its letters reading (#3255): mirrored top to bottom, a text
+  on the outside of a circle's top comes to the inside of its bottom,
+  reading left to right as Bottom centre puts it; mirrored left to right
+  it keeps its side of the path and goes to the mirrored place along it.
+  The other objects mirror as before, all in one undo step ("Mirror";
+  `ops2::tests::mirroring_a_fitted_text_with_its_circle_keeps_it_readable`).
+  The letters themselves came out upside down or back to front.
   Each change is one undo step and is stored with the
   text, so the bar shows it again when the text is selected again
   (`text_path::tests::the_bar_settings_edit_the_text_with_undo_and_come_back_on_reselect`).
@@ -1682,8 +1720,11 @@ stand-in next to each missing family: "Arial (Liberation Sans)".
   (`text_path::tests::fit_text_to_path_with_nothing_selected_leaves_no_stray_text`).
 - With the Text tool, a click on the outline of a path (within 4 pixels;
   not a text, a bitmap or a group) starts an empty text on that path,
-  placed the same way, ready to type. A click elsewhere starts an
-  artistic text as before
+  placed the same way, ready to type. While the pointer is over such an
+  outline the path shows outlined in blue, "Click to type along the
+  path" stands by the pointer and the status bar says so, so the way to
+  put text on a path is seen before the click (#3255). A click elsewhere
+  starts an artistic text as before
   (`ops2::tests::closed_paths_turn_clockwise_and_start_at_the_top`,
   `ops2::tests::text_fitted_to_an_ellipse_sits_centred_on_its_top_outside`,
   `ops2::tests::text_on_a_straight_line_stands_on_it_from_the_start`,
