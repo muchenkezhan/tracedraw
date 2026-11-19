@@ -514,6 +514,10 @@ pub struct Settings {
     /// on and one with it off, to compare them.
     #[serde(default)]
     pub benchmarks: Vec<crate::benchmark::Measured>,
+    /// Help > Benchmark asked for a start with or without the graphics
+    /// card: open the benchmark at the next start and run this test.
+    #[serde(default)]
+    pub benchmark_resume: Option<crate::benchmark::Level>,
     /// Options > Tools > Zoom/Pan: how much one wheel notch zooms, in
     /// percent (15 by default); see [`Settings::wheel_zoom_factor`].
     #[serde(default = "default_wheel_zoom_step")]
@@ -1129,6 +1133,19 @@ impl HandleSize {
         }
     }
 
+    /// How large the Shape tool's control handle heads are drawn, as a
+    /// share of their size for the node size: the largest (the default)
+    /// keeps them as they were, the smaller sizes draw them smaller. The
+    /// setting changed only the Pick tool's handles, so on the Nodes and
+    /// Handles page it seemed to do nothing (#3003).
+    pub fn head_scale(self) -> f32 {
+        match self {
+            HandleSize::Small => 0.6,
+            HandleSize::Medium => 0.8,
+            HandleSize::Large => 1.0,
+        }
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             HandleSize::Small => "options.node_small",
@@ -1234,8 +1251,14 @@ impl NodePrefs {
     /// 5/4 of its length) and a pixel more, so the whole head takes a
     /// press and the reach grows with the node size (#1643, #1935).
     pub fn handle_pick_px(&self) -> f64 {
-        let head = f64::from(self.size.handle_head());
+        let head = f64::from(self.control_head());
         self.pick_px().max(head * 1.25f64.sqrt() + 1.0)
+    }
+
+    /// Length of a control handle's arrow head, screen pixels: the node
+    /// size's, scaled by the handle size (#1643, #3003).
+    pub fn control_head(&self) -> f32 {
+        self.size.handle_head() * self.handles.head_scale()
     }
 
     /// The object click distance in screen pixels, kept sensible
@@ -1705,6 +1728,26 @@ impl Default for SnapPrefs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolPrefs {
+    /// The Common Shapes tool's shape, by the key of its name, and the
+    /// shape of My shapes picked instead: the choice went back to the
+    /// arrow at every start, as did the next ones.
+    pub common_shape: String,
+    pub my_shape: Option<u64>,
+    /// The Attributes eyedropper's groups and the colour eyedropper's
+    /// sample box (1, 2 or 5 pixels).
+    pub eyedropper_groups: crate::eyedropper::AttrGroups,
+    pub eyedropper_sample: u32,
+    /// The Free Transform tool's mode.
+    pub free_transform_mode: crate::app::FreeTransformMode,
+    /// The Shape tool's freehand marquee, and its Shift adding to the
+    /// nodes chosen.
+    pub node_lasso: bool,
+    pub node_lasso_keeps: bool,
+    /// The Blend tool's rotation and object and colour acceleration
+    /// (-1 to 1) for new blends; its steps were kept already.
+    pub blend_rotation: f64,
+    pub blend_accel_objects: f64,
+    pub blend_accel_colors: f64,
     pub polygon_points: u32,
     pub star_sharpness: f64,
     pub star_complex: bool,
@@ -1764,11 +1807,83 @@ pub struct ToolPrefs {
     pub knife: crate::knife::KnifeSettings,
     /// Segment Delete's drag is a freehand stroke, not a box (#1150).
     pub segment_freehand: bool,
+    /// The Brush Strokes tool's mode and settings: they went back to
+    /// the first start's at every start, as did the next three.
+    pub media: MediaPrefs,
+    /// The Speech Balloon tool's style, tail width and bend.
+    pub balloon: BalloonPrefs,
+    /// The Action Lines tool's settings.
+    pub action_lines: crate::action_lines::ActionLines,
+    /// The Painterly Brush tool's brush and size.
+    pub painterly: crate::painterly_tool::PainterlySettings,
+}
+
+/// The Brush Strokes tool's bar, kept between sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaPrefs {
+    pub mode: crate::media::MediaMode,
+    pub preset: usize,
+    /// mm.
+    pub width: f64,
+    /// Calligraphic nib angle, degrees.
+    pub angle: f64,
+    /// Sprayer spacing, mm.
+    pub spacing: f64,
+    /// Expression: how much the width follows the pressure, 0 to 1.
+    pub pressure: f64,
+    /// Freehand smoothing of the stroke, 0 to 100.
+    pub smoothing: f64,
+}
+
+impl Default for MediaPrefs {
+    fn default() -> Self {
+        MediaPrefs {
+            mode: crate::media::MediaMode::Calligraphic,
+            preset: 0,
+            width: 3.0,
+            angle: 45.0,
+            spacing: 8.0,
+            pressure: 0.5,
+            smoothing: 25.0,
+        }
+    }
+}
+
+/// The Speech Balloon tool's bar, kept between sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BalloonPrefs {
+    pub style: crate::balloons::BalloonStyle,
+    /// Tail width, percent of the body's smaller side.
+    pub width: f64,
+    /// Tail bend, -100 to 100.
+    pub bend: f64,
+}
+
+impl Default for BalloonPrefs {
+    fn default() -> Self {
+        BalloonPrefs {
+            style: Default::default(),
+            width: 30.0,
+            bend: 0.0,
+        }
+    }
 }
 
 impl Default for ToolPrefs {
     fn default() -> Self {
         ToolPrefs {
+            common_shape: crate::tools2::CommonShape::RightArrow.key().into(),
+            my_shape: None,
+            eyedropper_groups: Default::default(),
+            eyedropper_sample: 1,
+            free_transform_mode: crate::app::FreeTransformMode::Rotation,
+            node_lasso: false,
+            node_lasso_keeps: false,
+            blend_rotation: 0.0,
+            blend_accel_objects: 0.0,
+            blend_accel_colors: 0.0,
             polygon_points: 5,
             star_sharpness: 0.5,
             star_complex: false,
@@ -1812,6 +1927,10 @@ impl Default for ToolPrefs {
             sketch: Default::default(),
             knife: Default::default(),
             segment_freehand: false,
+            media: Default::default(),
+            balloon: Default::default(),
+            action_lines: Default::default(),
+            painterly: Default::default(),
         }
     }
 }
@@ -2118,6 +2237,7 @@ impl Default for Settings {
             smooth_zoom: true,
             light_zoom: false,
             benchmarks: Vec::new(),
+            benchmark_resume: None,
             wheel_zoom_step: default_wheel_zoom_step(),
             pan_right_click_out: false,
             pan_inertia: false,

@@ -32,6 +32,7 @@ mod autocorrect;
 mod barcode;
 pub mod benchmark;
 mod bg_remove;
+mod bg_subject;
 mod bitmap_file;
 mod bitmap_fx;
 mod bitmap_modes;
@@ -118,6 +119,8 @@ mod import_place;
 mod imposition;
 #[cfg(test)]
 mod input_method_tests;
+#[cfg(test)]
+mod stress_tests;
 #[cfg(not(target_arch = "wasm32"))]
 mod instance;
 mod interaction;
@@ -129,6 +132,7 @@ mod lens;
 mod live_guides;
 #[cfg(test)]
 mod macos_package;
+mod macro_convert;
 mod macro_forms;
 mod macros;
 mod mcp;
@@ -248,7 +252,9 @@ mod trace_blend;
 mod trace_fine;
 mod trace_fit;
 mod trace_fonts;
+mod trace_job;
 mod trace_preview;
+mod trace_progress;
 mod trace_strokes;
 mod trace_text;
 mod tracecut;
@@ -288,11 +294,20 @@ mod winit_pen_pressure;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../../../vendor/winit/src/size_bounds.rs"]
 mod winit_size_bounds;
+// The pointer pixels and scale of the same copy on Linux (#2871).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../../../vendor/winit/src/cursor_pixels.rs"]
+mod winit_cursor_pixels;
 // The pen pressure of the patched eframe's web layer, with its tests
 // (vendor/README.md, #1410), so that the gate runs them.
 #[cfg(test)]
 #[path = "../../../vendor/eframe/src/web/pen_pressure.rs"]
 mod eframe_web_pen_pressure;
+// The input the patched eframe keeps while the window is minimized,
+// with its tests (vendor/README.md, #3058).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../../../vendor/eframe/src/native/pending_input.rs"]
+mod eframe_pending_input;
 // The queue of files macOS asks to open, of the same copy (#646).
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../../../vendor/winit/src/opened_files.rs"]
@@ -337,10 +352,28 @@ mod winit_frame_input;
 mod winit_android_mouse;
 mod workspace_file;
 
+/// Stack of every thread TraceDraw starts without saying how large
+/// (drawing, opening, saving, export workers), as the main window's
+/// thread has (see build.rs): a drawing of a few hundred groups nested
+/// in one another, which a file may hold, overflowed the 2 MB threads
+/// get by default and ended the program. Only the part used is ever
+/// taken from memory.
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+const THREAD_STACK: &str = "8388608";
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn roomy_thread_stacks() {
+    // Before any thread starts: the standard library reads it once.
+    if std::env::var_os("RUST_MIN_STACK").is_none() {
+        std::env::set_var("RUST_MIN_STACK", THREAD_STACK);
+    }
+}
+
 /// The desktop program: the window, with the command line's files and
 /// options (see `docs/behavior/about-and-startup.md`).
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn run() -> eframe::Result<()> {
+    roomy_thread_stacks();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // One window for every start (#646): files given to a start while
     // TraceDraw runs go to its window, in tabs of their own, and this
@@ -470,6 +503,7 @@ pub fn run() -> eframe::Result<()> {
             .with_resizable(true)
             .with_title("TraceDraw")
             .with_app_id(splash::APP_ID)
+            .with_icon(splash::window_icon())
     } else {
         splash::main_window_builder(&settings, plain)
     };
@@ -580,6 +614,12 @@ pub fn run() -> eframe::Result<()> {
                 );
                 log::error!("{what}");
                 startup_log::no_window(&what);
+            }
+        } else if let Some(next) = gpu::take_restart_after_exit() {
+            // Help > Benchmark: with or without the graphics card.
+            log::info!("starting again with {next:?} for the benchmark");
+            if !gpu::restart_with(next, &args) {
+                log::error!("TraceDraw could not start again with {next:?}");
             }
         }
         return Ok(());
@@ -1084,6 +1124,11 @@ impl eframe::App for Shell {
         #[cfg(not(target_arch = "wasm32"))]
         if app.sync_mcp_link(ui.ctx()) {
             ui.ctx().request_repaint();
+        }
+        // Fonts being installed off the interface's thread (d#3200).
+        if app.poll_font_installs() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
         // A large drawing being opened off the interface's thread (#2849).
         if app.poll_opening() {

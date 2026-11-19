@@ -11,7 +11,8 @@ use tracedraw_core::{
     Color, Command, Fill,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MediaMode {
     Preset,
     Brush,
@@ -533,6 +534,7 @@ fn frame_times_of_brush_strokes() {
                 zoom: 4.0,
                 origin_x: 0.0,
                 origin_y: 1188.0,
+                stretch_y: 1.0,
             },
             ..Default::default()
         };

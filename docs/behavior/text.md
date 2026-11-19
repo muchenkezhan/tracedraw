@@ -459,6 +459,14 @@ together keep their stacking order
 `text_effect_tests::break_apart_keeps_the_hole_of_a_single_warped_letter`,
 `text_effect_tests::breaking_several_warped_texts_keeps_the_stacking_order`).
 
+The Text tool edits a text inside a group, a clip frame or a grouped
+blend where it is drawn, through an envelope, a perspective or another
+warp on the group (#2169). The caret goes by the letter clicked, as on
+a text of its own: through a warp, the point is taken back to where the
+letters are laid out by drawing a grid over the text through the same
+warp and keeping the grid point drawn nearest the click (#3010,
+`text_editing::tests::a_click_in_an_enveloped_grouped_text_puts_the_caret_by_the_letter`).
+
 Text takes blends (with another text or any object) and extrusions like
 any other object; the steps and sides follow the letters' outlines
 (`text_effect_tests::the_blend_tool_blends_two_texts_and_a_text_with_a_shape`,
@@ -596,8 +604,8 @@ on its own line, which is why the lines are joined first.
   afterwards flows on into the empty one (picked first, the empty frame
   took the whole text and the frame it came from was left empty;
   `textflow::tests::linking_to_an_empty_frame_keeps_the_source_text_whatever_the_order`).
-- Deleting a frame of a chain (Delete, Cut, or a group or clip frame
-  holding it) removes only the frame: the frames left are linked to one
+- Deleting a frame of a chain (Delete, Cut, a group or clip frame
+  holding it, or the page or layer it is on) removes only the frame: the frames left are linked to one
   another in their order and the chain's whole text flows anew over them,
   so the frame after the deleted one shows what it showed and the last
   frame takes the rest (with the overflow mark when it does not fit). A
@@ -609,7 +617,8 @@ on its own line, which is why the lines are joined first.
   `deleting_the_last_frame_of_a_chain_keeps_its_text`,
   `deleting_a_frame_of_a_chain_of_two_leaves_one_frame_with_all_the_text`,
   `cutting_a_frame_of_a_chain_keeps_its_text`,
-  `deleting_a_group_holding_a_frame_of_a_chain_keeps_its_text`).
+  `deleting_a_group_holding_a_frame_of_a_chain_keeps_its_text`,
+  `deleting_a_page_or_layer_holding_a_frame_of_a_chain_keeps_its_text`).
 - Text > Convert keeps the letters in place both ways: the new frame
   (paragraph text) is the text's own box plus 2 mm, and the new text is
   moved so that its first letter sits where the old one's did, in the
@@ -1680,7 +1689,18 @@ stand-in next to each missing family: "Arial (Liberation Sans)".
   `ops2::tests::text_on_a_straight_line_stands_on_it_from_the_start`,
   `ops2::tests::the_text_tool_on_a_paths_outline_starts_text_on_it`).
 - Change Case opens a dialog with Sentence case, lowercase, UPPERCASE,
-  Title Case and tOGGLE cASE; it needs a text selected.
+  Title Case and tOGGLE cASE; it needs a text selected. The runs of a
+  text (its parts in their own fonts, sizes, colours or bold) change as
+  one text: a bold word in the middle of a sentence keeps its small
+  letter in Sentence case, and a word in two looks takes one capital in
+  Title Case. Each run was changed as a text of its own, so Sentence case
+  gave "The big Dog Runs." A word starts after any white space, a line
+  break or a tab too
+  (`ops2::tests::the_runs_of_a_text_change_case_as_one_text`). Several
+  selected texts change in one undo step, and texts already in the case
+  asked for are left alone: with none to change there is no step, so
+  Undo never does nothing
+  (`ops2::tests::change_case_is_one_step_and_no_step_when_nothing_changes`).
 
 ## Font Sampler
 
