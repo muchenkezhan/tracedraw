@@ -831,6 +831,12 @@ pub(crate) fn check_label(ui: &mut Ui, label: &str, id: &str, on: bool) -> bool 
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The rows [`check_pic`] drew with a picture (tests).
+    static PICTURED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The width of the picture slot of a [`check_pic`] row, between the
 /// gutter and the label.
 const PIC_SLOT: f32 = 22.0;
@@ -841,13 +847,18 @@ const PIC_SLOT: f32 = 22.0;
 pub(crate) fn check_pic(
     ui: &mut Ui,
     key: &str,
+    shortcut: &str,
     on: bool,
     pic: Option<&dyn Fn(&egui::Painter, egui::Rect)>,
 ) -> bool {
     if invoke::active() {
-        return invoke::hit(key, "", true);
+        return invoke::hit(key, shortcut, true);
     }
-    let shortcut = invoke::shown_shortcut(key, "");
+    #[cfg(test)]
+    if pic.is_some() {
+        PICTURED.with(|p| p.borrow_mut().push(key.to_string()));
+    }
+    let shortcut = invoke::shown_shortcut(key, shortcut);
     let (r, _) = menu_row_at(
         ui,
         &tr(key),
@@ -1449,6 +1460,23 @@ pub(crate) mod replay {
 
 #[cfg(test)]
 mod tests {
+    /// Window > Panels shows each panel's picture beside its name, as
+    /// the panel bar's "..." list does (#3221).
+    #[test]
+    fn window_panels_show_the_panels_pictures() {
+        use crate::app::DockerTab;
+        let ctx = crate::theme::ui_context();
+        let mut app = crate::app::App::headless();
+        super::PICTURED.with(|p| p.borrow_mut().clear());
+        run_frame(&ctx, |ui| super::panels_menu(&mut app, ui));
+        let pictured = super::PICTURED.with(|p| p.borrow().clone());
+        for group in DockerTab::MENU_GROUPS.iter() {
+            for tab in group.iter() {
+                assert!(pictured.iter().any(|k| k == tab.key()), "{}", tab.key());
+            }
+        }
+    }
+
     #[test]
     fn the_panels_menu_lists_every_panel_once() {
         let mut listed: Vec<DockerTab> = DockerTab::MENU_GROUPS
@@ -2407,8 +2435,12 @@ pub fn menu_bar(app: &mut App, ui: &mut Ui) {
         .filter(|(m, _)| m.alt && !(m.ctrl || m.command || m.shift))
         .map(|(_, k)| k)
         .collect();
+    // A dialog keeps Alt and its letters: Alt+O in Text > Edit Text
+    // opened the Object menu behind it (#3370).
+    let dialog_open = !matches!(app.dialog, crate::ui::dialogs::Dialog::None);
     let blocked = move |c: char| {
         capturing
+            || dialog_open
             || (symmetry_e && c == 'e')
             || access::key_of(c).is_some_and(|k| user_alt_keys.contains(&k))
     };
@@ -3041,6 +3073,11 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
     }
     if item(ui, "menu.view.zoom_to_fit", "F4", true) {
         app.zoom_to_fit();
+    }
+    // Real size: the zoom box's 100%, as a command a key can be given
+    // in Options > Customization > Commands (#3103).
+    if item(ui, "menu.view.zoom_1to1", "", true) {
+        app.set_zoom_percent(100.0);
     }
     // The key held shows the Navigator while it is down (`view_navigator`);
     // the menu row opens it until a click.
@@ -3866,6 +3903,14 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
             outside: true,
         };
     }
+    // The outline one step wider or narrower, for a key of one's own
+    // (#2905).
+    if item(ui, "menu.object.outline_thicker", "", has) {
+        app.step_outline_width(true);
+    }
+    if item(ui, "menu.object.outline_thinner", "", has) {
+        app.step_outline_width(false);
+    }
     if item(ui, "menu.object.join_curves", "", true) {
         app.show_dockers = true;
         app.docker_tab = crate::app::DockerTab::JoinCurves;
@@ -4647,6 +4692,9 @@ fn tools_menu(app: &mut App, ui: &mut Ui) {
     if item(ui, "menu.tools.recolor", "", !app.selection.is_empty()) {
         app.recolor_dialog();
     }
+    if item(ui, "menu.tools.replace_color", "", app.has_document()) {
+        app.replace_color_dialog();
+    }
     sep(ui);
     sub(ui, "menu.tools.scripts", |ui| {
         if item(ui, "menu.tools.scripts_docker", "", true) {
@@ -4747,6 +4795,48 @@ pub(crate) fn toolbars_list(app: &mut App, ui: &mut Ui) {
     if check(ui, "menu.window.toolbar_time_tracker", "", tracker) {
         app.settings.time_tracker.show_bar = !tracker;
     }
+    // The toolbars the user made, by their names (#3264).
+    let slots: Vec<u8> = app.settings.bars.custom.iter().map(|c| c.slot).collect();
+    for slot in slots {
+        let bar = crate::ui::bars::Bar::Custom(slot);
+        let on = bar.visible(app);
+        let id = format!("menu.window.toolbar_{}", bar.id());
+        if check_label(ui, &bar.name(app), &id, on) {
+            bar.set_visible(app, !on);
+        }
+    }
+}
+
+/// Window > Panels: each panel with the picture its tab shows (as the
+/// panel bar's "..." list has them, #3221), its name and shortcut,
+/// ticked while it shows; choosing one opens it.
+fn panels_menu(app: &mut App, ui: &mut Ui) {
+    let row = |ui: &mut Ui, app: &mut App, tab: DockerTab| {
+        let pic = crate::ui::dockers::tab_icon(tab);
+        let pic = pic
+            .as_ref()
+            .map(|f| f as &dyn Fn(&egui::Painter, egui::Rect));
+        if check_pic(ui, tab.key(), tab.shortcut(), app.docker_shown(tab), pic) {
+            app.open_docker(tab);
+        }
+    };
+    for (i, group) in DockerTab::MENU_GROUPS.iter().enumerate() {
+        if i > 0 {
+            sep(ui);
+        }
+        for tab in group.iter() {
+            row(ui, app, *tab);
+        }
+        // The effect panels follow the text group, as a submenu.
+        if i == 5 {
+            sep(ui);
+            sub(ui, "menu.window.dockers_effects", |ui| {
+                for tab in DockerTab::EFFECTS_MENU {
+                    row(ui, app, tab);
+                }
+            });
+        }
+    }
 }
 
 fn window_menu(app: &mut App, ui: &mut Ui) {
@@ -4786,6 +4876,18 @@ fn window_menu(app: &mut App, ui: &mut Ui) {
                 set_layout(app, WindowLayout::Tabs);
             }
         }
+        // #2904: a drawing in a window of its own, for another monitor.
+        let detached = has && crate::ui::detached::is_detached(app, app.active_doc);
+        let can = has && !detached && crate::ui::detached::can_detach(ui.ctx());
+        if item(ui, "menu.window.detach_window", "", can) {
+            app.show_welcome = false;
+            let ctx = ui.ctx().clone();
+            crate::ui::detached::detach_active(app, &ctx);
+        }
+        if item(ui, "menu.window.attach_window", "", detached) {
+            let i = app.active_doc;
+            crate::ui::detached::attach(app, i);
+        }
     }
     sep(ui);
     sub(ui, "menu.window.workspace", |ui| {
@@ -4823,30 +4925,7 @@ fn window_menu(app: &mut App, ui: &mut Ui) {
         }
     });
     sep(ui);
-    sub(ui, "menu.window.dockers", |ui| {
-        let row = |ui: &mut Ui, app: &mut App, tab: DockerTab| {
-            if check(ui, tab.key(), tab.shortcut(), app.docker_shown(tab)) {
-                app.open_docker(tab);
-            }
-        };
-        for (i, group) in DockerTab::MENU_GROUPS.iter().enumerate() {
-            if i > 0 {
-                sep(ui);
-            }
-            for tab in group.iter() {
-                row(ui, app, *tab);
-            }
-            // The effect panels follow the text group, as a submenu.
-            if i == 5 {
-                sep(ui);
-                sub(ui, "menu.window.dockers_effects", |ui| {
-                    for tab in DockerTab::EFFECTS_MENU {
-                        row(ui, app, tab);
-                    }
-                });
-            }
-        }
-    });
+    sub(ui, "menu.window.dockers", |ui| panels_menu(app, ui));
     if check(ui, "menu.effects.picker", "", app.effect_picker.open) {
         app.effect_picker.open = !app.effect_picker.open;
     }

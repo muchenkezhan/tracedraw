@@ -179,7 +179,9 @@ pub(super) fn news(ui: &mut Ui) -> Option<String> {
                             ui.set_width(width);
                             ui.add_space(6.0);
                             ui.add(
-                                egui::Label::new(RichText::new(tr(release.body)).size(13.0)).wrap(),
+                                egui::Label::new(RichText::new(tr(release.body)).size(13.0))
+                                    .selectable(true)
+                                    .wrap(),
                             );
                             ui.add_space(8.0);
                             let url = release_page(release.version);

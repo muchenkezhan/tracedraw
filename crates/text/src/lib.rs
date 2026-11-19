@@ -1216,6 +1216,9 @@ fn cp1252_remapped(face: &ttf_parser::Face, text: &str) -> Option<String> {
 /// such as ஷ there, #1937), and so does U+F020 to U+F0FF, where text
 /// from other programs keeps a symbol font's codes.
 pub(crate) fn face_glyph(face: &ttf_parser::Face, c: char) -> Option<ttf_parser::GlyphId> {
+    if !has_outlines(face) {
+        return None;
+    }
     let symbol = |c: char| {
         // The code typed, or the place the symbol map keeps it at, as
         // text from other programs holds it (U+F084 for 0x84).
@@ -1236,6 +1239,38 @@ pub(crate) fn face_glyph(face: &ttf_parser::Face, c: char) -> Option<ttf_parser:
         .or_else(|| cp1252_twin(c).and_then(|t| face.glyph_index(t)))
         .or_else(|| symbol(c))
         .or_else(|| cp1252_twin(c).and_then(symbol))
+        .filter(|g| !picture_only(face, *g))
+}
+
+/// The glyph is only a picture (a colour font's bitmap with an empty
+/// outline, as in sbix fonts that carry a glyf table of blanks).
+fn picture_only(face: &ttf_parser::Face, g: ttf_parser::GlyphId) -> bool {
+    struct Any(bool);
+    impl ttf_parser::OutlineBuilder for Any {
+        fn move_to(&mut self, _: f32, _: f32) {
+            self.0 = true;
+        }
+        fn line_to(&mut self, _: f32, _: f32) {}
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+        fn close(&mut self) {}
+    }
+    let t = face.tables();
+    if t.cbdt.is_none() && t.sbix.is_none() {
+        return false;
+    }
+    let mut any = Any(false);
+    face.outline_glyph(g, &mut any);
+    !any.0 && face.glyph_raster_image(g, u16::MAX).is_some()
+}
+
+/// The face draws its letters as outlines. A colour font made only of
+/// pictures (Noto Color Emoji: CBDT, no glyf or CFF table) has none: text
+/// in it was drawn as nothing, on screen, in print and in PDF files, so
+/// its letters are taken from a font that draws them.
+pub(crate) fn has_outlines(face: &ttf_parser::Face) -> bool {
+    let t = face.tables();
+    t.glyf.is_some() || t.cff.is_some() || t.cff2.is_some()
 }
 
 /// A letter of a symbol-encoded family as the character it draws; others
@@ -3907,7 +3942,8 @@ impl FontSystem {
             db.with_face_data(id, |d, i| {
                 ttf_parser::Face::parse(d, i)
                     .ok()
-                    .and_then(|f| f.glyph_index(c))
+                    .filter(has_outlines)
+                    .and_then(|f| f.glyph_index(c).filter(|g| !picture_only(&f, *g)))
                     .is_some()
             })
             .unwrap_or(false)
@@ -4152,7 +4188,9 @@ impl FontSystem {
         let mut starts: Vec<usize> = infos.iter().map(|i| i.cluster as usize).collect();
         starts.sort_unstable();
         starts.dedup();
-        let mut claimed: Vec<usize> = Vec::new();
+        // (Looked up by halves and in a set: a search from the start for
+        // each glyph made a long text take seconds to lay out.)
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let size_mm = size_pt * PT_MM;
         let hyphen_glyph = {
             let gid = face.glyph_index('-');
@@ -4203,7 +4241,9 @@ impl FontSystem {
             if let Some(w) = widen {
                 gp = w * gp;
             }
-            let cluster = chars.iter().position(|(i, _)| *i == info.cluster as usize);
+            let cluster = chars
+                .binary_search_by_key(&(info.cluster as usize), |(i, _)| *i)
+                .ok();
             let ch = cluster
                 .and_then(|k| chars.get(k))
                 .map(|(_, c)| *c)
@@ -4235,9 +4275,8 @@ impl FontSystem {
             }
             let start = info.cluster as usize;
             let cluster_end = starts
-                .iter()
+                .get(starts.partition_point(|c| *c <= start))
                 .copied()
-                .find(|c| *c > start)
                 .unwrap_or(text.len());
             let further = claimed.contains(&start);
             let joins = further
@@ -4253,7 +4292,7 @@ impl FontSystem {
             let cluster_text = if further {
                 String::new()
             } else {
-                claimed.push(start);
+                claimed.insert(start);
                 text.get(start..cluster_end).unwrap_or("").to_string()
             };
             // As the outline above: slanted, widened, then moved into the
@@ -5225,7 +5264,19 @@ impl FontSystem {
                     // So is a line ended by a line break (Shift+Enter).
                     let last = (line.last_in_para || glyphs.iter().any(|g| g.ch == LINE_BREAK))
                         && align == TextAlign::Justify;
-                    if last || !avail.is_finite() {
+                    // A paragraph running right to left (set so, or by
+                    // its first strong letter) ends at the right: its
+                    // last line is set from the right edge (#3216).
+                    let rtl = ps.direction.is_right_to_left()
+                        || glyphs
+                            .iter()
+                            .filter(|g| !g.ch.is_whitespace())
+                            .map(|g| g.level)
+                            .min()
+                            .is_some_and(|l| l % 2 == 1);
+                    if last && rtl && avail.is_finite() {
+                        ((avail - total_w).max(0.0), Vec::new())
+                    } else if last || !avail.is_finite() {
                         (0.0, Vec::new())
                     } else {
                         (0.0, justify_extras(glyphs, avail - total_w))
@@ -6316,6 +6367,7 @@ fn place_glyph(collect: bool, a: Affine, g: &Glyph, out: &mut GlyphLayout) {
             transform: a * src.local,
             text: src.text.clone(),
             span: g.span,
+            char_idx: g.char_idx,
             path,
             exact: src.exact,
         }),
@@ -6743,6 +6795,54 @@ mod tests {
         );
         assert_eq!(line.starts[..], line.edges[..3]);
         assert_eq!(line.ends[..], line.edges[1..]);
+    }
+
+    /// #3216: a justified paragraph running right to left sets its last
+    /// line from the right edge, as a left-to-right one sets it from the
+    /// left; set so, or by its Hebrew letters.
+    #[test]
+    fn a_justified_right_to_left_paragraph_ends_at_the_right() {
+        if !has_fonts() {
+            return;
+        }
+        use tracedraw_core::TextDirection;
+        let width = 40.0;
+        let lay = |text: &str, para: &ParagraphStyle| {
+            fonts().layout(&TextRequest {
+                spans: &[span(text)],
+                frame: Some(Size::new(width, 100.0)),
+                align: TextAlign::Justify,
+                para,
+                on_path: None,
+            })
+        };
+        let words = "ab cd ef gh ij kl mn op qr st uv wx yz ab cd";
+        let ltr = ParagraphStyle::default();
+        let rtl = ParagraphStyle {
+            direction: TextDirection::RightToLeft,
+            ..ParagraphStyle::default()
+        };
+        let span_of = |l: &LineBox| {
+            let lo = l.edges.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = l.edges.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            (lo, hi)
+        };
+        let l = lay(words, &ltr);
+        if l.glyphs == 0 || l.lines.len() < 2 {
+            return;
+        }
+        let (lo, hi) = span_of(l.lines.last().unwrap());
+        assert!(lo.abs() < 1e-6 && hi < width - 1.0, "{lo} {hi}");
+        let r = lay(words, &rtl);
+        let (lo, hi) = span_of(r.lines.last().unwrap());
+        assert!((hi - width).abs() < 1e-3 && lo > 1.0, "{lo} {hi}");
+        // Hebrew letters make the paragraph right to left by themselves.
+        let hebrew = "\u{5D0}\u{5D1} \u{5D2}\u{5D3} ".repeat(8);
+        let h = lay(&hebrew, &ltr);
+        if h.lines.len() > 1 {
+            let (lo, hi) = span_of(h.lines.last().unwrap());
+            assert!((hi - width).abs() < 1e-3 && lo > 1.0, "{lo} {hi}");
+        }
     }
 
     /// A paragraph set to run right to left (#2670): Latin letters keep
@@ -9403,6 +9503,42 @@ mod tests {
         }
         out.extend_from_slice(&body);
         out
+    }
+
+    /// Text set in a colour font made only of pictures (as Noto Color
+    /// Emoji: CBDT, no glyf table) was drawn as nothing on screen, in
+    /// print and in PDF files: its letters come from a font that draws
+    /// them now.
+    #[test]
+    fn text_in_a_picture_only_font_is_drawn_from_another_font() {
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+        // Its outlines' table renamed to the colour bitmaps' one (the
+        // tables sorted again by the new name table).
+        let mut font = SELAWIK.to_vec();
+        let n = usize::from(u16::from_be_bytes([font[4], font[5]]));
+        for (from, to) in [(b"glyf", b"CBDT"), (b"loca", b"CBLC"), (b"gvar", b"zvar")] {
+            if let Some(at) = (0..n)
+                .map(|i| 12 + 16 * i)
+                .find(|at| &font[*at..*at + 4] == from)
+            {
+                font[at..at + 4].copy_from_slice(to);
+            }
+        }
+        let pictures = with_names(
+            &font,
+            &[
+                (3, 1, 0x409, 1, utf16("Picture Emoji")),
+                (3, 1, 0x409, 2, utf16("Regular")),
+                (3, 1, 0x409, 4, utf16("Picture Emoji")),
+                (3, 1, 0x409, 6, utf16("PictureEmoji")),
+            ],
+        );
+        let f = system_with(&[&pictures, QUICKSAND]);
+        assert!(f.has_family("Picture Emoji"), "{:?}", f.families());
+        let layout = f.outline(&[TextSpan::new("Hello", "Picture Emoji", 24.0)]);
+        let b = layout.path.bounding_box();
+        assert!(layout.path.elements().len() > 10, "nothing drawn");
+        assert!(b.width() > 10.0, "{b:?}");
     }
 
     /// A font that names its family in Chinese only in the GBK code page
