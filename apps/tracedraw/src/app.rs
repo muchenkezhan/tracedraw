@@ -317,6 +317,11 @@ pub struct HandleMods {
     /// proportions; side handles scale the letters of paragraph texts
     /// and tables with their frames (#1553).
     pub free: bool,
+    /// Ctrl and Alt together on a corner handle: width and height grow
+    /// or shrink by the same distance, an even border round the
+    /// selection (with Shift on every side) instead of by the same
+    /// ratio (#3330).
+    pub even: bool,
 }
 
 impl HandleMods {
@@ -325,6 +330,7 @@ impl HandleMods {
             from_center: mods.shift,
             steps: mods.ctrl,
             free: mods.alt,
+            even: mods.ctrl && mods.alt,
         }
     }
 }
@@ -500,10 +506,19 @@ pub enum Drag {
         from: Point,
         begun: bool,
     },
-    /// A press on an edge of a polygon or star (Shape tool): the first
-    /// move turns it into a curve and bends the edge grabbed (page point
-    /// the press began at); a plain click converts nothing.
-    PolygonEdge { shape: ShapeId, from: Point },
+    /// A press on an edge of a polygon or star (Shape tool, page point
+    /// the press began at): a drag bends every side the same way, the
+    /// shape staying a polygon (`start` its kind at the press, `to_local`
+    /// from the page into its own space, #2451); a complex star becomes
+    /// a curve on the first move and the edge grabbed bends. A plain
+    /// click changes nothing.
+    PolygonEdge {
+        shape: ShapeId,
+        from: Point,
+        start: ShapeKind,
+        to_local: Affine,
+        begun: bool,
+    },
     /// Dragging a node transform handle (Shape tool).
     NodeTransform {
         handle: Handle,
@@ -547,6 +562,13 @@ pub enum Drag {
     /// Moving a fountain handle of the selected object (Interactive Fill).
     FountainHandle {
         handle: crate::fill_tool::FountainHandle,
+        /// The drag's undo step is recorded (the next moves join it).
+        begun: bool,
+    },
+    /// Moving a node of a pattern fill's first tile (Interactive Fill,
+    /// #3379).
+    PatternHandle {
+        handle: crate::pattern_fill_tool::PatternHandle,
         /// The drag's undo step is recorded (the next moves join it).
         begun: bool,
     },
@@ -948,15 +970,16 @@ pub const OPEN_EXTENSIONS: &[&str] = &[
 ];
 
 /// The picture files a drawing is made of when they are opened (#2600).
-pub const PICTURE_EXTENSIONS: &[&str] =
-    &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"];
+pub const PICTURE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "jxl",
+];
 
 /// The extensions File > Import reads (besides those of installed script
 /// filters).
 pub const IMPORT_EXTENSIONS: &[&str] = &[
     "cdr", "cdt", "cdrt", "csl", "cmx", "tdraw", "svg", "svgz", "pdf", "ai", "eps", "ps", "prn",
     "dxf", "psd", "psb", "emf", "wmf", "plt", "hpgl", "hgl", "txt", "rtf", "docx", "xlsx", "csv",
-    "tsv", "pmd", "pm6", "p65", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff",
+    "tsv", "pmd", "pm6", "p65", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "jxl",
 ];
 
 /// The memory the undo steps of one drawing may hold before the oldest
@@ -1186,6 +1209,9 @@ pub struct App {
     /// Missing Fonts dialog is turned off (Warnings, #1243).
     pub status_opens_options: Option<(String, crate::ui::dialogs::OptionsPage)>,
     pub fit_pending: bool,
+    /// The view each page of the drawing was last shown with in this
+    /// window, so going back to a page shows it as it was left (#3434).
+    pub page_views: std::collections::HashMap<PageId, crate::view::View>,
     /// Set the view of Options > Display > View when a drawing opens
     /// with the next fit (a drawing just opened or made, #1134).
     pub open_view_pending: bool,
@@ -1861,6 +1887,8 @@ pub struct App {
     pub objects_master_closed: bool,
     /// Objects docker: the cached thumbnails of the objects.
     pub object_thumbs: crate::object_thumbs::ObjectThumbs,
+    /// Symbols docker: the cached pictures of the symbols (#3249).
+    pub symbol_thumbs: crate::object_thumbs::ObjectThumbs,
     /// When `autosave_settings` last wrote the preferences, and the
     /// preferences as last saved or looked at (JSON), to save them only
     /// when they changed.
@@ -2198,6 +2226,9 @@ pub struct App {
     pub area_outline_mode: u8,
     pub area_outline_width: f64,
     pub area_outline_color: Color,
+    /// Smart Fill stops at the edges of the outlines as they are drawn,
+    /// their width, not at their middle line (#3321).
+    pub area_fill_outline_edges: bool,
     pub mesh_rows: u32,
     pub mesh_cols: u32,
     /// Shape tool elastic mode: dragging one node pulls its neighbours.
@@ -2898,6 +2929,12 @@ impl App {
         if !crate::files::WEB {
             app.keep_default_font_installed();
         }
+        // The system's printers are read now, off the interface's thread,
+        // so the first File > Print finds them: reading them took seconds
+        // each time the dialog opened (#3337).
+        if !crate::files::WEB && !crate::files::ANDROID {
+            app.fetch_printers(crate::printers::system_printers);
+        }
         app
     }
 
@@ -3020,6 +3057,7 @@ impl App {
             status: String::new(),
             status_opens_options: None,
             fit_pending: true,
+            page_views: Default::default(),
             open_view_pending: true,
             units: Units::Millimeters,
             nudge_mm: 2.54,
@@ -3333,6 +3371,7 @@ impl App {
             settings_pending: false,
             objects_closed_pages: Default::default(),
             object_thumbs: Default::default(),
+            symbol_thumbs: Default::default(),
             objects_master_closed: false,
             picked_layer: None,
             navigator_tex: None,
@@ -3477,6 +3516,7 @@ impl App {
             area_outline_mode: 0,
             area_outline_width: 0.2,
             area_outline_color: Color::BLACK,
+            area_fill_outline_edges: false,
             mesh_rows: 2,
             mesh_cols: 2,
             elastic_mode: false,
@@ -4099,6 +4139,7 @@ impl App {
             smart_outline_mode: self.area_outline_mode,
             smart_outline_width: self.area_outline_width,
             smart_outline_color: self.area_outline_color,
+            smart_outline_edges: self.area_fill_outline_edges,
             brush_radius: self.brush_radius,
             roughen_amount: self.roughen_amount,
             brush: self.brush,
@@ -4198,6 +4239,7 @@ impl App {
         self.area_outline_mode = t.smart_outline_mode.min(2);
         self.area_outline_width = finite(t.smart_outline_width, 0.0, 1000.0, 0.2);
         self.area_outline_color = t.smart_outline_color;
+        self.area_fill_outline_edges = t.smart_outline_edges;
         self.brush_radius = finite(t.brush_radius, 0.5, 500.0, 10.0);
         self.roughen_amount = finite(t.roughen_amount, 0.05, 50.0, 2.0);
         self.brush = t.brush.clamped();
@@ -5282,9 +5324,20 @@ impl App {
         let rotating = self.rotate_mode;
         // One step: the copies and their move (#471).
         let mark = self.engine.begin_group();
-        self.duplicate_in_place();
+        let saved = self.duplicate_offset;
+        self.duplicate_offset = Vec2::ZERO;
+        self.last_duplicate.clear();
+        self.duplicate();
+        self.duplicate_offset = saved;
+        let pairs = std::mem::take(&mut self.last_duplicate);
         self.transform_selection(t);
         self.engine.end_group(mark, "Duplicate");
+        // The copies are a Duplicate moved (turned, scaled) by `t`: while
+        // they stay selected, Ctrl+D makes the next copy by the same step,
+        // as after a Duplicate moved by hand. A copy left by a drag or a
+        // turn about a centre, then Ctrl+D, put each new copy on top of
+        // the last one (#3272).
+        self.last_duplicate = pairs;
         // A copy turned in rotate mode stays in it, its centre of rotation
         // in sight for the next turn (#2353).
         self.rotate_mode = rotating;
@@ -5545,6 +5598,13 @@ impl App {
     /// else the page's topmost visible, unlocked layer (hidden layers
     /// cannot take new objects); with none visible, the topmost unlocked
     /// one.
+    /// Whether a click, a marquee or Select All may take the objects of
+    /// `layer`: any layer with Edit Across Layers on, else the active
+    /// layer alone (#3276).
+    pub fn layer_in_reach(&self, layer: LayerId) -> bool {
+        self.settings.edit_across_layers || self.active_layer() == Some(layer)
+    }
+
     pub fn active_layer(&self) -> Option<LayerId> {
         if let Some(id) = self.picked_layer {
             if self
@@ -5795,7 +5855,13 @@ impl App {
             let mut line: Vec<Point> = Vec::new();
             let mut start = None;
             let mut done = Vec::new();
-            tracedraw_core::geometry::flatten(&s.page_path(), tolerance, &mut |el| {
+            // A symbol instance: the symbol's outline, not its
+            // placeholder box (#3437).
+            let path = match self.with_symbols_drawn(s) {
+                Some(d) => d.page_path(),
+                None => s.page_path(),
+            };
+            tracedraw_core::geometry::flatten(&path, tolerance, &mut |el| {
                 use tracedraw_core::geometry::PathEl;
                 match el {
                     PathEl::MoveTo(p) => {
@@ -5833,6 +5899,66 @@ impl App {
         lines
     }
 
+    /// `s` with every symbol instance it is or holds (in groups and clip
+    /// frames) replaced by its symbol's objects, placed as the instance
+    /// places them: what the outlines drawn over a selection follow. A
+    /// bare instance only knows a 10 x 10 placeholder box, which the
+    /// selection outline and the Shape tool's frame showed instead of
+    /// the symbol (#3437). `None` when `s` holds no instance.
+    pub fn with_symbols_drawn(&self, s: &Shape) -> Option<Shape> {
+        const DEEPEST: usize = 8;
+        fn holds(s: &Shape, depth: usize) -> bool {
+            depth <= DEEPEST
+                && match &s.kind {
+                    ShapeKind::SymbolInstance { .. } => true,
+                    ShapeKind::Group { children } => children.iter().any(|c| holds(c, depth + 1)),
+                    ShapeKind::ClipFrame { contents, .. } => {
+                        contents.iter().any(|c| holds(c, depth + 1))
+                    }
+                    _ => false,
+                }
+        }
+        fn drawn(s: &Shape, symbols: &[tracedraw_core::document::Symbol], depth: usize) -> Shape {
+            if depth > DEEPEST {
+                return s.clone();
+            }
+            match &s.kind {
+                ShapeKind::SymbolInstance { index } => match symbols.get(*index) {
+                    Some(def) => {
+                        let mut d = drawn(&def.shape, symbols, depth + 1);
+                        d.absorb(s.transform);
+                        d.id = s.id;
+                        d
+                    }
+                    None => s.clone(),
+                },
+                ShapeKind::Group { children } => {
+                    let mut g = s.clone();
+                    g.kind = ShapeKind::Group {
+                        children: children
+                            .iter()
+                            .map(|c| drawn(c, symbols, depth + 1))
+                            .collect(),
+                    };
+                    g
+                }
+                ShapeKind::ClipFrame { frame, contents } => {
+                    let mut c = s.clone();
+                    c.kind = ShapeKind::ClipFrame {
+                        frame: frame.clone(),
+                        contents: contents
+                            .iter()
+                            .map(|k| drawn(k, symbols, depth + 1))
+                            .collect(),
+                    };
+                    c
+                }
+                _ => s.clone(),
+            }
+        }
+        holds(s, 0).then(|| drawn(s, &self.doc().symbols, 0))
+    }
+
     /// The bounds of what `s` (in page space) draws, its live effects
     /// included; measured once per change of the drawing.
     pub fn visual_bounds(&self, s: &Shape) -> Rect {
@@ -5845,6 +5971,14 @@ impl App {
                     &def.shape.page_path(),
                     s.transform,
                 );
+            }
+        }
+        // A group or clip frame holding one: the box of what it draws, so
+        // a click or a marquee over the symbol's objects picks the group
+        // (#3437).
+        if !matches!(s.kind, ShapeKind::SymbolInstance { .. }) {
+            if let Some(drawn) = self.with_symbols_drawn(s) {
+                return drawn.bounds();
             }
         }
         if !s.has_live_effects() {
@@ -6170,6 +6304,7 @@ impl App {
                 sharpness: 0.0,
                 complex: None,
                 twist: 0.0,
+                bend: 0.0,
             },
             // A complex star's vertices are those of a polygon.
             Tool::Star if self.star_complex => ShapeKind::Polygon {
@@ -6178,6 +6313,7 @@ impl App {
                 sharpness: 0.0,
                 complex: Some(self.complex_sharpness),
                 twist: 0.0,
+                bend: 0.0,
             },
             Tool::Star => ShapeKind::Polygon {
                 rect: self.polygon_model_rect(rect, self.polygon_points, self.star_sharpness),
@@ -6185,6 +6321,7 @@ impl App {
                 sharpness: self.star_sharpness,
                 complex: None,
                 twist: 0.0,
+                bend: 0.0,
             },
             Tool::GraphPaper => {
                 self.create_graph_paper(rect);
@@ -6797,6 +6934,19 @@ impl App {
             return;
         }
         let shapes = std::mem::take(&mut self.selection);
+        // A part of a dimension goes on its own, the rest of it staying
+        // as objects of their own (#3348).
+        if let Some(cmds) = self.dimension_part_delete_commands(&shapes) {
+            if let Err(e) = self.engine.run_batch("Delete", &cmds) {
+                self.status = e.to_string();
+                self.selection = shapes;
+                return;
+            }
+            if let Some(rec) = &mut self.recording {
+                rec.extend(cmds);
+            }
+            return;
+        }
         // A frame of a linked chain goes without its text: the frames
         // left take it, in the same step (#1986, see `textflow.rs`).
         let flow = self.flow_around_deleted(&shapes);
@@ -6949,6 +7099,14 @@ impl App {
         let connectors = self.connector_copies(&originals, &copies);
         let mut copies: Vec<Shape> = copies.into_iter().chain(connectors).collect();
         self.bring_into_edited_frame(&mut copies);
+        // Pasted wholly beside the page, with the desktop taking such
+        // objects: onto the desktop layer (#3100).
+        let layer = match copies.iter().map(|s| s.bounds()).reduce(|a, b| a.union(b)) {
+            Some(all) if !self.editing_clip_contents() && self.symmetry_edit.is_none() => {
+                self.layer_beside_page(layer, all)
+            }
+            _ => layer,
+        };
         for shape in copies {
             cmds.push(Command::AddShape { layer, shape });
         }
@@ -7761,6 +7919,26 @@ impl App {
         self.run(Command::SwapColors { shapes });
     }
 
+    /// Object > Thicker Outline and Thinner Outline (#2905): the
+    /// selection's outline one step up or down the outline width list,
+    /// as the wheel over the width box steps it, in the outline's unit.
+    /// Thinner stops at the hairline (it never takes the outline off);
+    /// thicker gives an object without an outline a hairline. Each object
+    /// keeps its own colour and the rest of its outline.
+    pub fn step_outline_width(&mut self, up: bool) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let width = self
+            .first_paint_target()
+            .and_then(|s| s.stroke.as_ref().map(|k| k.width));
+        if let Some(Some(w)) =
+            crate::ui::propbar::outline_width_step(width, up, self.outline_units())
+        {
+            self.apply_outline_width(w);
+        }
+    }
+
     pub fn apply_outline_width(&mut self, width: f64) {
         let shapes = self.selected_shapes();
         if shapes.is_empty() {
@@ -7830,6 +8008,11 @@ impl App {
         }
         let shapes = self.selection.clone();
         let pivot = self.moved_rotation_center();
+        // What follows the transform (the contents of an unlocked
+        // PowerClip put back, hinted objects snapped to the pixels, the
+        // text of linked frames flowed again) is part of it: one Undo
+        // takes it all back.
+        let mark = self.engine.begin_group();
         // Paragraph text takes a scale as a new frame (see text_frames.rs).
         if !self.transform_with_frames(&shapes, t) {
             self.run(Command::TransformShapes {
@@ -7837,9 +8020,11 @@ impl App {
                 transform: t,
             });
         }
+        let label = self.engine.undo_label().unwrap_or("Transform");
         self.compensate_unlocked_clip_frames(&shapes, t);
         self.apply_hinting(&shapes);
         self.reflow_chains_of(&shapes);
+        self.engine.end_group(mark, label);
         // A centre of rotation that was moved goes where the transform
         // takes it: several objects kept it as a place in their box, which
         // a turn about it moved away from the point they turned round
@@ -7873,7 +8058,29 @@ impl App {
                 * Affine::scale_non_uniform(1.0, -1.0)
                 * Affine::translate((0.0, -c.y))
         };
-        self.transform_selection(t);
+        // Texts fitted to a path mirror their path, not their letters, so
+        // they still read (#3255); the rest mirrors as usual, one step.
+        let (cmds, texts) = self.mirror_fitted_texts(t, horizontal);
+        if texts.is_empty() {
+            self.transform_selection(t);
+            return;
+        }
+        let all = self.selection.clone();
+        let mark = self.engine.begin_group();
+        let rest: Vec<ShapeId> = all
+            .iter()
+            .copied()
+            .filter(|id| !texts.contains(id))
+            .collect();
+        if !rest.is_empty() {
+            self.selection = rest;
+            self.transform_selection(t);
+        }
+        if let Err(e) = self.engine.run_batch("Mirror", &cmds) {
+            self.status = e.to_string();
+        }
+        self.engine.end_group(mark, "Mirror");
+        self.selection = all;
     }
 
     pub fn undo(&mut self) {
@@ -9637,7 +9844,11 @@ impl App {
             st.printer = crate::printers::starting_printer(st.printer.as_deref(), &st.printers);
         }
         st.looking_for_printers = true;
-        self.fetch_printers(crate::printers::system_printers);
+        // The list read when the application started may still be on its
+        // way (or waiting to be taken): no second read meanwhile.
+        if self.printer_fetch.is_none() {
+            self.fetch_printers(crate::printers::system_printers);
+        }
         self.dialog = crate::ui::dialogs::Dialog::Print(st);
     }
 
@@ -9828,7 +10039,9 @@ impl App {
             .add_filter("Photoshop (*.psd, *.psb)", &["psd", "psb"])
             .add_filter(
                 crate::i18n::tr("file.images"),
-                &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"],
+                &[
+                    "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "jxl",
+                ],
             )
             .pick_files(self, |app, paths| app.import_picked_many(paths));
     }
@@ -10262,7 +10475,7 @@ impl App {
     }
 
     /// Parse a text document (TXT, RTF, DOCX) by extension.
-    fn parse_text_file(
+    pub(crate) fn parse_text_file(
         path: &std::path::Path,
     ) -> Result<tracedraw_io::text_import::ImportedText, String> {
         let ext = path
@@ -10876,11 +11089,44 @@ impl App {
             }
             return;
         }
-        if let Some(p) = self.doc().pages.get(idx) {
-            self.page = p.id;
-            self.selection.clear();
-            self.fit_pending = true;
+        let Some(new) = id else {
+            return;
+        };
+        // The zoom stays: the page is shown as it was left, else at the
+        // same zoom, centred in the window; it was fitted to the window
+        // each time (#3434).
+        if new != self.page {
+            self.page_views.insert(self.page, self.view);
         }
+        self.page = new;
+        self.selection.clear();
+        match self.page_views.get(&new) {
+            Some(v) => self.view = *v,
+            None => self.centre_page_at_zoom(),
+        }
+    }
+
+    /// Show the current page in the middle of the window at the zoom it
+    /// has; fitted when the window has no size yet.
+    pub fn centre_page_at_zoom(&mut self) {
+        let c = self.canvas_rect.center();
+        if !(self.canvas_rect.width() > 0.0 && self.canvas_rect.height() > 0.0) {
+            self.fit_pending = true;
+            return;
+        }
+        let page = self.page_rect().center();
+        let z = self.view.zoom;
+        self.view.origin = egui::pos2(c.x - page.x as f32 * z, c.y + page.y as f32 * z);
+    }
+
+    /// Run `f` (a change of the page's size or orientation) keeping the
+    /// zoom and the page's centre where it is on screen; the page was
+    /// fitted to the window again (#3434).
+    pub fn keeping_page_centre(&mut self, f: impl FnOnce(&mut Self)) {
+        let before = self.view.to_screen(self.page_rect().center());
+        f(self);
+        let after = self.view.to_screen(self.page_rect().center());
+        self.view.origin += before - after;
     }
 
     /// View > Printable Area's margins on a page `width` x `height` mm:
