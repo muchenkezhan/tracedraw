@@ -908,6 +908,11 @@ struct TextRun {
     /// Filled and outlined (render mode 2 or 6): the way a word processor
     /// draws bold in a font that has no bold face (#2569).
     stroked_bold: bool,
+    /// Drawn filled (render modes 0, 2, 4 and 6).
+    filled: bool,
+    /// The outline it is drawn with: render mode 1 or 5, or 2 or 6 in
+    /// an outline colour of its own ([`text_outline`]).
+    outline: Option<Stroke>,
 }
 
 /// A Devanagari consonant (with the nukta forms).
@@ -2582,7 +2587,32 @@ impl<'a> Importer<'a> {
         } else {
             None
         };
-        shape.opacity = if fill { gs.fill_alpha } else { gs.stroke_alpha };
+        // A paint at alpha 0 draws nothing (Canva puts such see-through
+        // boxes over its pictures, #2640). Leave that part out so the shape
+        // is not an invisible object on the page, and keep the other part
+        // at its own alpha.
+        let has_fill = !matches!(shape.fill, Fill::None);
+        let fill_gone = has_fill && gs.fill_alpha <= 0.0;
+        let stroke_gone = shape.stroke.is_some() && gs.stroke_alpha <= 0.0;
+        if fill_gone {
+            shape.fill = Fill::None;
+        }
+        if stroke_gone {
+            shape.stroke = None;
+        }
+        if (fill_gone || stroke_gone) && matches!(shape.fill, Fill::None) && shape.stroke.is_none()
+        {
+            return;
+        }
+        shape.opacity = if has_fill && !fill_gone {
+            gs.fill_alpha
+        } else if shape.stroke.is_some() {
+            gs.stroke_alpha
+        } else if fill {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
         self.push(shape, &gs.clip);
     }
 
@@ -2903,6 +2933,7 @@ impl<'a> Importer<'a> {
                         .collect(),
                     _ => Vec::new(),
                 };
+                let mut cmyk_screen = CmykScreen::default();
                 for _ in 0..h {
                     if source.read_exact(&mut row).is_err() {
                         self.warn("image data shorter than its size; skipped");
@@ -2975,11 +3006,9 @@ impl<'a> Importer<'a> {
                                     } else {
                                         (comps[0], comps[1], comps[2], comps[3])
                                     };
-                                    (
-                                        to8((1.0 - c) * (1.0 - k)),
-                                        to8((1.0 - m) * (1.0 - k)),
-                                        to8((1.0 - yy) * (1.0 - k)),
-                                    )
+                                    let [r, g, b] =
+                                        cmyk_screen.rgb([to8(c), to8(m), to8(yy), to8(k)]);
+                                    (r, g, b)
                                 }
                                 ColorSpace::DeviceN(_) => {
                                     let n = cs.components();
@@ -4087,15 +4116,24 @@ impl<'a> Importer<'a> {
             *text_matrix *= Affine::translate((advance, 0.0));
             if !path.elements().is_empty() {
                 let mut shape = self.new_shape(ShapeKind::Path { path, closed: true });
-                shape.fill = Fill::Solid(gs.fill.unwrap_or(Color::BLACK));
+                shape.fill = if text_filled(gs) {
+                    Fill::Solid(gs.fill.unwrap_or(Color::BLACK))
+                } else {
+                    Fill::None
+                };
                 // Filled and outlined text (bold made up for a font with
-                // no bold face) keeps its outline, so it stays bold.
-                shape.stroke = gs.stroke.filter(|_| fake_bold(gs)).map(|c| {
-                    let w = (gs.line_width * Self::scale_of(gs.ctm)).max(Stroke::HAIRLINE);
-                    let mut st = Stroke::new(c, w);
-                    st.join = LineJoin::Round;
-                    st
-                });
+                // no bold face) keeps its outline, so it stays bold; text
+                // with an outline of its own keeps that outline.
+                shape.stroke = gs
+                    .stroke
+                    .filter(|_| fake_bold(gs))
+                    .map(|c| {
+                        let w = (gs.line_width * Self::scale_of(gs.ctm)).max(Stroke::HAIRLINE);
+                        let mut st = Stroke::new(c, w);
+                        st.join = LineJoin::Round;
+                        st
+                    })
+                    .or_else(|| text_outline(gs));
                 shape.opacity = gs.fill_alpha;
                 let clip = gs.clip.clone();
                 self.push(shape, &clip);
@@ -4157,6 +4195,8 @@ impl<'a> Importer<'a> {
             Some(r) => {
                 std::rc::Rc::ptr_eq(&r.font, &font)
                     && r.stroked_bold == fake_bold(gs)
+                    && r.filled == text_filled(gs)
+                    && r.outline == text_outline(gs)
                     && (r.size_pt - size_pt).abs() < 1e-6
                     && r.fill == gs.fill
                     && (same_line(&r.matrix, &trm, r.end_x, gs.font_size)
@@ -4205,6 +4245,8 @@ impl<'a> Importer<'a> {
                     reph_glyph: false,
                     xs: Some(Vec::new()),
                     stroked_bold: fake_bold(gs),
+                    filled: text_filled(gs),
+                    outline: text_outline(gs),
                 });
             }
         } else if let (Some(r), Some((new_end, len))) = (run.as_mut(), along) {
@@ -4317,6 +4359,14 @@ impl<'a> Importer<'a> {
             }
             from = part.end;
         }
+        // Hebrew and Arabic: back from the order the glyphs are drawn in,
+        // left to right on the page, to the order they are typed. Text an
+        // ActualText gave is in typed order already.
+        let text = if r.typed.is_empty() {
+            rtl_typed_order(&text)
+        } else {
+            text
+        };
         // The characters' places hold only while the text is as drawn.
         let text_chars = if text == r.text {
             text.chars().count()
@@ -4338,10 +4388,11 @@ impl<'a> Importer<'a> {
         });
         shape.transform = transform;
         shape.fill = match r.fill {
+            _ if !r.filled => Fill::None,
             Some(c) => Fill::Solid(c),
             None => Fill::Solid(Color::BLACK),
         };
-        shape.stroke = None;
+        shape.stroke = r.outline;
         shape.opacity = r.alpha;
         let _ = r.font.type3_matrix;
         self.line_widths.insert(shape.id, r.reach * scale);
@@ -4353,10 +4404,96 @@ impl<'a> Importer<'a> {
     }
 }
 
+/// `visual`, a line of text in the order its glyphs are drawn (left to
+/// right on the page), in the order it is typed: the words of Hebrew and
+/// Arabic (letters written right to left) turned around, with the Latin
+/// words and the numbers among them kept as they read, as the Unicode
+/// bidirectional algorithm lays typed text out (applied to the drawn
+/// text, it gives it back as typed). A letter keeps the marks after it
+/// (Hebrew points, Arabic vowels). Text with no such letters is left as
+/// it is. A PDF draws such text so, and Hebrew came in reversed: "שלום"
+/// drawn ם ו ל ש came in as "םולש".
+fn rtl_typed_order(visual: &str) -> String {
+    use unicode_bidi::{bidi_class, BidiClass, BidiInfo};
+    let rtl = |c: char| matches!(bidi_class(c), BidiClass::R | BidiClass::AL);
+    if !visual.chars().any(rtl) {
+        return visual.to_string();
+    }
+    let info = BidiInfo::new(visual, None);
+    // Each letter with the marks after it, at the letter's level.
+    let mut clusters: Vec<(u8, &str)> = Vec::new();
+    let mut start = 0;
+    for (i, c) in visual.char_indices().skip(1) {
+        if bidi_class(c) != BidiClass::NSM {
+            clusters.push((
+                info.levels.get(start).map_or(0, |l| l.number()),
+                &visual[start..i],
+            ));
+            start = i;
+        }
+    }
+    clusters.push((
+        info.levels.get(start).map_or(0, |l| l.number()),
+        &visual[start..],
+    ));
+    // From the highest level down to the lowest odd one, every run of
+    // clusters at that level or higher turns around.
+    let highest = clusters.iter().map(|c| c.0).max().unwrap_or(0);
+    let lowest = clusters.iter().map(|c| c.0).min().unwrap_or(0);
+    let lowest_odd = lowest | 1;
+    let mut level = highest;
+    while level >= lowest_odd && level > 0 {
+        let mut i = 0;
+        while i < clusters.len() {
+            if clusters[i].0 >= level {
+                let from = i;
+                while i < clusters.len() && clusters[i].0 >= level {
+                    i += 1;
+                }
+                clusters[from..i].reverse();
+            } else {
+                i += 1;
+            }
+        }
+        level -= 1;
+    }
+    clusters.iter().map(|c| c.1).collect()
+}
+
 /// Text drawn filled and outlined (render mode 2, or 6 with clipping) with
 /// an outline: how bold is made up for a font with no bold face.
 fn fake_bold(gs: &GState) -> bool {
-    matches!(gs.render_mode, 2 | 6) && gs.stroke.is_some() && gs.line_width > 0.0
+    matches!(gs.render_mode, 2 | 6)
+        && gs.stroke.is_some()
+        && gs.line_width > 0.0
+        && gs.stroke == gs.fill
+}
+
+/// Text drawn filled: render modes 0, 2, 4 and 6 (3 and 7 draw nothing,
+/// 1 and 5 only outline).
+fn text_filled(gs: &GState) -> bool {
+    matches!(gs.render_mode, 0 | 2 | 4 | 6)
+}
+
+/// The outline text is drawn with: outlined only (render mode 1 or 5),
+/// or filled and outlined (2 or 6) in an outline colour other than the
+/// fill's, as TraceDraw writes text with an outline. Filled and outlined
+/// in its fill colour is bold made up ([`fake_bold`]), not an outline.
+fn text_outline(gs: &GState) -> Option<Stroke> {
+    let outlined = match gs.render_mode {
+        1 | 5 => true,
+        2 | 6 => !fake_bold(gs),
+        _ => false,
+    };
+    let c = gs.stroke.filter(|_| outlined)?;
+    let scale = Importer::scale_of(gs.ctm);
+    let mut st = Stroke::new(c, (gs.line_width * scale).max(Stroke::HAIRLINE));
+    st.cap = gs.cap;
+    st.join = gs.join;
+    if !gs.dash.is_empty() && st.width > 0.0 {
+        st.dash = gs.dash.iter().map(|d| d * scale / st.width).collect();
+    }
+    Some(st)
 }
 
 /// Same baseline and direction, continuing after the previous advance.
@@ -5539,6 +5676,7 @@ fn cmyk_jpeg_rgba(data: &[u8], decode: &[f64]) -> Option<Vec<u8>> {
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(data), options);
     let raw = dec.decode().ok()?;
     let turn: [bool; 4] = std::array::from_fn(|i| decode.get(2 * i).is_some_and(|v| *v == 1.0));
+    let mut screen = CmykScreen::default();
     let mut out = Vec::with_capacity(raw.len());
     for px in raw.chunks_exact(4) {
         let mut ink = [px[0], px[1], px[2], px[3]];
@@ -5556,11 +5694,35 @@ fn cmyk_jpeg_rgba(data: &[u8], decode: &[f64]) -> Option<Vec<u8>> {
                 *v = 255 - *v;
             }
         }
-        let k = 255 - ink[3] as u32;
-        let rgb = |c: u8| (((255 - c as u32) * k + 127) / 255) as u8;
-        out.extend_from_slice(&[rgb(ink[0]), rgb(ink[1]), rgb(ink[2]), 255]);
+        let [r, g, b] = screen.rgb(ink);
+        out.extend_from_slice(&[r, g, b, 255]);
     }
     Some(out)
+}
+
+/// Screen colours of CMYK samples, as a CMYK colour of the drawing shows
+/// (the press model, or the CMYK profile when one is loaded), each
+/// sample worked out once. Taken as plain 1 - ink, solid cyan and
+/// magenta came in as a pure RGB blue far brighter than any press
+/// prints, unlike the same colour drawn as a vector (#3225).
+#[derive(Default)]
+struct CmykScreen {
+    seen: std::collections::HashMap<[u8; 4], [u8; 3]>,
+}
+
+impl CmykScreen {
+    fn rgb(&mut self, ink: [u8; 4]) -> [u8; 3] {
+        *self.seen.entry(ink).or_insert_with(|| {
+            let f = |v: u8| v as f32 / 255.0;
+            Color::Cmyk {
+                c: f(ink[0]),
+                m: f(ink[1]),
+                y: f(ink[2]),
+                k: f(ink[3]),
+            }
+            .to_rgb8()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -5720,6 +5882,69 @@ mod tests {
             assert_eq!(devanagari_logical_order(typed, false), typed);
             assert_eq!(devanagari_logical_order(typed, true), typed);
         }
+    }
+
+    /// Hebrew and Arabic drawn as PDFs draw them, left to right on the
+    /// page, come back in the order they are typed: the words turned
+    /// around, Latin words and numbers among them as they read, points
+    /// staying on their letters. Hebrew came in reversed.
+    #[test]
+    fn hebrew_and_arabic_from_a_pdf_come_back_in_typed_order() {
+        let cases = [
+            (
+                "\u{5DD}\u{5DC}\u{5D5}\u{5E2} \u{5DD}\u{5D5}\u{5DC}\u{5E9}",
+                "\u{5E9}\u{5DC}\u{5D5}\u{5DD} \u{5E2}\u{5D5}\u{5DC}\u{5DD}",
+            ),
+            (
+                "Hebrew \u{5DD}\u{5D5}\u{5DC}\u{5E9}",
+                "Hebrew \u{5E9}\u{5DC}\u{5D5}\u{5DD}",
+            ),
+            (
+                "123 \u{5DD}\u{5D5}\u{5DC}\u{5E9}",
+                "\u{5E9}\u{5DC}\u{5D5}\u{5DD} 123",
+            ),
+            // שָׁלוֹם with its points: drawn ם, וֹ, ל, שָׁ.
+            (
+                "\u{5DD}\u{5D5}\u{5B9}\u{5DC}\u{5E9}\u{5B8}\u{5C1}",
+                "\u{5E9}\u{5B8}\u{5C1}\u{5DC}\u{5D5}\u{5B9}\u{5DD}",
+            ),
+            // مرحبا
+            (
+                "\u{627}\u{628}\u{62D}\u{631}\u{645}",
+                "\u{645}\u{631}\u{62D}\u{628}\u{627}",
+            ),
+        ];
+        for (drawn, typed) in cases {
+            assert_eq!(rtl_typed_order(drawn), typed, "{drawn}");
+        }
+        for plain in [
+            "abc def",
+            "\u{915}\u{93F}\u{924}\u{93E}\u{92C}",
+            "12.5 %",
+            "",
+        ] {
+            assert_eq!(rtl_typed_order(plain), plain);
+        }
+        // A file: a simple font whose codes A to D are ש ל ו ם, drawing
+        // "שלום" as its glyphs go on the page, ם first.
+        let cmap = "/CIDInit /ProcSet findresource begin begincmap 1 begincodespacerange <00> <FF> endcodespacerange 4 beginbfchar <41> <05E9> <42> <05DC> <43> <05D5> <44> <05DD> endbfchar endcmap";
+        let font = "<< /Type /Font /Subtype /TrueType /BaseFont /Arial /FirstChar 65 /LastChar 68 /Widths [500 500 500 500] /ToUnicode 6 0 R >>".to_string();
+        let bytes = one_page(
+            "BT /F1 12 Tf 20 50 Td (DCBA) Tj ET",
+            "<< /Font << /F1 5 0 R >> >>",
+            &[font, stream("", cmap)],
+        );
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let texts: Vec<String> = imp.pages[0]
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.kind {
+                ShapeKind::Text { spans, .. } => Some(spans[0].text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["\u{5E9}\u{5DC}\u{5D5}\u{5DD}".to_string()]);
     }
 
     /// A simple font whose codes A to O stand for Devanagari glyphs the
@@ -6130,6 +6355,30 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn paint_at_alpha_zero_leaves_no_invisible_object() {
+        // Canva lays see-through boxes (ca 0) over its pictures (#2640).
+        let bytes = one_page(
+            "0 0 0 rg 0 0 50 50 re f /G0 gs 60 0 40 40 re f \
+             1 0 0 RG 5 w 0 60 40 40 re B /G1 gs 0 0 1 rg 60 60 30 30 re B",
+            "<< /ExtGState << /G0 << /ca 0 >> /G1 << /ca 1 /CA 0 >> >> >>",
+            &[],
+        );
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let p = &imp.pages[0];
+        assert_eq!(p.shapes.len(), 3, "{:?}", imp.warnings);
+        assert!(matches!(p.shapes[0].fill, Fill::Solid(_)));
+        // Fill at alpha 0 and a red outline: only the outline, seen.
+        assert!(matches!(p.shapes[1].fill, Fill::None));
+        assert!(p.shapes[1].stroke.is_some());
+        assert!((p.shapes[1].opacity - 1.0).abs() < 1e-9);
+        // Outline at alpha 0: only the blue fill.
+        assert!(matches!(p.shapes[2].fill, Fill::Solid(_)));
+        assert!(p.shapes[2].stroke.is_none());
+        assert!((p.shapes[2].opacity - 1.0).abs() < 1e-9);
     }
 
     /// A circle as four curves, counter-clockwise from its right end, for
@@ -6578,17 +6827,69 @@ mod tests {
     /// A CMYK JPEG stored with its inks turned over and drawn with an
     /// inverting Decode array, the usual way such pictures are written,
     /// comes in as it looks, not as a negative (#2322). Its left half is
-    /// full cyan, its right half half black.
+    /// full cyan, its right half half black. The inks show as the same
+    /// CMYK colours drawn as vectors do (#3225).
     #[test]
     fn cmyk_jpeg_with_inverting_decode_is_not_a_negative() {
         let jpeg = include_bytes!("../testdata/cmyk-inverted.jpg");
         let (cyan, grey) = cmyk_jpeg_pixels(jpeg, "/Decode [1 0 1 0 1 0 1 0]");
-        assert!(cyan[0] < 30 && cyan[1] > 225 && cyan[2] > 225, "{cyan:?}");
-        assert!(grey.iter().all(|v| (110..=145).contains(v)), "{grey:?}");
+        let near = |got: [u8; 3], c: f32, k: f32| {
+            let want = Color::Cmyk {
+                c,
+                m: 0.0,
+                y: 0.0,
+                k,
+            }
+            .to_rgb8();
+            got.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 16)
+        };
+        assert!(near(cyan, 1.0, 0.0), "{cyan:?}");
+        assert!(near(grey, 0.0, 0.5), "{grey:?}");
         // Without the Decode array the same samples are the inks as
         // stored: no cyan and full black on the left, so near black.
         let (left, _) = cmyk_jpeg_pixels(jpeg, "");
         assert!(left.iter().all(|v| *v < 40), "{left:?}");
+    }
+
+    /// Solid cyan and magenta in a plain CMYK picture show as the press
+    /// prints that blue, as the same colour drawn as a vector, not as
+    /// a pure RGB blue (#3225).
+    #[test]
+    fn cmyk_pictures_show_as_cmyk_colours_do() {
+        // 2 x 1 pixels: C+M, then paper.
+        let samples = [255u8, 255, 0, 0, 0, 0, 0, 0];
+        let mut image = format!(
+            "<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Length {} >>\nstream\n",
+            samples.len()
+        )
+        .into_bytes();
+        image.extend_from_slice(&samples);
+        image.extend_from_slice(b"\nendstream");
+        let bytes = pdf_bin(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>".to_vec(),
+            stream("", "q 80 0 0 80 10 10 cm /Im1 Do Q").into_bytes(),
+            image,
+        ]);
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let ShapeKind::Bitmap { png, .. } = &imp.pages[0].shapes[0].kind else {
+            panic!("{:?}", imp.pages[0].shapes[0].kind);
+        };
+        let pm = tiny_skia::Pixmap::decode_png(png).expect("png");
+        let p = pm.pixels()[0];
+        let blue = Color::Cmyk {
+            c: 1.0,
+            m: 1.0,
+            y: 0.0,
+            k: 0.0,
+        }
+        .to_rgb8();
+        assert_eq!([p.red(), p.green(), p.blue()], blue);
+        assert_ne!(blue, [0, 0, 255], "not the plain 1 - ink blue");
+        let paper = pm.pixels()[1];
+        assert_eq!([paper.red(), paper.green(), paper.blue()], [255, 255, 255]);
     }
 
     /// A one-page PDF whose objects may hold binary streams: each object
@@ -7007,6 +7308,42 @@ mod tests {
             (texts[2].0, texts[2].1, texts[2].2),
             ("Plain", false, false)
         );
+    }
+
+    /// Text with an outline of its own colour (render mode 2, as the PDF
+    /// export writes outlined text) keeps the outline and is not made
+    /// bold; text drawn outlined only (mode 1) comes in unfilled. Both
+    /// came in filled, without an outline.
+    #[test]
+    fn outlined_text_keeps_its_outline() {
+        let font =
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+        let bytes = one_page(
+            "BT /F1 12 Tf 1 0 0 rg 0 0 1 RG 0.5 w 2 Tr 20 60 Td (Both) Tj ET \
+             BT /F1 12 Tf 0 0 1 RG 0.5 w 1 Tr 20 30 Td (Outline) Tj ET",
+            "<< /Font << /F1 5 0 R >> >>",
+            &[font.to_string()],
+        );
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let texts: Vec<&Shape> = imp.pages[0]
+            .shapes
+            .iter()
+            .filter(|s| matches!(s.kind, ShapeKind::Text { .. }))
+            .collect();
+        assert_eq!(texts.len(), 2);
+        let ShapeKind::Text { spans, .. } = &texts[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(spans[0].text, "Both");
+        assert!(!spans[0].bold);
+        assert_eq!(texts[0].fill, Fill::Solid(Color::rgb8(255, 0, 0)));
+        let st = texts[0].stroke.as_ref().expect("the outline is kept");
+        assert_eq!(st.color, Color::rgb8(0, 0, 255));
+        assert!((st.width - 0.5 * PT_MM).abs() < 1e-6, "{}", st.width);
+        assert_eq!(texts[1].fill, Fill::None);
+        let st = texts[1].stroke.as_ref().expect("outline only");
+        assert_eq!(st.color, Color::rgb8(0, 0, 255));
     }
 
     /// A one-page file with a rectangle, a text run and a title, as the
