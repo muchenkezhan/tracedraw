@@ -5,6 +5,18 @@ has none (new, or opened from a format TraceDraw only reads or converts,
 `.cdr` included), and File > Save As (Ctrl+Shift+S), open the Save
 Drawing dialog.
 
+A save never loses the file it replaces (`files::replace_with`): the new
+file is written whole under a `.part` name beside it first, and only
+then copied over the old one in place (keeping its permissions, links
+and an open drawing's hold on it) and the `.part` file removed. When the
+write fails half way (a full disk, an error while the drawing is
+written, the program stopped), the old file is as it was; it was
+written over from the start and left cut short, so both the old and the
+new drawing were lost. Should the copy into place fail, the `.part` file
+keeps the whole new file and the error on the status line names it. A
+new file is the `.part` file renamed. Exports and every other file the
+desktop writes go the same way (`files::tests::a_failed_write_keeps_the_file_it_was_replacing`).
+
 ## Save Drawing
 
 One window, 760 px wide, the same on every system:
@@ -151,6 +163,11 @@ version decides who can open a file:
 
 What each version's file holds is in `docs/cdr-format.md`, Writing.
 
+Layers keep their state from version 16: a hidden layer is saved
+hidden with its objects, and a locked layer or one kept from printing
+keeps that, as the program's own files hold them. Before version 16 a
+hidden layer is saved empty.
+
 Live effects and drop shadows are saved as what they draw (a distorted
 rectangle as its curve, a contour as its steps, a shadow as a picture
 of it beneath the object), which any program shows. From version 14
@@ -201,6 +218,7 @@ another name.
 
 ## Checks
 
+- `files::tests::a_failed_write_keeps_the_file_it_was_replacing`
 - Each open drawing's file is held from the frame after it is opened or
   saved until it is closed or saved under another name, in the front tab
   or another, the file a drawing was opened from until it is saved under

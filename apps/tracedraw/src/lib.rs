@@ -32,6 +32,7 @@ mod autocorrect;
 mod barcode;
 pub mod benchmark;
 mod bg_remove;
+mod bg_subject;
 mod bitmap_file;
 mod bitmap_fx;
 mod bitmap_modes;
@@ -131,6 +132,7 @@ mod lens;
 mod live_guides;
 #[cfg(test)]
 mod macos_package;
+mod macro_convert;
 mod macro_forms;
 mod macros;
 mod mcp;
@@ -500,6 +502,7 @@ pub fn run() -> eframe::Result<()> {
             .with_resizable(true)
             .with_title("TraceDraw")
             .with_app_id(splash::APP_ID)
+            .with_icon(splash::window_icon())
     } else {
         splash::main_window_builder(&settings, plain)
     };
@@ -610,6 +613,12 @@ pub fn run() -> eframe::Result<()> {
                 );
                 log::error!("{what}");
                 startup_log::no_window(&what);
+            }
+        } else if let Some(next) = gpu::take_restart_after_exit() {
+            // Help > Benchmark: with or without the graphics card.
+            log::info!("starting again with {next:?} for the benchmark");
+            if !gpu::restart_with(next, &args) {
+                log::error!("TraceDraw could not start again with {next:?}");
             }
         }
         return Ok(());
@@ -1114,6 +1123,11 @@ impl eframe::App for Shell {
         #[cfg(not(target_arch = "wasm32"))]
         if app.sync_mcp_link(ui.ctx()) {
             ui.ctx().request_repaint();
+        }
+        // Fonts being installed off the interface's thread (d#3200).
+        if app.poll_font_installs() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
         // A large drawing being opened off the interface's thread (#2849).
         if app.poll_opening() {

@@ -3371,6 +3371,66 @@ fn a_page_background_colour_round_trips_from_version_21() {
     }
 }
 
+/// From version 16 a hidden layer goes out with its objects and its
+/// state as flags, so do a locked layer and one kept from print, as
+/// files of version 27 hold them (#2850); before, a hidden layer goes
+/// out empty and the other states plain.
+#[test]
+fn layer_state_and_hidden_layer_objects_are_kept_from_version_16() {
+    let mut doc = doc_with(Vec::new());
+    let mut ids = doc.ids().clone();
+    let shape = |ids: &mut tracedraw_core::id::IdSource, x: f64| {
+        let mut r = Shape::new(
+            ids.shape(),
+            ShapeKind::Rect {
+                rect: Rect::new(x, 10.0, x + 20.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        r.fill = Fill::Solid(Color::rgb8(255, 0, 0));
+        r
+    };
+    doc.pages[0].layers[0].shapes = vec![shape(&mut ids, 10.0)];
+    let mut hidden = Layer::new(ids.layer(), "Hidden");
+    hidden.visible = false;
+    hidden.shapes = vec![shape(&mut ids, 40.0), shape(&mut ids, 70.0)];
+    let mut locked = Layer::new(ids.layer(), "Locked");
+    locked.locked = true;
+    locked.shapes = vec![shape(&mut ids, 100.0)];
+    let mut no_print = Layer::new(ids.layer(), "No print");
+    no_print.printable = false;
+    no_print.shapes = vec![shape(&mut ids, 130.0)];
+    doc.pages[0].layers.extend([hidden, locked, no_print]);
+    doc.set_ids(ids);
+    for v in versions() {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, rep) = crate::open_bytes(&bytes, "back").expect("reads back");
+        assert_eq!(rep.skipped_objects, 0, "{v}: {:?}", rep.warnings);
+        let layer = |name: &str| {
+            back.pages[0]
+                .layers
+                .iter()
+                .find(|l| l.name == name)
+                .unwrap_or_else(|| panic!("{v}: no layer {name}"))
+                .clone()
+        };
+        let (h, l, p) = (layer("Hidden"), layer("Locked"), layer("No print"));
+        assert_eq!(layer("Ink").shapes.len(), 1, "{v}");
+        if v < 16 {
+            assert!(h.shapes.is_empty(), "{v}");
+            continue;
+        }
+        assert!(!h.visible, "{v}");
+        assert_eq!(h.shapes.len(), 2, "{v}");
+        assert!(h.shapes.iter().all(|s| s.visible), "{v}");
+        assert!(l.locked && l.visible && l.printable, "{v}");
+        assert_eq!(l.shapes.len(), 1, "{v}");
+        assert!(!p.printable && p.visible && !p.locked, "{v}");
+        assert_eq!(p.shapes.len(), 1, "{v}");
+    }
+}
+
 #[test]
 fn hidden_objects_are_kept_hidden_from_version_21() {
     let mut ids = tracedraw_core::id::IdSource::default();
@@ -10166,5 +10226,139 @@ fn arrowheads_go_out_as_curves_and_open_again_on_the_line() {
         let read = &back.pages[0].layers[0].shapes;
         assert_eq!(read.len(), 1, "{v}: {read:?}");
         assert_eq!(read[0].stroke, line.stroke, "{v}");
+    }
+}
+
+/// An emoji or a mathematical letter (beyond U+FFFF) is two letters of a
+/// file, a surrogate pair of marked UTF-16 units, from version 12. They
+/// went out as "?", and read back, every run after such a letter started
+/// one letter late (it took the letter before it), in every version.
+#[test]
+fn letters_beyond_u_ffff_round_trip_with_their_runs() {
+    let mut ids = tracedraw_core::id::IdSource::default();
+    let mut bold = TextSpan::new("B\u{1F600}b", "Arial", 20.0);
+    bold.bold = true;
+    let spans = vec![
+        TextSpan::new("a\u{1F600}\u{1D538}", "Arial", 12.0),
+        bold,
+        TextSpan::new(
+            "\u{e9}\u{1F44D}\u{1F3FD} family \u{1F468}\u{200d}\u{1F467}z",
+            "Arial",
+            12.0,
+        ),
+    ];
+    let t = text_shape(&mut ids, spans.clone(), TextAlign::Left);
+    let doc = doc_with(vec![t]);
+    for v in 12u16..=*crate::write::versions().end() {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        let runs: Vec<(String, bool)> = back
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .filter_map(|s| match &s.kind {
+                ShapeKind::Text { spans, .. } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|sp| (sp.text.clone(), sp.bold))
+            .collect();
+        let want: Vec<(String, bool)> = spans.iter().map(|sp| (sp.text.clone(), sp.bold)).collect();
+        assert_eq!(runs, want, "{v}");
+    }
+}
+
+/// A drawing's symbols are saved as symbols (#3250): the definition once
+/// in the document's `LIST sytr` and the table naming it, each instance
+/// a `LIST symb` placing it. Opened again, the symbol is there with its
+/// name and the instances stand where they stood; they used to be
+/// written as groups of the definition's objects.
+#[test]
+fn symbols_are_saved_as_symbols_and_their_instances() {
+    use tracedraw_core::document::Symbol;
+    let mut doc = Document::new("w", Size::new(200.0, 100.0));
+    let mut ids = doc.ids().clone();
+    let mut def = Shape::new(
+        tracedraw_core::id::ShapeId(0),
+        ShapeKind::Ellipse {
+            rect: Rect::new(-10.0, -5.0, 10.0, 5.0),
+            arc: None,
+        },
+    );
+    def.fill = Fill::Solid(Color::rgb8(200, 30, 30));
+    def.stroke = None;
+    doc.symbols.push(Symbol {
+        name: "Logo".into(),
+        shape: def,
+    });
+    let placements = [
+        Affine::translate((40.0, 30.0)),
+        Affine::translate((120.0, 60.0)) * Affine::rotate(0.5),
+        Affine::translate((160.0, 20.0)) * Affine::scale_non_uniform(2.0, 0.5),
+    ];
+    for t in placements {
+        let mut inst = Shape::new(ids.shape(), ShapeKind::SymbolInstance { index: 0 });
+        inst.transform = t;
+        inst.fill = Fill::None;
+        inst.stroke = None;
+        doc.pages[0].layers[0].shapes.push(inst);
+    }
+    doc.set_ids(ids);
+    let before: Vec<Rect> = doc.pages[0].layers[0]
+        .shapes
+        .iter()
+        .map(|s| {
+            s.expand(&doc.symbols)
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+                .expect("drawn")
+        })
+        .collect();
+    for v in [14, 27] {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "w.cdr").expect("reopens");
+        assert_eq!(back.symbols.len(), 1, "version {v}");
+        assert_eq!(back.symbols[0].name, "Logo", "version {v}");
+        let shapes: Vec<&Shape> = back
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .collect();
+        assert_eq!(shapes.len(), 3, "version {v}");
+        let mut after: Vec<Rect> = Vec::new();
+        for s in &shapes {
+            assert!(
+                matches!(s.kind, ShapeKind::SymbolInstance { index: 0 }),
+                "version {v}: {:?}",
+                s.kind
+            );
+            let b = s
+                .expand(&back.symbols)
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+                .expect("drawn");
+            after.push(b);
+        }
+        for b in &before {
+            assert!(
+                after.iter().any(|a| (a.x0 - b.x0).abs() < 0.05
+                    && (a.y0 - b.y0).abs() < 0.05
+                    && (a.x1 - b.x1).abs() < 0.05
+                    && (a.y1 - b.y1).abs() < 0.05),
+                "version {v}: {b:?} not among {after:?}"
+            );
+        }
     }
 }

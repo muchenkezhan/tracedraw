@@ -19,6 +19,7 @@
 mod extra;
 pub mod vba_run;
 mod vg;
+pub mod vg_catalog;
 
 use crate::app::App;
 use boa_engine::{
@@ -1797,19 +1798,17 @@ impl HostInner {
                     else {
                         continue;
                     };
-                    let spans: Vec<TextSpan> = spans
-                        .into_iter()
-                        .map(|sp| TextSpan {
-                            text: crate::export::replace_in(
-                                &sp.text,
-                                needle,
-                                &replacement,
-                                match_case,
-                                whole_word,
-                            ),
-                            ..sp
-                        })
-                        .collect();
+                    // The runs as one text, as the interface's Find and
+                    // Replace searches them.
+                    let Some(spans) = crate::export::replace_in_spans(
+                        &spans,
+                        needle,
+                        &replacement,
+                        match_case,
+                        whole_word,
+                    ) else {
+                        continue;
+                    };
                     self.run(Command::SetShapeKind {
                         shape: s.id,
                         kind: ShapeKind::Text {
