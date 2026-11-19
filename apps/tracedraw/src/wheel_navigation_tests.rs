@@ -157,7 +157,7 @@ fn plain_wheel_keeps_the_configured_zoom_or_scroll_action() {
 }
 
 #[test]
-fn control_wheel_and_pinch_keep_zooming_with_either_mouse_wheel_action() {
+fn control_wheel_follows_the_mouse_wheel_action_and_pinch_always_zooms() {
     for wheel_zooms in [false, true] {
         for modifiers in [
             Modifiers::CTRL,
@@ -168,6 +168,11 @@ fn control_wheel_and_pinch_keep_zooming_with_either_mouse_wheel_action() {
             let before = app.view;
             let spot = app.view.to_page(at);
             wheel_notch(&ctx, &mut app, at, modifiers);
+            if wheel_zooms && modifiers.ctrl {
+                assert_pan_axis(app.view.origin - before.origin, true);
+                assert_eq!(app.view.zoom, before.zoom, "Ctrl pans in Zoom mode");
+                continue;
+            }
             assert!(app.view.zoom > before.zoom, "Ctrl/Cmd keeps zooming");
             let after = app.view.to_page(at);
             assert!(
