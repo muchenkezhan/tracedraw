@@ -365,7 +365,7 @@ impl App {
         self.page_layers()
             .into_iter()
             .rev()
-            .filter(|l| l.visible && !l.locked)
+            .filter(|l| l.visible && !l.locked && self.layer_in_reach(l.id))
             .flat_map(|l| l.shapes.iter().rev())
             .find(|s| s.visible && !self.outside_clip_edit(s.id) && self.shape_hit(s, p, tol))
             .filter(|s| s.locked)
@@ -602,7 +602,7 @@ impl App {
             .page_layers()
             .into_iter()
             .rev()
-            .filter(|l| l.visible && !l.locked)
+            .filter(|l| l.visible && !l.locked && self.layer_in_reach(l.id))
             .flat_map(|l| l.shapes.iter().rev())
             .filter(|s| !s.locked && s.visible && !self.outside_clip_edit(s.id))
         {
@@ -660,7 +660,7 @@ impl App {
         }
         self.page_layers()
             .into_iter()
-            .filter(|l| l.visible && !l.locked)
+            .filter(|l| l.visible && !l.locked && self.layer_in_reach(l.id))
             .flat_map(|l| l.shapes.iter())
             .find(|e| e.id == end)
             .filter(|e| {
@@ -694,7 +694,7 @@ impl App {
         self.page_layers()
             .into_iter()
             .rev()
-            .filter(|l| l.visible && !l.locked)
+            .filter(|l| l.visible && !l.locked && self.layer_in_reach(l.id))
             .flat_map(|l| l.shapes.iter().rev())
             .filter(|s| !s.locked && s.visible && !self.outside_clip_edit(s.id))
             .find_map(|s| {
@@ -1096,7 +1096,7 @@ impl App {
         let end_shape = self
             .page_layers()
             .into_iter()
-            .filter(|l| l.visible && !l.locked)
+            .filter(|l| l.visible && !l.locked && self.layer_in_reach(l.id))
             .flat_map(|l| l.shapes.iter())
             .find(|e| e.id == end && e.visible && !e.locked)
             .cloned();
@@ -1165,7 +1165,7 @@ impl App {
             .page_layers()
             .into_iter()
             .rev()
-            .filter(|l| l.visible && !l.locked)
+            .filter(|l| l.visible && !l.locked && self.layer_in_reach(l.id))
             .flat_map(|l| l.shapes.iter().rev())
             .filter(|s| {
                 !s.locked && s.visible && !self.outside_clip_edit(s.id) && self.shape_hit(s, p, tol)
@@ -1204,7 +1204,7 @@ impl App {
         for s in self
             .page_layers()
             .into_iter()
-            .filter(|l| l.visible && !l.locked)
+            .filter(|l| l.visible && !l.locked && self.layer_in_reach(l.id))
             .flat_map(|l| &l.shapes)
             .filter(|s| s.visible && !s.locked && !self.outside_clip_edit(s.id))
         {
@@ -2560,9 +2560,18 @@ impl App {
                 self.toggle_rotate_mode();
                 return;
             }
-            if (self.guide_rotate.is_some() || self.hit_test(p).is_none())
-                && self.click_guide(p, mods.shift)
-            {
+            // A guideline over an object takes the click as it takes the
+            // press, unless the object is selected (#3424).
+            if self.guide_wins_press(p) && self.click_guide(p, mods.shift) {
+                // The second click of a double click: the Guidelines panel
+                // on it. The click took the guideline and the double click
+                // further down was never reached, so it only selected the
+                // guideline (#3008).
+                if response.double_clicked_by(PointerButton::Primary) && !mods.shift {
+                    if let Some(i) = self.pick_guide_at(p) {
+                        self.open_guide_properties(i);
+                    }
+                }
                 return;
             }
             self.deselect_guides();
@@ -4123,11 +4132,17 @@ impl App {
                 if std::mem::take(&mut self.ctrl_copy) {
                     self.drag_copy = true;
                 }
+                let before_move = self.engine.last_step_id();
                 if total.hypot() > 1e-6 {
                     self.finish_transform(Affine::translate(total));
                 }
                 if let Some((idx, r)) = to_page {
                     self.give_selection_to_shown_page(idx, r);
+                } else if self.drop_frame.is_none() && self.page_drag_group.is_none() {
+                    // Let go beside the page, or back on it from the
+                    // desktop, with the desktop taking such objects:
+                    // they change layer in the move's step (#3100).
+                    self.settle_beside_page(before_move);
                 }
                 if let Some(mark) = mark {
                     self.engine.end_group(mark, "Move to Page");
@@ -4291,6 +4306,7 @@ impl App {
                 self.finish_guide_move(at);
             }
             Drag::FountainHandle { .. }
+            | Drag::PatternHandle { .. }
             | Drag::SymmetryLines { .. }
             | Drag::ContourDrag { .. }
             | Drag::OffsetShadow { .. }
@@ -4354,7 +4370,19 @@ impl App {
                         sy = (anchor.y - current.y) / h;
                     }
                 }
-                if handle.is_corner() && !self.rotate_mode && !mods.free {
+                let even = handle.is_corner() && !self.rotate_mode && mods.even;
+                if even {
+                    // Ctrl+Alt: the width and the height change by the
+                    // same distance, where the pointer falls along the
+                    // diagonal, so the selection gains (or loses) an even
+                    // border, on every side from the centre (#3330).
+                    let d = ((sx.abs() - 1.0) * w + (sy.abs() - 1.0) * h) / 2.0;
+                    if w + d <= 1e-6 || h + d <= 1e-6 {
+                        return None;
+                    }
+                    sx = sx.signum() * (w + d) / w;
+                    sy = sy.signum() * (h + d) / h;
+                } else if handle.is_corner() && !self.rotate_mode && !mods.free {
                     // Corners scale proportionally (Alt: freely): by where
                     // the pointer falls along the box's diagonal, so the
                     // corner follows the pointer and a wide, low box (a
@@ -4372,7 +4400,7 @@ impl App {
                     sx = s * sx.signum();
                     sy = s * sy.signum();
                 }
-                if mods.steps {
+                if mods.steps && !even {
                     // Ctrl: whole steps of 100 %, so crossing the other
                     // side gives the mirror image at the same size.
                     let step = |v: f64| v.signum() * v.abs().round().max(1.0);
@@ -4518,13 +4546,7 @@ impl App {
         let cmd = Modifiers::COMMAND;
         for (key, mods) in presses {
             let text = crate::shortcuts::format(mods, key);
-            let own = self
-                .settings
-                .shortcuts
-                .iter()
-                .find(|(_, v)| crate::shortcuts::same(v, &text))
-                .map(|(id, _)| id.clone());
-            if let Some(id) = own {
+            if let Some(id) = self.own_shortcut(&text) {
                 if id.starts_with("menu.") && id != crate::ui::NAVIGATOR_KEY {
                     self.pending_command = Some(id);
                     return true;
@@ -4600,6 +4622,24 @@ impl App {
         });
         self.select(vec![te.shape]);
         self.sync_text_defaults_from(te.shape);
+    }
+
+    /// The command or tool the user gave the keys `text` (Options >
+    /// Customization > Commands): with the Shape tool, the Node editing
+    /// table's first, then the main table's (#3243).
+    fn own_shortcut(&self, text: &str) -> Option<String> {
+        let find = |table: &[(String, String)]| {
+            table
+                .iter()
+                .find(|(_, v)| crate::shortcuts::same(v, text))
+                .map(|(id, _)| id.clone())
+        };
+        if self.tool == Tool::Shape {
+            if let Some(id) = find(&self.settings.node_shortcuts) {
+                return Some(id);
+            }
+        }
+        find(&self.settings.shortcuts)
     }
 
     /// The built-in shortcut `key` with `mods` is another command's by
@@ -4882,13 +4922,7 @@ impl App {
         // shortcut over (#1595).
         for (key, mods) in &presses {
             let text = crate::shortcuts::format(*mods, *key);
-            let Some(id) = self
-                .settings
-                .shortcuts
-                .iter()
-                .find(|(_, v)| crate::shortcuts::same(v, &text))
-                .map(|(id, _)| id.clone())
-            else {
+            let Some(id) = self.own_shortcut(&text) else {
                 continue;
             };
             // The Navigator's key works while held (`ui::view_navigator`).

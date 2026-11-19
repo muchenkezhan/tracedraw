@@ -3073,6 +3073,10 @@ impl App {
                 text: tracedraw_core::spans_text(spans),
                 spans: spans.clone(),
                 ink,
+                align: match &s.kind {
+                    ShapeKind::Text { align, .. } => *align,
+                    _ => Default::default(),
+                },
             };
         }
     }
@@ -3090,6 +3094,47 @@ impl App {
         let mut spans = spans;
         retext_keeping_styles(&mut spans, text);
         self.set_text_spans(id, spans);
+    }
+
+    /// OK in the Edit Text box: its characters and the alignment set in
+    /// it (#3270), as one undo step "Edit Text".
+    pub fn set_edit_text(
+        &mut self,
+        id: ShapeId,
+        spans: Vec<TextSpan>,
+        align: tracedraw_core::TextAlign,
+    ) {
+        let Some(ShapeKind::Text {
+            spans: old,
+            origin,
+            frame,
+            align: old_align,
+            para,
+            on_path,
+        }) = self.doc().find_shape(id).map(|s| s.kind.clone())
+        else {
+            return;
+        };
+        if align == old_align {
+            self.set_text_spans(id, spans);
+            return;
+        }
+        let spans = tracedraw_core::document::merge_equal_spans(spans);
+        let spans = if spans.is_empty() { old } else { spans };
+        let kind = ShapeKind::Text {
+            spans,
+            origin,
+            frame,
+            align,
+            para,
+            on_path,
+        };
+        if let Err(e) = self
+            .engine
+            .run_with_label(&Command::SetShapeKind { shape: id, kind }, "Edit Text")
+        {
+            self.status = e.to_string();
+        }
     }
 
     /// The text object `id` gets the characters and formatting `spans`,
@@ -3763,29 +3808,32 @@ impl App {
         self.selection = vec![text.id];
     }
 
-    /// The Text tool clicked on the outline of a path (not a text): a new
-    /// text starts on that path. True when it did.
-    pub fn start_text_on_path_at(&mut self, p: Point) -> bool {
+    /// The path whose outline is at `p` (within 4 screen pixels) that
+    /// the Text tool would start a text on: not a text, a picture or a
+    /// group.
+    pub fn text_tool_path_at(&self, p: Point) -> Option<ShapeId> {
         let tolerance = 4.0 / f64::from(self.view.zoom).max(1e-6);
-        let Some(id) = self.hit_test(p) else {
-            return false;
-        };
-        let Ok((_, s)) = self.doc().shape(id) else {
-            return false;
-        };
+        let id = self.hit_test(p)?;
+        let (_, s) = self.doc().shape(id).ok()?;
         if matches!(
             s.kind,
             ShapeKind::Text { .. } | ShapeKind::Bitmap { .. } | ShapeKind::Group { .. }
         ) {
-            return false;
+            return None;
         }
         let path = s.page_path();
         let near = path.segments().any(|seg| {
             kurbo::ParamCurveNearest::nearest(&seg, p, 1e-3).distance_sq <= tolerance * tolerance
         });
-        if !near {
+        near.then_some(id)
+    }
+
+    /// The Text tool clicked on the outline of a path (not a text): a new
+    /// text starts on that path. True when it did.
+    pub fn start_text_on_path_at(&mut self, p: Point) -> bool {
+        let Some(id) = self.text_tool_path_at(p) else {
             return false;
-        }
+        };
         self.selection.clear();
         self.text_onto_path(id, Some(p), true);
         true
@@ -5603,6 +5651,55 @@ impl App {
     }
 }
 
+impl App {
+    /// The Symbols docker's Cancel beside Finish (#3437): the objects put
+    /// on the page to edit symbol `index` go away and the symbol keeps
+    /// the objects it had; one undo step, after which undo goes back into
+    /// the edit as it was.
+    pub fn cancel_symbol_edit(&mut self) {
+        if self.symbol_edit_index().is_none() {
+            return;
+        }
+        let contents = self.clip_edit_contents();
+        let Some((instance, outside)) = self.clip_frame_edit.take() else {
+            return;
+        };
+        let before = self.engine.last_step_id();
+        if !contents.is_empty() {
+            if let Err(e) = self.engine.run_batch(
+                "Cancel Editing Symbol",
+                &[Command::DeleteShapes { shapes: contents }],
+            ) {
+                self.status = e.to_string();
+                self.clip_frame_edit = Some((instance, outside));
+                return;
+            }
+        }
+        self.mark_clip_edit_step(before, instance, &outside, false);
+        self.select(vec![instance]);
+        self.status = String::new();
+    }
+
+    /// The Symbols docker's Duplicate (#3437): a new symbol drawing the
+    /// same objects as symbol `index` (copies of them, with ids of their
+    /// own), named after it, with no instance placed; one undo step.
+    pub fn duplicate_symbol(&mut self, index: usize) {
+        let Some(sym) = self.doc().symbols.get(index).cloned() else {
+            return;
+        };
+        let engine = &mut self.engine;
+        let mut shape = sym.shape.with_fresh_ids(&mut || engine.new_shape_id());
+        shape.id = ShapeId(0);
+        let name = trf("docker.symbol_copy_name", &[("name", &sym.name)]);
+        let _ = self.engine.run_with_label(
+            &Command::AddSymbol {
+                symbol: tracedraw_core::Symbol { name, shape },
+            },
+            "Duplicate Symbol",
+        );
+    }
+}
+
 /// Whether `t` can be undone (an instance scaled to nothing cannot).
 fn invertible(t: Affine) -> bool {
     let d = t.determinant();
@@ -5959,6 +6056,48 @@ mod tests {
         assert_eq!(app.engine.history_labels().0.len(), steps + 1);
     }
 
+    /// Turning a PowerClip whose contents are not locked to it is one
+    /// Undo: the contents put back where they were joined the turn as a
+    /// step of their own, so one Undo left the frame turned and the
+    /// contents turned with it.
+    #[test]
+    fn transforming_an_unlocked_clip_frame_is_one_undo() {
+        let mut app = App::headless();
+        let rect = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: kurbo::Rect::new(x, 0.0, x + 30.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect")
+        };
+        let frame = rect(&mut app, 0.0);
+        let inner = rect(&mut app, 5.0);
+        app.place_inside(vec![inner], frame);
+        let clip = app.doc().top_level_of(inner).expect("clip");
+        app.select(vec![clip]);
+        app.toggle_clip_frame_lock();
+        assert!(!app.clip_frame_locked(clip));
+        let inner_at = |app: &App| {
+            let p = app.doc().shape_on_page(inner).expect("inner").page_path();
+            p.elements()
+                .iter()
+                .map(|e| format!("{e:.6?}"))
+                .collect::<Vec<_>>()
+        };
+        let before = app.doc().to_json().unwrap();
+        let still = inner_at(&app);
+        let steps = app.engine.history_labels().0.len();
+        app.transform_selection(Affine::rotate(0.5));
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+        assert_eq!(inner_at(&app), still, "the contents stay where they are");
+        app.undo();
+        assert_eq!(app.doc().to_json().unwrap(), before, "one Undo: as before");
+        app.redo();
+        assert_eq!(inner_at(&app), still);
+        assert_ne!(app.doc().to_json().unwrap(), before);
+    }
+
     /// #2761: the 100% button makes the size an object has now read
     /// 100% in the scale fields; later scaling reads from it, one Undo
     /// brings the old reading back, and an object at its drawn size
@@ -6152,6 +6291,98 @@ mod tests {
         app.finish_clip_frame_edit();
         assert_eq!(app.symbol_edit_index(), Some(0));
         assert_eq!(app.status, tr("status.symbol_holds_itself"));
+    }
+
+    /// #3437: a selected instance is outlined by its symbol's objects,
+    /// not a 10 x 10 placeholder, and a group holding one is picked over
+    /// them; Cancel beside Finish leaves the symbol as it was; Duplicate
+    /// adds a copy of the symbol, named after it, with no instance.
+    #[test]
+    fn symbol_instances_outline_their_objects_cancel_and_duplicate() {
+        let mut app = App::headless();
+        let a = symbol_of(&mut app, kurbo::Rect::new(40.0, 50.0, 100.0, 80.0));
+        app.select(vec![a]);
+        let lines = app.selected_outlines();
+        let xs: Vec<f64> = lines.iter().flatten().map(|p| p.x).collect();
+        let ys: Vec<f64> = lines.iter().flatten().map(|p| p.y).collect();
+        let lo = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (lo(&xs) - 40.0).abs() < 1e-6 && (hi(&xs) - 100.0).abs() < 1e-6,
+            "{xs:?}"
+        );
+        assert!(
+            (lo(&ys) - 50.0).abs() < 1e-6 && (hi(&ys) - 80.0).abs() < 1e-6,
+            "{ys:?}"
+        );
+        // Grouped with a small square far from it: the group's box takes
+        // in the symbol's objects, and a click on them picks the group.
+        let other = app
+            .new_shape(ShapeKind::Rect {
+                rect: kurbo::Rect::new(150.0, 150.0, 155.0, 155.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![a, other]);
+        app.group_selection();
+        let g = app.selection[0];
+        let s = app.doc().find_shape(g).cloned().expect("group");
+        let b = app.visual_bounds(&s);
+        assert!(
+            (b.x0 - 40.0).abs() < 1e-6 && (b.y0 - 50.0).abs() < 1e-6,
+            "{b:?}"
+        );
+        assert_eq!(app.hit_test(Point::new(98.0, 78.0)), Some(g));
+        app.undo();
+        // Cancel: the objects put on the page go, the symbol is as it was.
+        let before = app.doc().symbols[0].clone();
+        app.edit_symbol_instance(a);
+        let copy = app.selection[0];
+        app.run(Command::TransformShapes {
+            shapes: vec![copy],
+            transform: Affine::scale(2.0),
+        });
+        app.cancel_symbol_edit();
+        assert!(app.clip_frame_edit.is_none());
+        assert!(app.doc().find_shape(copy).is_none());
+        assert_eq!(app.doc().symbols[0], before);
+        assert_eq!(app.selection, vec![a]);
+        // Undo goes back into the edit, the objects as they were left.
+        app.undo();
+        assert_eq!(app.symbol_edit_index(), Some(0));
+        assert!(app.doc().find_shape(copy).is_some());
+        app.cancel_symbol_edit();
+        // Duplicate: a second symbol drawing the same, no instance placed.
+        let count = |app: &App| {
+            app.doc()
+                .all_layers()
+                .map(|l| l.shapes.len())
+                .sum::<usize>()
+        };
+        let shapes = count(&app);
+        app.duplicate_symbol(0);
+        assert_eq!(app.doc().symbols.len(), 2);
+        assert_eq!(
+            app.doc().symbols[1].name,
+            trf("docker.symbol_copy_name", &[("name", &before.name)])
+        );
+        assert_eq!(
+            app.doc().symbols[1].shape.page_path(),
+            app.doc().symbols[0].shape.page_path()
+        );
+        assert_eq!(count(&app), shapes);
+        // #3249: the Symbols docker draws a picture of each symbol, once.
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                crate::ui::dockers2::show(&mut app, ui, crate::app::DockerTab::Symbols);
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(app.symbol_thumbs.renders, 2);
+        app.undo();
+        assert_eq!(app.doc().symbols.len(), 1);
     }
 
     /// New Symbol is one step to undo: the symbol goes with its instance.
@@ -6675,6 +6906,68 @@ mod tests {
         assert!(b.height() < 10.0, "{b:?}");
     }
 
+    /// #3255: the Pick tool's mirrors on a circle and the text fitted to
+    /// it mirror the text's path, not its letters: top to bottom the text
+    /// on the top's outside comes to the bottom's inside, reading left to
+    /// right as Bottom centre puts it, in one undo step.
+    #[test]
+    fn mirroring_a_fitted_text_with_its_circle_keeps_it_readable() {
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let e = app
+            .new_shape(ShapeKind::Ellipse {
+                rect: tracedraw_core::geometry::Rect::new(40.0, 100.0, 140.0, 200.0),
+                arc: None,
+            })
+            .expect("circle");
+        app.start_text(Point::new(60.0, 260.0), None);
+        app.text_insert("Abdullah");
+        app.finish_text();
+        let t = app.selection[0];
+        app.selection = vec![t, e];
+        app.begin_fit_text_to_path();
+        let before = fitted(&app, t);
+        app.selection = vec![e, t];
+        app.mirror(false);
+        assert_eq!(app.engine.undo_label(), Some("Mirror"));
+        assert_eq!(app.selection, vec![e, t]);
+        let after = fitted(&app, t);
+        assert_ne!(after.path, before.path);
+        assert_eq!(after.mirrors(), before.mirrors());
+        let bounds = |app: &App| {
+            let s = app.doc().shape(t).expect("text").1.clone();
+            app.visual_bounds(&s)
+        };
+        let fonts = !tracedraw_text::fonts().families().is_empty();
+        if fonts {
+            // Inside the bottom, centred.
+            let b = bounds(&app);
+            assert!((b.center().x - 90.0).abs() < 1.0, "{b:?}");
+            assert!(b.y0 > 99.0 && b.y1 < 125.0, "{b:?}");
+            // Bottom centre puts it just so: it reads left to right.
+            app.selection = vec![t];
+            app.place_fitted_text_round(true);
+            let c = bounds(&app);
+            assert!(
+                (c.x0 - b.x0).abs() < 1.0 && (c.y0 - b.y0).abs() < 1.0 && (c.x1 - b.x1).abs() < 1.0,
+                "{b:?} {c:?}"
+            );
+            app.undo();
+            app.selection = vec![e, t];
+        }
+        // Left to right it stays inside the bottom, centred.
+        app.mirror(true);
+        if fonts {
+            let b = bounds(&app);
+            assert!((b.center().x - 90.0).abs() < 1.0, "{b:?}");
+            assert!(b.y0 > 99.0 && b.y1 < 125.0, "{b:?}");
+        }
+        // Two undos give the text back as it was fitted.
+        app.undo();
+        app.undo();
+        assert_eq!(fitted(&app, t).path, before.path);
+    }
+
     #[test]
     fn text_on_a_straight_line_stands_on_it_from_the_start() {
         tracedraw_text::install();
@@ -6716,9 +7009,24 @@ mod tests {
                 arc: None,
             })
             .expect("ellipse");
-        let _ = e;
         // Inside, far from the outline: not on the path.
         app.selection.clear();
+        // Over the outline the Text tool shows the path and says a click
+        // types along it (#3255); inside it does not.
+        app.set_tool(crate::tools::Tool::Text);
+        assert_eq!(app.text_tool_path_at(Point::new(90.0, 160.0)), Some(e));
+        assert_eq!(app.text_tool_path_at(Point::new(90.0, 130.0)), None);
+        app.pointer_page = Some(Point::new(90.0, 160.0));
+        assert_eq!(
+            crate::ui::status::tool_hint(&app),
+            crate::i18n::tr("status_hint.text_on_path")
+        );
+        app.pointer_page = Some(Point::new(90.0, 130.0));
+        assert_eq!(
+            crate::ui::status::tool_hint(&app),
+            crate::i18n::tr("status_hint.text")
+        );
+        app.pointer_page = None;
         assert!(!app.start_text_on_path_at(Point::new(90.0, 130.0)));
         // On the outline at the top.
         assert!(app.start_text_on_path_at(Point::new(90.0, 160.0)));

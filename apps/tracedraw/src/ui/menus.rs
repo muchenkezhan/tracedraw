@@ -2463,8 +2463,12 @@ pub fn menu_bar(app: &mut App, ui: &mut Ui) {
         .filter(|(m, _)| m.alt && !(m.ctrl || m.command || m.shift))
         .map(|(_, k)| k)
         .collect();
+    // A dialog keeps Alt and its letters: Alt+O in Text > Edit Text
+    // opened the Object menu behind it (#3370).
+    let dialog_open = !matches!(app.dialog, crate::ui::dialogs::Dialog::None);
     let blocked = move |c: char| {
         capturing
+            || dialog_open
             || (symmetry_e && c == 'e')
             || access::key_of(c).is_some_and(|k| user_alt_keys.contains(&k))
     };
@@ -3100,6 +3104,11 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
     }
     if item(ui, "menu.view.zoom_to_fit", "F4", true) {
         app.zoom_to_fit();
+    }
+    // Real size: the zoom box's 100%, as a command a key can be given
+    // in Options > Customization > Commands (#3103).
+    if item(ui, "menu.view.zoom_1to1", "", true) {
+        app.set_zoom_percent(100.0);
     }
     // The key held shows the Navigator while it is down (`view_navigator`);
     // the menu row opens it until a click.
@@ -3924,6 +3933,14 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
             distance: app.units.from_mm(app.outline_offset_mm),
             outside: true,
         };
+    }
+    // The outline one step wider or narrower, for a key of one's own
+    // (#2905).
+    if item(ui, "menu.object.outline_thicker", "", has) {
+        app.step_outline_width(true);
+    }
+    if item(ui, "menu.object.outline_thinner", "", has) {
+        app.step_outline_width(false);
     }
     if item(ui, "menu.object.join_curves", "", true) {
         app.show_dockers = true;
