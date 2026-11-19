@@ -15,7 +15,8 @@ use tracedraw_core::{
 
 /// What a drag with the Free Transform tool does. Modifier keys override
 /// the mode: Alt scales, Ctrl skews, Shift reflects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FreeTransformMode {
     Rotation,
     Reflection,
@@ -1228,6 +1229,8 @@ pub struct App {
     /// reached the program on Windows (#2686).
     pub file_drag: crate::drop_files::FileDrag,
     pub duplicate_offset: Vec2,
+    /// Q held down on its own: all snapping off while it is held (#3072).
+    pub snap_held_off: bool,
     /// The last Duplicate: each original and its copy. While the copies
     /// are the selection, the next Duplicate repeats what was done to
     /// them since (moved, scaled, turned), as the reference program's
@@ -1462,6 +1465,10 @@ pub struct App {
     /// arrangement and number of windows last laid out.
     pub window_layout: crate::ui::windows::WindowLayout,
     pub window_layout_seen: Option<(crate::ui::windows::WindowLayout, usize)>,
+    /// Drawings in windows of their own (#2904), and the drawing the main
+    /// window shows while the active one is in such a window.
+    pub detached: Vec<crate::ui::detached::Detached>,
+    pub main_window_doc: Option<(u64, u32)>,
     /// Whether each paragraph text overflows its frame, by document
     /// revision (laying text out every frame would be slow).
     pub overflow_cache: std::cell::RefCell<(u64, std::collections::HashMap<ShapeId, bool>)>,
@@ -1476,6 +1483,11 @@ pub struct App {
     /// Families the font lists show: installed, carried by drawings, and
     /// (browser build) offered by the page's font folder.
     pub font_families: Vec<String>,
+    /// Font files being installed off the interface's thread: the Font
+    /// Manager's fonts at the start and the fonts of a folder just added
+    /// (a library of tens of thousands of fonts kept the window from
+    /// opening for a minute, or froze it for hours, d#2166, d#3200).
+    pub font_installs: Vec<std::sync::mpsc::Receiver<Vec<String>>>,
     /// What the Font Manager loaded and drew.
     pub font_catalog: crate::ui::font_manager::Catalog,
     /// The font lists' pictures of family names in their own fonts.
@@ -2616,6 +2628,10 @@ pub struct SelectedCache {
     shapes: std::rc::Rc<Vec<Shape>>,
     /// Their visual bounds, once asked for.
     bounds: std::cell::RefCell<Option<std::rc::Rc<Vec<Rect>>>>,
+    /// Answers worked out from them, by name, once asked for (see
+    /// [`App::from_selection`]).
+    derived:
+        std::cell::RefCell<std::collections::HashMap<&'static str, std::rc::Rc<dyn std::any::Any>>>,
 }
 
 /// An action Edit > Repeat can repeat.
@@ -3034,6 +3050,7 @@ impl App {
             // scaled or turned; the next one repeats that (#1494).
             duplicate_offset: Vec2::ZERO,
             last_duplicate: Vec::new(),
+            snap_held_off: false,
             forgotten_duplicate: None,
             selection_steps: Default::default(),
             last_guide_duplicate: None,
@@ -3141,12 +3158,15 @@ impl App {
             view_anchor: None,
             window_layout: Default::default(),
             window_layout_seen: None,
+            detached: Vec::new(),
+            main_window_doc: None,
             overflow_cache: Default::default(),
             live_reflow: Default::default(),
             builder: Default::default(),
             corner_cache: Default::default(),
             wireframe: false,
             font_families: tracedraw_text::fonts().available_families(),
+            font_installs: Vec::new(),
             font_catalog: Default::default(),
             font_previews: Default::default(),
             font_generation: tracedraw_text::fonts().generation(),
@@ -3741,16 +3761,47 @@ impl App {
     /// Apply persisted settings (language, workspace, snapping, units).
     pub fn load_settings(&mut self) {
         self.apply_settings(crate::settings::Settings::load());
-        // Fonts installed for TraceDraw in the Font Manager.
-        if !crate::ui::font_manager::install_saved(&self.settings.font_manager).is_empty() {
-            self.font_families = tracedraw_text::fonts().available_families();
+        // Fonts installed for TraceDraw in the Font Manager, read off the
+        // interface's thread: the window opens meanwhile (d#3200).
+        if let Some(job) =
+            crate::ui::font_manager::install_saved_in_background(&self.settings.font_manager)
+        {
+            self.font_installs.push(job);
         }
+    }
+
+    /// Take the fonts installed off the interface's thread once they are
+    /// in: the font lists name them, and the open drawing's missing fonts
+    /// and the font for new text are checked again. Whether some are
+    /// still being installed.
+    pub fn poll_font_installs(&mut self) -> bool {
+        if self.font_installs.is_empty() {
+            return false;
+        }
+        let before = self.font_installs.len();
+        self.font_installs
+            .retain(|rx| matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        if self.font_installs.len() == before {
+            return true;
+        }
+        self.font_families = tracedraw_text::fonts().available_families();
+        if self.font_installs.is_empty() {
+            if !crate::files::WEB {
+                self.keep_default_font_installed();
+            }
+            self.check_missing_fonts();
+        }
+        !self.font_installs.is_empty()
     }
 
     /// A font for new text that is no longer installed gives way to Arial,
     /// or the first font there is: text typed in it was drawn with a
     /// stand-in while the bars named the missing font (#504).
     pub fn keep_default_font_installed(&mut self) {
+        // The fonts of the Font Manager are still coming in.
+        if !self.font_installs.is_empty() {
+            return;
+        }
         let installed = |f: &str| self.font_families.iter().any(|g| g.eq_ignore_ascii_case(f));
         if self.font_families.is_empty() || installed(&self.text_default_font) {
             return;
@@ -4014,6 +4065,16 @@ impl App {
     /// The tool settings now (see [`crate::settings::ToolPrefs`]).
     pub fn tool_prefs(&self) -> crate::settings::ToolPrefs {
         crate::settings::ToolPrefs {
+            common_shape: self.common_shape.key().to_string(),
+            my_shape: self.my_shape,
+            eyedropper_groups: self.eyedropper_groups,
+            eyedropper_sample: self.eyedropper_sample,
+            free_transform_mode: self.free_transform_mode,
+            node_lasso: self.node_lasso,
+            node_lasso_keeps: self.node_lasso_keeps,
+            blend_rotation: self.blend_rotation,
+            blend_accel_objects: self.blend_accel_objects,
+            blend_accel_colors: self.blend_accel_colors,
             polygon_points: self.polygon_points,
             star_sharpness: self.star_sharpness,
             star_complex: self.star_complex,
@@ -4057,6 +4118,22 @@ impl App {
             sketch: self.sketch,
             knife: self.knife,
             segment_freehand: self.segment_freehand,
+            media: crate::settings::MediaPrefs {
+                mode: self.media_mode,
+                preset: self.media_preset,
+                width: self.media_width,
+                angle: self.media_angle,
+                spacing: self.media_spacing,
+                pressure: self.media_pressure,
+                smoothing: self.media_smoothing,
+            },
+            balloon: crate::settings::BalloonPrefs {
+                style: self.balloon_style,
+                width: self.balloon_width,
+                bend: self.balloon_bend,
+            },
+            action_lines: self.action_lines,
+            painterly: self.painterly,
         }
     }
 
@@ -4070,6 +4147,25 @@ impl App {
                 or
             }
         };
+        // A shape key this version does not know keeps the current one.
+        if let Some(s) = crate::tools2::CommonShape::ALL
+            .iter()
+            .find(|s| s.key() == t.common_shape)
+        {
+            self.common_shape = *s;
+        }
+        self.my_shape = t.my_shape;
+        self.eyedropper_groups = t.eyedropper_groups;
+        self.eyedropper_sample = match t.eyedropper_sample {
+            2 | 5 => t.eyedropper_sample,
+            _ => 1,
+        };
+        self.free_transform_mode = t.free_transform_mode;
+        self.node_lasso = t.node_lasso;
+        self.node_lasso_keeps = t.node_lasso_keeps;
+        self.blend_rotation = finite(t.blend_rotation, -3600.0, 3600.0, 0.0);
+        self.blend_accel_objects = finite(t.blend_accel_objects, -1.0, 1.0, 0.0);
+        self.blend_accel_colors = finite(t.blend_accel_colors, -1.0, 1.0, 0.0);
         self.polygon_points = t.polygon_points.clamp(3, 500);
         // Negative: inverted stars (#1331).
         self.star_sharpness = finite(t.star_sharpness, -1.0, 1.0, 0.5);
@@ -4130,6 +4226,33 @@ impl App {
             ..t.knife
         };
         self.segment_freehand = t.segment_freehand;
+        // The ranges of their bars.
+        let m = &t.media;
+        self.media_mode = m.mode;
+        self.media_preset = m.preset.min(64);
+        self.media_width = finite(m.width, 0.2, 50.0, 3.0);
+        self.media_angle = finite(m.angle, 0.0, 180.0, 45.0);
+        self.media_spacing = finite(m.spacing, 1.0, 50.0, 8.0);
+        self.media_pressure = finite(m.pressure, 0.0, 1.0, 0.5);
+        self.media_smoothing = finite(m.smoothing, 0.0, 100.0, 25.0);
+        self.balloon_style = t.balloon.style;
+        self.balloon_width = finite(t.balloon.width, 5.0, 100.0, 30.0);
+        self.balloon_bend = finite(t.balloon.bend, -100.0, 100.0, 0.0);
+        let a = t.action_lines;
+        self.action_lines = crate::action_lines::ActionLines {
+            count: a.count.clamp(2, 500),
+            length_var: finite(a.length_var, 0.0, 100.0, 70.0),
+            inner: finite(a.inner, 0.0, 90.0, 30.0),
+            width: finite(a.width, 0.0, 1000.0, 0.0),
+            width_var: finite(a.width_var, 0.0, 100.0, 50.0),
+            spacing_var: finite(a.spacing_var, 0.0, 100.0, 0.0),
+            angle: finite(a.angle, -360.0, 360.0, 0.0),
+            ..a
+        };
+        self.painterly = crate::painterly_tool::PainterlySettings {
+            size: finite(t.painterly.size, 0.1, 200.0, 5.0),
+            ..t.painterly
+        };
         self.sketch = crate::recognize::SketchSettings {
             join_distance: finite(t.sketch.join_distance, 0.0, 1000.0, 5.0),
             smoothing: t.sketch.smoothing.min(5),
@@ -4961,6 +5084,29 @@ impl App {
 
     /// The active drawing's name: its file's name without the extension,
     /// else the document title (an Untitled name for a new drawing).
+    /// The name an export of the drawing starts with (its extension
+    /// added): the drawing's file, else the file it was read from (a
+    /// `.cdr`, a PDF), else its title, else Graphic1 (#3254, #3208). A
+    /// drawing opened from a `.cdr` has no file of its own until it is
+    /// saved as `.tdraw`, so its exports were offered as Graphic1.
+    pub fn export_stem(&self) -> String {
+        let stem_of = |p: &std::path::Path| {
+            crate::files::plain_path(p)
+                .file_stem()
+                .map(|s| s.to_string_lossy().trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        self.file
+            .as_deref()
+            .and_then(stem_of)
+            .or_else(|| self.opened_from.as_deref().and_then(stem_of))
+            .or_else(|| {
+                let t = self.doc().title.trim();
+                (!t.is_empty() && !is_untitled_name(t)).then(|| t.to_string())
+            })
+            .unwrap_or_else(|| "Graphic1".into())
+    }
+
     pub fn document_name(&self) -> String {
         // Imported files (.cdr, .svg) have no native path yet; their title
         // comes from the document.
@@ -5467,6 +5613,7 @@ impl App {
                 selection: self.selection.clone(),
                 shapes: shapes.clone(),
                 bounds: Default::default(),
+                derived: Default::default(),
             });
         }
         shapes
@@ -5533,14 +5680,17 @@ impl App {
         if self.selection.len() <= 8 {
             return self.selection.iter().any(|id| doc.is_nested(*id));
         }
-        // One pass over the layers rather than a search per object (#367).
-        let on_layer: std::collections::HashSet<ShapeId> = doc
-            .all_layers()
-            .flat_map(|l| l.shapes.iter().map(|s| s.id))
-            .collect();
-        self.selection
-            .iter()
-            .any(|id| !on_layer.contains(id) && doc.find_shape(*id).is_some())
+        // One pass over the layers rather than a search per object (#367),
+        // and only once for the selection: the canvas asks every frame.
+        *self.from_selection("nested", |_| {
+            let on_layer: std::collections::HashSet<ShapeId> = doc
+                .all_layers()
+                .flat_map(|l| l.shapes.iter().map(|s| s.id))
+                .collect();
+            self.selection
+                .iter()
+                .any(|id| !on_layer.contains(id) && doc.find_shape(*id).is_some())
+        })
     }
 
     /// Turn the rotate and skew handles on or off (a moved centre of
@@ -5590,6 +5740,43 @@ impl App {
             }
         }
         b
+    }
+
+    /// `f` of [`Self::selected_rc`], worked out once for the gathered
+    /// selection and kept with it under `name`: what the bars show of the
+    /// selection is asked for every frame, and going through each of
+    /// 50,000 selected objects for it made each frame take a fifth of a
+    /// second. `f` may read the app only as the selection and the drawing
+    /// it is kept for (a new revision or selection works it out anew).
+    pub fn from_selection<T: 'static>(
+        &self,
+        name: &'static str,
+        f: impl FnOnce(&[Shape]) -> T,
+    ) -> std::rc::Rc<T> {
+        let shapes = self.selected_rc();
+        let kept = |c: &SelectedCache| {
+            std::rc::Rc::ptr_eq(&c.shapes, &shapes)
+                .then(|| c.derived.borrow().get(name).cloned())
+                .flatten()
+                .and_then(|v| v.downcast::<T>().ok())
+        };
+        if let Ok(cache) = self.selected_cache.try_borrow() {
+            if let Some(v) = cache.as_ref().and_then(kept) {
+                return v;
+            }
+        }
+        let v = std::rc::Rc::new(f(&shapes));
+        if let Ok(cache) = self.selected_cache.try_borrow() {
+            if let Some(c) = cache
+                .as_ref()
+                .filter(|c| std::rc::Rc::ptr_eq(&c.shapes, &shapes))
+            {
+                c.derived
+                    .borrow_mut()
+                    .insert(name, v.clone() as std::rc::Rc<dyn std::any::Any>);
+            }
+        }
+        v
     }
 
     /// The outlines of the selected objects in page space, flattened
@@ -6208,6 +6395,31 @@ impl App {
     /// of the curve the line goes on from, so the curve is closed and a
     /// redo of this step ends it, as a close by hand does (#1846).
     pub(crate) fn finish_curve_as(&mut self, closes: bool) {
+        // A curve whose last node lies on its first (placed there by a
+        // snap, or a click just outside the reach that closes it) is
+        // closed: finished open, its two ends met with the line's caps
+        // and that corner came out cut off where the others came to a
+        // point (#3219).
+        if !closes {
+            if let Some(c) = self.curve.as_ref().filter(|c| !c.bspline) {
+                let ends_on_first = c.nodes.len() >= 4
+                    && c.nodes
+                        .first()
+                        .zip(c.nodes.last())
+                        .is_some_and(|(a, b)| (a.0 - b.0).hypot() < 1e-6 && b.1.is_none());
+                if ends_on_first {
+                    let line = c.path(None);
+                    if !self.would_join(&line) {
+                        if let Some(mut c) = self.curve.take() {
+                            c.nodes.pop();
+                            c.closing = None;
+                            self.close_curve(c);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         let history = std::mem::take(&mut self.curve_steps.undo);
         self.curve_steps.clear();
         let Some(c) = self.curve.take() else { return };
@@ -6723,6 +6935,7 @@ impl App {
             cmds.push(Command::AddSymbol { symbol });
         }
         crate::textflow::relink_copies(&cb.shapes, &mut copies);
+        self.unlink_foreign_blend_ends(&mut copies);
         // Copies of connected objects still in the drawing come with
         // their connectors (#476).
         // Only objects of this drawing count (the same id and identity):
@@ -6765,28 +6978,60 @@ impl App {
     /// showed nothing once the edit was finished. Objects that would lie
     /// wholly outside the frame's box are centred on it, together;
     /// objects reaching into the frame stay where they were copied.
-    fn bring_into_edited_frame(&self, pasted: &mut [Shape]) {
-        if !self.editing_clip_contents() {
-            return;
-        }
-        let Some(frame) = self
-            .clip_frame_edit
-            .as_ref()
-            .and_then(|(frame, _)| self.doc().find_shape(*frame))
-            .map(|f| f.bounds())
-        else {
-            return;
-        };
+    pub(crate) fn bring_into_edited_frame(&self, pasted: &mut [Shape]) {
         let Some(all) = pasted.iter().map(|s| s.bounds()).reduce(|a, b| a.union(b)) else {
             return;
         };
-        let finite = |r: Rect| [r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite());
-        if !finite(frame) || !finite(all) || all.intersect(frame).area() > 0.0 {
+        let Some(d) = self.edited_frame_shift(all) else {
             return;
-        }
-        let d = frame.center() - all.center();
+        };
         for s in pasted {
             s.transform_by(Affine::translate(d));
+        }
+    }
+
+    /// How far objects of box `all` move to land in the clip frame whose
+    /// contents are edited (see [`App::bring_into_edited_frame`]): `None`
+    /// when no frame is edited or they reach into it already.
+    fn edited_frame_shift(&self, all: Rect) -> Option<kurbo::Vec2> {
+        if !self.editing_clip_contents() {
+            return None;
+        }
+        let frame = self
+            .clip_frame_edit
+            .as_ref()
+            .and_then(|(frame, _)| self.doc().find_shape(*frame))
+            .map(|f| f.bounds())?;
+        let finite = |r: Rect| [r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite());
+        if !finite(frame) || !finite(all) || all.intersect(frame).area() > 0.0 {
+            return None;
+        }
+        Some(frame.center() - all.center())
+    }
+
+    /// Objects `ids` just pasted from another program (a picture, text)
+    /// while a clip frame's contents are edited go where the frame shows
+    /// them, in the step that pasted them, as copies made here do
+    /// (#2044): they came in at the page centre or where the other
+    /// program had them, and the frame cut them away whole.
+    pub(crate) fn bring_pasted_into_edited_frame(&mut self, ids: &[ShapeId]) {
+        let Some(all) = ids
+            .iter()
+            .filter_map(|id| self.doc().find_shape(*id))
+            .map(|s| s.bounds())
+            .reduce(|a, b| a.union(b))
+        else {
+            return;
+        };
+        let Some(d) = self.edited_frame_shift(all) else {
+            return;
+        };
+        let cmd = Command::TransformShapes {
+            shapes: ids.to_vec(),
+            transform: Affine::translate(d),
+        };
+        if let Err(e) = self.engine.amend(&cmd) {
+            self.status = e.to_string();
         }
     }
 
@@ -7002,13 +7247,13 @@ impl App {
         for g in groups {
             self.run(Command::Ungroup { group: g });
         }
+        let mut have: std::collections::HashSet<ShapeId> = members.iter().copied().collect();
         for id in self.added_top_level_ids(&before) {
-            if !members.contains(&id) {
+            if have.insert(id) {
                 members.push(id);
             }
         }
-        let doc = self.doc();
-        members.retain(|id| doc.find_shape(*id).is_some());
+        self.doc().retain_existing(&mut members);
         self.select(members);
     }
 
@@ -7109,8 +7354,10 @@ impl App {
 
     /// Something selected that Convert to Curves would change.
     pub fn can_convert_to_curves(&self) -> bool {
-        self.selected_shapes().iter().any(|s| {
-            s.converts_to_curves() || s.has_outline_warp() || crate::dimensions::is_dimension(s)
+        *self.from_selection("converts_to_curves", |shapes| {
+            shapes.iter().any(|s| {
+                s.converts_to_curves() || s.has_outline_warp() || crate::dimensions::is_dimension(s)
+            })
         })
     }
 
@@ -7651,6 +7898,7 @@ impl App {
             return;
         }
         let step = self.engine.last_step_id();
+        let at = self.page_index_now();
         let undone = match self.engine.undo() {
             Ok(l) => {
                 self.status = crate::i18n::trf("status.undo_n", &[("l", l)]);
@@ -7661,9 +7909,9 @@ impl App {
                 false
             }
         };
-        self.selection
-            .retain(|id| self.engine.document().find_shape(*id).is_some());
+        self.engine.document().retain_existing(&mut self.selection);
         if undone {
+            self.settle_page_after_history(at);
             self.clip_edit_across(step, true);
             // A curve taken up by an earlier undo goes; undoing a Pen or
             // Bezier step takes its curve up again (#631). A curve being
@@ -7691,6 +7939,7 @@ impl App {
         if self.redo_selection_step() {
             return;
         }
+        let at = self.page_index_now();
         let redone = match self.engine.redo() {
             Ok(l) => {
                 self.status = crate::i18n::trf("status.redo_n", &[("l", l)]);
@@ -7701,9 +7950,9 @@ impl App {
                 false
             }
         };
-        self.selection
-            .retain(|id| self.engine.document().find_shape(*id).is_some());
+        self.engine.document().retain_existing(&mut self.selection);
         if redone {
+            self.settle_page_after_history(at);
             self.clip_edit_across(self.engine.last_step_id(), false);
             if self.curve.as_ref().is_some_and(|c| c.resumed) {
                 self.curve = None;
@@ -7712,6 +7961,34 @@ impl App {
                 self.resume_pen_step(self.engine.last_step_id(), false);
             }
         }
+    }
+
+    /// Where the current page stands among the drawing's pages.
+    fn page_index_now(&self) -> usize {
+        self.doc()
+            .pages
+            .iter()
+            .position(|p| p.id == self.page)
+            .unwrap_or(0)
+    }
+
+    /// After Undo or Redo: when the step took away the page shown (Undo
+    /// of Insert Page, Redo of Delete Page), the page now at its place
+    /// becomes current, the last one past the end. The view stayed on a
+    /// page that no longer existed, blank, and nothing drawn there was
+    /// made.
+    fn settle_page_after_history(&mut self, at: usize) {
+        if self.doc().page(self.page).is_ok() {
+            return;
+        }
+        let n = self.doc().pages.len();
+        if n == 0 {
+            return;
+        }
+        let idx = at.min(n - 1);
+        self.page = self.doc().pages[idx].id;
+        self.selection.clear();
+        self.fit_pending = true;
     }
 
     // ----- files -------------------------------------------------------------
@@ -8760,12 +9037,14 @@ impl App {
         out
     }
 
-    /// The file name of a drawing's auto-backup in the folder: in a
-    /// browser inside the session's own folder, so two tabs never write
-    /// over each other's.
+    /// The file name of a drawing's auto-backup in the folder: inside the
+    /// session's own folder, so two tabs or two TraceDraws running at
+    /// once never write over each other's backups (both had
+    /// `AutoBackup_of_Untitled-1.tdraw`, and the one that closed cleanly
+    /// deleted the other's).
     fn backup_file(&self, slot: Option<usize>) -> String {
         let name = self.backup_name(slot);
-        match self.session.as_ref().filter(|_| crate::files::WEB) {
+        match self.session.as_ref() {
             Some(s) => format!("{}/{name}", s.id()),
             None => name,
         }
@@ -8950,6 +9229,14 @@ impl App {
         for path in &opened {
             let _ = crate::files::remove(path);
         }
+        for (f, path) in found
+            .iter()
+            .flat_map(|f| f.backups.iter().map(move |b| (f, b)))
+        {
+            if let Some(dir) = f.marker.parent() {
+                crate::recovery::remove_empty_folders(path, dir);
+            }
+        }
         crate::recovery::dismiss(found, false);
     }
 
@@ -9086,10 +9373,27 @@ impl App {
     /// `AutoBackup_of_<drawing name>.tdraw` for the active drawing (`None`)
     /// or another open one.
     fn backup_name(&self, slot: Option<usize>) -> String {
-        let title = match slot {
-            None => self.drawing_title(self.active_doc),
-            Some(i) => self.drawing_title(i),
-        };
+        let i = slot.unwrap_or(self.active_doc);
+        let stem = self.backup_stem(i);
+        // Two drawings of the same name (files of one name in two
+        // folders, `logo.tdraw` beside `logo.cdr`) get a backup each: the
+        // later ones are numbered.
+        let key = stem.to_lowercase();
+        let earlier = self
+            .dirty_documents()
+            .into_iter()
+            .filter(|&j| j < i && self.backup_stem(j).to_lowercase() == key)
+            .count();
+        if earlier == 0 {
+            format!("AutoBackup_of_{stem}.tdraw")
+        } else {
+            format!("AutoBackup_of_{stem} ({}).tdraw", earlier + 1)
+        }
+    }
+
+    /// The name drawing `i`'s auto-backup is called after.
+    fn backup_stem(&self, i: usize) -> String {
+        let title = self.drawing_title(i);
         // The name in its own script, accents and vowel marks included
         // (the tab of a recovered drawing shows it again); only what no
         // file name can hold changes, the same on every system.
@@ -9103,7 +9407,7 @@ impl App {
         )
         .trim_start_matches('.')
         .to_string();
-        format!("AutoBackup_of_{stem}.tdraw")
+        stem
     }
 
     /// Ctrl+8 and Ctrl+2: the selected text (or the text being edited)
@@ -9182,6 +9486,11 @@ impl App {
         st.remember = true;
         st.target = None;
         st.dont_show = self.settings.formats.skip_export_dialog;
+        // Selected only from the start, when the options say so and
+        // something is selected (#3208).
+        if self.settings.formats.export_selected_only && !self.selection.is_empty() {
+            st.selection_only = true;
+        }
         let skip = self.settings.formats.skip_export_dialog && !show_options;
         if EXPORT_FILE_FIRST {
             choose_export_file(self, st, skip);
@@ -9668,7 +9977,12 @@ impl App {
             return;
         }
         let library = is_symbol_library_path(&path);
-        self.import_document_with(Self::open_cdr(&path).map(|(doc, _)| doc), library);
+        let read = Self::open_cdr(&path).map(|(doc, _)| doc);
+        let carried = read.as_ref().ok().map(|d| d.cmyk_profile.clone());
+        self.import_document_with(read, library);
+        if let Some(carried) = carried {
+            self.warn_import_profile(carried.as_ref());
+        }
         if library {
             self.open_docker(DockerTab::Symbols);
         }
@@ -10337,18 +10651,30 @@ impl App {
     }
 
     /// The document navigator's insert buttons: a page like the current
-    /// one, before or after it, made current.
+    /// one, before or after it, made current, in one undo step.
     pub fn insert_page(&mut self, after: bool) {
         let idx = self.page_index();
         let size = self.page_size();
-        self.run(self.localized_page(size));
-        let Some(new) = self.doc().pages.last().map(|p| p.id) else {
+        let Command::AddPage { name, size, layer } = self.localized_page(size) else {
             return;
         };
-        let to = if after { idx + 1 } else { idx };
-        if to + 1 < self.doc().pages.len() {
-            self.run(Command::MovePage { page: new, to });
-        }
+        let old: Vec<PageId> = self.doc().pages.iter().map(|p| p.id).collect();
+        self.run(Command::InsertPage {
+            at: if after { idx + 1 } else { idx },
+            name,
+            size,
+            layer,
+            shapes: Vec::new(),
+        });
+        let Some(new) = self
+            .doc()
+            .pages
+            .iter()
+            .map(|p| p.id)
+            .find(|id| !old.contains(id))
+        else {
+            return;
+        };
         self.page = new;
         self.selection.clear();
         self.fit_pending = true;
@@ -10359,20 +10685,114 @@ impl App {
     pub fn duplicate_page(&mut self, before: bool, contents: bool) {
         let page = self.page;
         let old: Vec<_> = self.doc().pages.iter().map(|p| p.id).collect();
+        let originals = self.page_shapes(page);
+        let revision = self.engine.revision();
         self.run(Command::DuplicatePage {
             page,
             before,
             contents,
         });
         let new = self.doc().pages.iter().position(|p| !old.contains(&p.id));
+        if let Some(i) = new.filter(|_| contents && self.engine.revision() != revision) {
+            let id = self.doc().pages[i].id;
+            let cmds = self.relink_page_copies(&originals, &self.page_shapes(id));
+            if !cmds.is_empty() {
+                if let Err(e) = self.engine.amend_batch("Duplicate Page", &cmds) {
+                    self.status = e.to_string();
+                }
+            }
+        }
         if let Some(i) = new {
             self.goto_page(i);
         }
     }
 
+    /// The objects on the layers of `page`, bottom layer first.
+    fn page_shapes(&self, page: PageId) -> Vec<Shape> {
+        self.doc()
+            .page(page)
+            .map(|p| {
+                p.layers
+                    .iter()
+                    .flat_map(|l| l.shapes.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The commands that make the objects of a duplicated page `copies`
+    /// (made of `originals`, member by member) link among themselves: a
+    /// copied chain of linked text frames is a chain of the copies and a
+    /// copied blend ends at the copy of its end object. They named the
+    /// original page's objects, so the copied frames ran on into the
+    /// original chain and a copied blend drew its steps to the original
+    /// end object.
+    fn relink_page_copies(&self, originals: &[Shape], copies: &[Shape]) -> Vec<Command> {
+        fn strip(s: &mut Shape) {
+            crate::textflow::without_links(&mut s.data);
+            match &mut s.kind {
+                ShapeKind::Group { children } => children.iter_mut().for_each(strip),
+                ShapeKind::ClipFrame { frame, contents } => {
+                    strip(frame);
+                    contents.iter_mut().for_each(strip);
+                }
+                _ => {}
+            }
+        }
+        fn changes(was: &Shape, now: &Shape, out: &mut Vec<Command>) {
+            if was.data != now.data {
+                out.push(Command::SetObjectData {
+                    shape: now.id,
+                    data: now.data.clone(),
+                });
+            }
+            if was.effects != now.effects {
+                out.push(Command::SetEffects {
+                    shape: now.id,
+                    effects: now.effects.clone(),
+                });
+            }
+            match (&was.kind, &now.kind) {
+                (ShapeKind::Group { children: a }, ShapeKind::Group { children: b }) => {
+                    a.iter().zip(b).for_each(|(x, y)| changes(x, y, out));
+                }
+                (
+                    ShapeKind::ClipFrame {
+                        frame: fa,
+                        contents: a,
+                    },
+                    ShapeKind::ClipFrame {
+                        frame: fb,
+                        contents: b,
+                    },
+                ) => {
+                    changes(fa, fb, out);
+                    a.iter().zip(b).for_each(|(x, y)| changes(x, y, out));
+                }
+                _ => {}
+            }
+        }
+        if originals.len() != copies.len() {
+            return Vec::new();
+        }
+        let mut fixed = copies.to_vec();
+        fixed.iter_mut().for_each(strip);
+        crate::textflow::relink_copies(originals, &mut fixed);
+        let mut out = Vec::new();
+        for (was, now) in copies.iter().zip(&fixed) {
+            changes(was, now, &mut out);
+        }
+        out
+    }
+
     pub fn delete_page(&mut self) {
         let page = self.page;
+        let flow = self.flow_around_deleted_pages(&[page]);
+        let revision = self.engine.revision();
         self.run(Command::DeletePage { page });
+        if self.engine.revision() != revision {
+            self.amend_flow("Delete Page", flow);
+        }
         if let Some(p) = self.doc().pages.first() {
             self.page = p.id;
         }
@@ -10394,10 +10814,12 @@ impl App {
             .iter()
             .map(|&page| Command::DeletePage { page })
             .collect();
+        let flow = self.flow_around_deleted_pages(&ids[a..=b]);
         if let Err(e) = self.engine.run_batch("Delete Page", &cmds) {
             self.status = e.to_string();
             return;
         }
+        self.amend_flow("Delete Page", flow);
         self.renumber_default_pages();
         let next = ids
             .get(b + 1)
@@ -10407,6 +10829,34 @@ impl App {
         }
         self.selection.clear();
         self.fit_pending = true;
+    }
+
+    /// The commands that keep the text of linked frame chains running
+    /// through the pages `pages` when they are deleted: the frames left
+    /// take it, as when the frames themselves are deleted (#1986). The
+    /// text the deleted frames showed was lost with the page.
+    pub(crate) fn flow_around_deleted_pages(&self, pages: &[PageId]) -> Vec<Command> {
+        let ids: Vec<ShapeId> = pages
+            .iter()
+            .flat_map(|p| self.page_shapes(*p))
+            .map(|s| s.id)
+            .collect();
+        self.flow_around_deleted(&ids)
+    }
+
+    /// Run `flow` (from [`Self::flow_around_deleted`]) in the step just
+    /// made.
+    pub(crate) fn amend_flow(&mut self, label: &'static str, flow: Vec<Command>) {
+        if flow.is_empty() {
+            return;
+        }
+        if let Err(e) = self.engine.amend_batch(label, &flow) {
+            self.status = e.to_string();
+            return;
+        }
+        if let Some(rec) = &mut self.recording {
+            rec.extend(flow);
+        }
     }
 
     /// Page > Delete Page asks which pages, the current one first.
@@ -10468,6 +10918,23 @@ impl App {
 
 /// Give a copied shape (and any children) fresh ids.
 /// Re-number a shape tree with fresh engine ids (for other modules).
+/// Whether `title` is a name a new drawing gets by itself ("Untitled",
+/// or the numbered name of `doc.untitled_n` in the interface language),
+/// not one the drawing was given.
+fn is_untitled_name(title: &str) -> bool {
+    if title == "Untitled" {
+        return true;
+    }
+    let pattern = crate::i18n::trf("doc.untitled_n", &[("n", "\u{0}")]);
+    let Some((before, after)) = pattern.split_once('\u{0}') else {
+        return false;
+    };
+    title
+        .strip_prefix(before)
+        .and_then(|rest| rest.strip_suffix(after))
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
 pub fn reid_pub(s: Shape, id: ShapeId, engine: &mut Engine) -> Shape {
     reid(s, id, engine)
 }
@@ -11279,6 +11746,59 @@ mod tests {
         assert!(near(t(&app, g), t(&app, f)));
     }
 
+    /// The name an export starts with: the drawing's file, else the
+    /// `.cdr` it was opened from (it has no file of its own until saved),
+    /// else its title, else Graphic1 (#3254, #3208).
+    #[test]
+    fn exports_are_named_after_the_drawing_or_the_file_it_came_from() {
+        let mut app = App::headless();
+        app.file = None;
+        app.opened_from = None;
+        app.run(Command::SetTitle {
+            title: String::new(),
+        });
+        assert_eq!(app.export_stem(), "Graphic1");
+        let auto = App::untitled_name();
+        app.run(Command::SetTitle { title: auto });
+        assert_eq!(app.export_stem(), "Graphic1", "a new drawing's own name");
+        app.run(Command::SetTitle {
+            title: "Poster".into(),
+        });
+        assert_eq!(app.export_stem(), "Poster");
+        app.opened_from = Some(PathBuf::from("/work/MyDesign.cdr"));
+        assert_eq!(app.export_stem(), "MyDesign");
+        app.file = Some(PathBuf::from("/work/Saved as.tdraw"));
+        assert_eq!(app.export_stem(), "Saved as");
+        // Selected only from the start when the options say so and there
+        // is a selection.
+        app.settings.formats.export_selected_only = true;
+        app.settings.formats.skip_export_dialog = false;
+        app.export_with_options();
+        if let crate::ui::dialogs::Dialog::Export(st) = &app.dialog {
+            assert!(!st.selection_only, "nothing selected");
+        }
+        app.dialog = crate::ui::dialogs::Dialog::None;
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![id]);
+        let _ = crate::files::test_save::asked();
+        app.export_with_options();
+        if let crate::ui::dialogs::Dialog::Export(st) = &app.dialog {
+            assert!(st.selection_only);
+        } else {
+            // The Save dialog comes first on the desktop; its answer opens
+            // the options, which start with Selected only.
+            let asked = crate::files::test_save::asked();
+            assert_eq!(asked.len(), 1);
+            assert_eq!(asked[0].file_name(), Some("Saved as.svg"));
+        }
+    }
+
     /// A deselect by accident: Undo right after it selects the copies of
     /// the last Duplicate again and the next Duplicate repeats the step
     /// again; no change of the drawing is undone. With a change made
@@ -11924,6 +12444,43 @@ mod tests {
         assert_eq!(app.page, ids[2], "the page before them");
     }
 
+    /// Undo of Insert Page while the new page is shown, and Redo of
+    /// Delete Page: the page now at its place is current, so drawing goes
+    /// on. The view stayed on the page taken away, and a rectangle drawn
+    /// there was never made.
+    #[test]
+    fn undo_of_the_page_shown_moves_to_a_page_that_is_there() {
+        let mut app = App::headless();
+        app.add_page();
+        app.add_page();
+        let ids: Vec<_> = app.doc().pages.iter().map(|p| p.id).collect();
+        assert_eq!(app.page, ids[2]);
+        app.undo();
+        assert_eq!(app.page, ids[1], "the last page left");
+        let rect = ShapeKind::Rect {
+            rect: Rect::new(10.0, 10.0, 60.0, 40.0),
+            radius: 0.0,
+            corners: None,
+        };
+        let id = app.new_shape(rect.clone()).expect("drawn on the page shown");
+        let page = app.doc().page(ids[1]).expect("page");
+        assert!(page
+            .layers
+            .iter()
+            .any(|l| l.shapes.iter().any(|s| s.id == id)));
+        // Redo of Delete Page from the page after it.
+        app.add_page();
+        let ids: Vec<_> = app.doc().pages.iter().map(|p| p.id).collect();
+        app.goto_page(1);
+        app.delete_pages(1, 1);
+        app.undo();
+        app.goto_page(1);
+        assert_eq!(app.page, ids[1]);
+        app.redo();
+        assert_eq!(app.page, ids[2], "the page now in its place");
+        assert!(app.new_shape(rect).is_some());
+    }
+
     /// A font for new text that is not installed (uninstalled since it
     /// was kept) gives way to an installed one; an installed one stays,
     /// whatever its case (#504).
@@ -11943,6 +12500,65 @@ mod tests {
         app.text_default_font = "Gone".into();
         app.keep_default_font_installed();
         assert_eq!(app.text_default_font, "Georgia");
+    }
+
+    /// The bars of the Brush Strokes, Speech Balloon, Action Lines and
+    /// Painterly Brush tools went back to a first start's settings at
+    /// every start, while the other tools kept theirs: they are kept now,
+    /// through the preferences file and an export of them.
+    #[test]
+    fn brush_strokes_balloon_action_lines_and_painterly_survive_a_restart() {
+        use crate::balloons::BalloonStyle;
+        use crate::media::MediaMode;
+        let mut app = App::headless();
+        app.media_mode = MediaMode::Sprayer;
+        app.media_preset = 2;
+        app.media_width = 7.5;
+        app.media_angle = 30.0;
+        app.media_spacing = 12.0;
+        app.media_pressure = 0.8;
+        app.media_smoothing = 60.0;
+        app.balloon_style = BalloonStyle::Shout;
+        app.balloon_width = 55.0;
+        app.balloon_bend = -40.0;
+        app.action_lines.count = 40;
+        app.action_lines.radial = true;
+        app.action_lines.width = 1.5;
+        app.action_lines.taper = crate::action_lines::Taper::default();
+        app.action_lines.seed = 7;
+        app.painterly.size = 12.0;
+        app.painterly.brush = tracedraw_core::painterly::Painterly::new(
+            tracedraw_core::painterly::PainterlyBrush::Fur,
+        );
+        app.sync_settings();
+        // Written and read back as the preferences file is.
+        let text = serde_json::to_string(&app.settings).expect("saved");
+        let read: crate::settings::Settings = serde_json::from_str(&text).expect("read");
+        let mut next = App::headless();
+        next.apply_settings(read.upgrade());
+        assert_eq!(next.media_mode, MediaMode::Sprayer);
+        assert_eq!(next.media_preset, 2);
+        assert_eq!(next.media_width, 7.5);
+        assert_eq!(next.media_angle, 30.0);
+        assert_eq!(next.media_spacing, 12.0);
+        assert_eq!(next.media_pressure, 0.8);
+        assert_eq!(next.media_smoothing, 60.0);
+        assert_eq!(next.balloon_style, BalloonStyle::Shout);
+        assert_eq!(next.balloon_width, 55.0);
+        assert_eq!(next.balloon_bend, -40.0);
+        assert_eq!(next.action_lines, app.action_lines);
+        assert_eq!(next.painterly, app.painterly);
+        // A file edited by hand is brought into the bars' ranges.
+        let mut odd = crate::settings::ToolPrefs::default();
+        odd.media.width = 1e9;
+        odd.balloon.width = -3.0;
+        odd.action_lines.count = 0;
+        odd.painterly.size = f64::NAN;
+        next.apply_tool_prefs(&odd);
+        assert_eq!(next.media_width, 50.0);
+        assert_eq!(next.balloon_width, 5.0);
+        assert_eq!(next.action_lines.count, 2);
+        assert_eq!(next.painterly.size, 5.0);
     }
 
     #[test]
@@ -12049,6 +12665,52 @@ mod tests {
             old.snap.dynamic,
             crate::live_guides::DynamicOptions::default()
         );
+    }
+
+    /// The Common Shapes tool's shape, the eyedroppers' groups and sample
+    /// box, the Free Transform mode, the Shape tool's freehand marquee and
+    /// the Blend tool's rotation and acceleration went back to a first
+    /// start's at every start: they are kept now.
+    #[test]
+    fn common_shapes_eyedropper_free_transform_and_blend_choices_survive_a_restart() {
+        let mut app = App::headless();
+        app.common_shape = crate::tools2::CommonShape::ALL[3];
+        app.my_shape = Some(42);
+        app.eyedropper_groups.size = true;
+        app.eyedropper_groups.fill = false;
+        app.eyedropper_sample = 5;
+        app.free_transform_mode = FreeTransformMode::Skew;
+        app.node_lasso = true;
+        app.node_lasso_keeps = true;
+        app.blend_rotation = 90.0;
+        app.blend_accel_objects = 0.4;
+        app.blend_accel_colors = -0.3;
+        app.sync_settings();
+        let text = serde_json::to_string(&app.settings).expect("saved");
+        let read: crate::settings::Settings = serde_json::from_str(&text).expect("read");
+        let mut next = App::headless();
+        next.apply_settings(read.upgrade());
+        assert_eq!(next.common_shape, crate::tools2::CommonShape::ALL[3]);
+        assert_eq!(next.my_shape, Some(42));
+        assert_eq!(next.eyedropper_groups, app.eyedropper_groups);
+        assert_eq!(next.eyedropper_sample, 5);
+        assert_eq!(next.free_transform_mode, FreeTransformMode::Skew);
+        assert!(next.node_lasso && next.node_lasso_keeps);
+        assert_eq!(next.blend_rotation, 90.0);
+        assert_eq!(next.blend_accel_objects, 0.4);
+        assert_eq!(next.blend_accel_colors, -0.3);
+        // A file edited by hand: an unknown shape keeps the current one,
+        // and values outside the bars come back into them.
+        let mut odd = next.tool_prefs();
+        odd.common_shape = "no.such.shape".into();
+        odd.eyedropper_sample = 3;
+        odd.blend_accel_objects = 7.0;
+        odd.blend_rotation = f64::NAN;
+        next.apply_tool_prefs(&odd);
+        assert_eq!(next.common_shape, crate::tools2::CommonShape::ALL[3]);
+        assert_eq!(next.eyedropper_sample, 1);
+        assert_eq!(next.blend_accel_objects, 1.0);
+        assert_eq!(next.blend_rotation, 0.0);
     }
 
     /// The preferences are saved when something changed, not every
@@ -12537,6 +13199,102 @@ mod tests {
         assert!(!backup.exists());
         assert!(app.session.as_ref().expect("session").backups().is_empty());
         app.end_session();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two TraceDraws running at once with one auto-backup folder keep
+    /// their own backups: each one's first new drawing is Untitled-1, and
+    /// both backed it up as `AutoBackup_of_Untitled-1.tdraw`, so the
+    /// second overwrote the first's and the first, closing cleanly,
+    /// deleted the backup the second counted on.
+    #[test]
+    fn two_programs_at_once_keep_their_own_backups() {
+        let dir = std::env::temp_dir().join(format!("tracedraw-two-{}", crate::recovery::new_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = crate::recovery::now_secs();
+        let start = |dir: &std::path::Path| {
+            let mut app = App::headless();
+            app.settings.backup.auto_dir = Some(dir.to_path_buf());
+            app.session_tick(now);
+            app
+        };
+        let mut a = start(&dir);
+        let mut b = start(&dir);
+        assert_eq!(a.drawing_title(a.active_doc), b.drawing_title(b.active_doc));
+        rect_shape(&mut a, Rect::new(0.0, 0.0, 10.0, 10.0), true);
+        rect_shape(&mut b, Rect::new(0.0, 0.0, 20.0, 10.0), true);
+        rect_shape(&mut b, Rect::new(0.0, 0.0, 30.0, 10.0), true);
+        assert!(a.backup_now() && b.backup_now());
+        // The first closes cleanly; the second then ends without closing.
+        a.end_session();
+        let found = crate::recovery::find(&dir, now + crate::recovery::STALE_SECS + 10, None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].backups.len(), 1, "the second's backup is there");
+        let mut next = start(&dir);
+        next.recover(&found);
+        assert_eq!(
+            next.doc().pages[0].layers[0].shapes.len(),
+            2,
+            "the second's drawing"
+        );
+        // Nothing is left behind, not even the sessions' folders.
+        drop(b);
+        next.end_session();
+        assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two open drawings of the same name get an auto-backup each: they
+    /// shared one, so only the drawing backed up last came back.
+    #[test]
+    fn two_drawings_of_one_name_get_a_backup_each() {
+        let dir =
+            std::env::temp_dir().join(format!("tracedraw-same-{}", crate::recovery::new_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = crate::recovery::now_secs();
+        let mut app = App::headless();
+        app.settings.backup.auto_dir = Some(dir.clone());
+        app.session_tick(now);
+        for (folder, w) in [("one", 10.0), ("two", 20.0)] {
+            let file = std::path::PathBuf::from(format!("/nowhere/{folder}/logo.tdraw"));
+            app.open_document(tracedraw_core::Document::default(), Some(file));
+            rect_shape(&mut app, Rect::new(0.0, 0.0, w, 10.0), true);
+        }
+        assert!(app.backup_now());
+        let mut names: Vec<String> = app
+            .session
+            .as_ref()
+            .expect("session")
+            .backups()
+            .iter()
+            .map(|b| b.rsplit('/').next().unwrap_or(b).to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["AutoBackup_of_logo (2).tdraw", "AutoBackup_of_logo.tdraw"]
+        );
+        app.leave_session();
+        let found = crate::recovery::find(&dir, now + 1, None);
+        assert_eq!(found.iter().map(|f| f.backups.len()).sum::<usize>(), 2);
+        let mut next = App::headless();
+        next.settings.backup.auto_dir = Some(dir.clone());
+        next.recover(&found);
+        let mut widths: Vec<f64> = next
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, _)| next.tab_engine(i))
+            .filter_map(|e| {
+                e.document().pages[0].layers[0]
+                    .shapes
+                    .first()
+                    .map(|s| s.page_path())
+            })
+            .map(|p| tracedraw_core::geometry::Shape::bounding_box(&p).width())
+            .collect();
+        widths.sort_by(f64::total_cmp);
+        assert_eq!(widths, vec![10.0, 20.0], "both drawings came back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

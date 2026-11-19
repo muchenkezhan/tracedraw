@@ -1475,6 +1475,8 @@ pub enum Dialog {
     ConvertColors(crate::ui::convert_colors::ConvertColorsState),
     /// Tools > Recolor.
     Recolor(crate::ui::recolor::RecolorState),
+    /// Tools > Replace Color (#2858).
+    ReplaceColor(crate::ui::replace_color::ReplaceColorState),
     FontManager(FontManagerState),
     /// Launch > TraceCut, Tools > TraceCut.
     TraceCut(Box<crate::tracecut::TraceCutState>),
@@ -1649,11 +1651,24 @@ fn convert_fields(app: &App, ui: &mut Ui, o: &mut crate::bitmap_modes::ConvertOp
             "dialog.anti_aliasing",
             "dialog.convert_anti_alias_desc",
         ));
-    ui.checkbox(&mut o.transparent, tr("dialog.transparent_background"))
-        .rich_tip(crate::ui::tips::pair(
-            "dialog.transparent_background",
-            "dialog.convert_transparent_desc",
-        ));
+    // Black and white is 1-bit and has no alpha: the box shows off and
+    // can't be ticked (#3204).
+    let tip = crate::ui::tips::pair(
+        "dialog.transparent_background",
+        "dialog.convert_transparent_desc",
+    );
+    let can_see_through = o.mode != ConvertMode::BlackWhite;
+    let mut shown = o.keeps_transparency();
+    let r = ui
+        .add_enabled(
+            can_see_through,
+            egui::Checkbox::new(&mut shown, tr("dialog.transparent_background")),
+        )
+        .rich_tip(&tip)
+        .rich_disabled_tip(&tip);
+    if can_see_through && r.changed() {
+        o.transparent = shown;
+    }
     // The size of the bitmap made: drop shadows and outlines count (#2351).
     if let Some(b) = app.convert_to_bitmap_area() {
         let w = (b.width() / 25.4 * o.dpi).ceil().max(1.0) as u64;
@@ -3394,6 +3409,7 @@ pub fn show(app: &mut App, ctx: &Context) {
         Dialog::BorderGrommet(st) => border_grommet_dialog(app, ctx, st, &mut close),
         Dialog::ConvertColors(st) => crate::ui::convert_colors::dialog(app, ctx, st, &mut close),
         Dialog::Recolor(st) => crate::ui::recolor::dialog(app, ctx, st, &mut close),
+        Dialog::ReplaceColor(st) => crate::ui::replace_color::dialog(app, ctx, st, &mut close),
         Dialog::ColorManagement(st) => {
             crate::ui::color_management::dialog(app, ctx, st, &mut close)
         }
@@ -4536,11 +4552,7 @@ pub fn export_format_of(path: &std::path::Path) -> Option<usize> {
 /// exported to last, else the drawing's own (#1817).
 fn export_save_dialog(app: &App, st: &ExportState) -> crate::files::Dialog {
     let (name, ext) = EXPORT_FORMATS[st.format.min(EXPORT_FORMATS.len() - 1)];
-    let stem = app
-        .file
-        .as_ref()
-        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "Graphic1".into());
+    let stem = app.export_stem();
     let mut dialog = crate::files::Dialog::new().add_filter(name, &export_extensions(ext));
     for (other, e) in EXPORT_FORMATS.iter() {
         if *e != ext {
@@ -5208,11 +5220,30 @@ fn export_dialog(app: &mut App, ctx: &Context, st: &mut ExportState, close: &mut
                 if !scripted && EXPORT_FORMATS[st.format.min(EXPORT_FORMATS.len() - 1)].1 == "plt" {
                     plt_export_fields(ui, st);
                 }
-                ui.checkbox(&mut st.selection_only, tr("dialog.selected_only"))
-                    .rich_tip(crate::ui::tips::pair(
-                        "dialog.selected_only",
-                        "dialog.export_selected_desc",
-                    ));
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut st.selection_only, tr("dialog.selected_only"))
+                        .rich_tip(crate::ui::tips::pair(
+                            "dialog.selected_only",
+                            "dialog.export_selected_desc",
+                        ));
+                    // Selected only from the start of every export with
+                    // objects selected (#3208).
+                    let mut always = app.settings.formats.export_selected_only;
+                    if ui
+                        .checkbox(&mut always, tr("dialog.selected_only_default"))
+                        .rich_tip(crate::ui::tips::pair(
+                            "dialog.selected_only_default",
+                            "dialog.selected_only_default_tip",
+                        ))
+                        .changed()
+                    {
+                        app.settings.formats.export_selected_only = always;
+                        if always {
+                            st.selection_only = true;
+                        }
+                        app.settings.save();
+                    }
+                });
                 if !st.selection_only {
                     export_range_fields(app, ui, st);
                 }
@@ -5372,11 +5403,7 @@ pub fn export_dialog_ok(app: &mut App, st: &ExportState) {
             write(app, path, st);
             return;
         }
-        let stem = app
-            .file
-            .as_ref()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "Graphic1".into());
+        let stem = app.export_stem();
         let ext = exts.first().cloned().unwrap_or_default();
         let patterns: Vec<&str> = exts.iter().map(String::as_str).collect();
         let st2 = st.clone();
@@ -9697,6 +9724,29 @@ pub(crate) mod tests {
             target_tree: egui::accesskit::TreeId::ROOT,
             data: None,
         })
+    }
+
+    /// Help > Benchmark: Options opens the Options window at the page with
+    /// hardware acceleration, instead of the Benchmark window putting
+    /// itself back over it (#3351).
+    #[test]
+    fn benchmark_options_opens_the_options_window() {
+        use egui::accesskit::Role;
+        let mut app = App::headless();
+        let ctx = crate::theme::ui_context();
+        app.dialog = Dialog::Benchmark;
+        frame_widgets(&ctx, &mut app, Vec::new());
+        let w = frame_widgets(&ctx, &mut app, Vec::new());
+        let options = tr("menu.tools.options");
+        let (_, _, enabled, id) = w
+            .iter()
+            .find(|(r, l, _, _)| *r == Role::Button && *l == options)
+            .cloned()
+            .expect("an Options button");
+        assert!(enabled);
+        frame_widgets(&ctx, &mut app, vec![click(id)]);
+        assert!(matches!(app.dialog, Dialog::Options), "{:?}", app.dialog);
+        assert_eq!(app.options_page, OptionsPage::General);
     }
 
     /// The update progress dialog: a progress bar and Cancel while the

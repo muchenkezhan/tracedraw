@@ -51,7 +51,10 @@ pub fn without_links(data: &mut Vec<(String, String)>) {
 /// with the same structure (groups and clip frames copied member by
 /// member, in order): a link to a frame copied along points to its copy,
 /// so a chain copied whole stays a chain of the copies; a link to any
-/// other frame stays out.
+/// other frame stays out. A blend whose end object was copied along ends
+/// at that copy: it still named the original's end, so a pasted or
+/// duplicated blend drew its steps back to the original, and in another
+/// drawing to whatever object had that number there.
 pub fn relink_copies(originals: &[Shape], copies: &mut [Shape]) {
     fn map_ids(o: &Shape, c: &Shape, map: &mut HashMap<ShapeId, ShapeId>) {
         map.insert(o.id, c.id);
@@ -83,6 +86,16 @@ pub fn relink_copies(originals: &[Shape], copies: &mut [Shape]) {
         for key in [NEXT, PREV] {
             if let Some(to) = data_id(&o.data, key).and_then(|id| map.get(&id)) {
                 c.data = with_key(std::mem::take(&mut c.data), key, Some(*to));
+            }
+        }
+        for e in &mut c.effects {
+            if let tracedraw_core::live::Effect::Blend {
+                end_id: Some(end), ..
+            } = e
+            {
+                if let Some(to) = map.get(end) {
+                    *end = *to;
+                }
             }
         }
         match (&o.kind, &mut c.kind) {
@@ -1051,6 +1064,87 @@ mod tests {
         assert_eq!(text_of(&app, b), LONG);
         let shape = app.doc().find_shape(b).cloned().expect("frame");
         assert!(!app.text_overflows(&shape));
+    }
+
+    /// A page or a layer deleted with a frame of a chain on it leaves
+    /// the frame's text to the chain, as a deleted frame does: the text
+    /// the frame showed was lost with the page or the layer.
+    #[test]
+    fn deleting_a_page_or_layer_holding_a_frame_of_a_chain_keeps_its_text() {
+        use crate::ui::objects_docker::{delete_current, move_to_layer, new_layer};
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let ([a, b, c], [ta, tb, tc]) = chain_of_three(&mut app);
+        app.add_page();
+        let second = app.doc().pages[1].layers[0].id;
+        move_to_layer(&mut app, &[b], second);
+        assert_eq!(app.chain_of(a), vec![a, b, c]);
+        let kept = |app: &App| {
+            assert!(app.doc().find_shape(b).is_none());
+            assert_eq!(app.chain_of(a), vec![a, c]);
+            assert_eq!(text_of(app, a), ta);
+            assert_eq!(text_of(app, c), format!("{tb}{tc}"));
+        };
+        let back = |app: &mut App| {
+            app.undo();
+            assert_eq!(app.chain_of(a), vec![a, b, c]);
+            assert_eq!(text_of(app, b), tb);
+            assert_eq!(text_of(app, c), tc);
+        };
+        // The page tab's Delete, on the second page.
+        app.goto_page(1);
+        app.delete_page();
+        kept(&app);
+        back(&mut app);
+        // Page > Delete Page.
+        app.delete_pages(1, 1);
+        kept(&app);
+        back(&mut app);
+        // The frame's layer deleted in the Objects docker.
+        app.goto_page(0);
+        new_layer(&mut app);
+        let layer = app.doc().pages[0]
+            .layers
+            .last()
+            .map(|l| l.id)
+            .expect("layer");
+        move_to_layer(&mut app, &[b], layer);
+        app.select(vec![]);
+        app.picked_layer = Some(layer);
+        delete_current(&mut app);
+        assert!(app.doc().layer(layer).is_err(), "the layer is gone");
+        kept(&app);
+        back(&mut app);
+    }
+
+    /// A page duplicated with its contents: its copied chain of frames is
+    /// a chain of the copies, the original chain as it was. The copied
+    /// frames named the original frames, so the copies ran on into the
+    /// original chain.
+    #[test]
+    fn a_duplicated_page_keeps_its_copied_chain_to_itself() {
+        tracedraw_text::install();
+        let mut app = App::headless();
+        let ([a, b, c], texts) = chain_of_three(&mut app);
+        let steps = app.engine.history_labels().0.len();
+        app.duplicate_page(false, true);
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+        assert_eq!(app.chain_of(a), vec![a, b, c], "the original chain");
+        let copies: Vec<ShapeId> = app.doc().pages[1].layers[0]
+            .shapes
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(copies.len(), 3);
+        assert_eq!(app.chain_of(copies[0]), copies, "a chain of the copies");
+        let copied: Vec<String> = copies.iter().map(|id| text_of(&app, *id)).collect();
+        assert_eq!(copied, texts.to_vec());
+        for id in &copies {
+            assert_eq!(app.chain_head(*id), copies[0]);
+        }
+        app.undo();
+        assert_eq!(app.doc().pages.len(), 1);
+        assert_eq!(app.chain_of(a), vec![a, b, c]);
     }
 
     /// Cut takes a frame of a chain out the same way: the text stays
