@@ -1003,6 +1003,7 @@ fn handle_modifiers_shape_the_scale() {
             grab: tracedraw_core::geometry::Vec2::ZERO,
             mods,
             snapped: (false, false),
+            start_geometry: None,
         })
         .expect("transform")
     };
@@ -1323,6 +1324,7 @@ fn the_status_bar_tells_how_far_how_much_and_what_angle() {
         grab: tracedraw_core::geometry::Vec2::ZERO,
         mods: HandleMods::default(),
         snapped: (false, false),
+        start_geometry: None,
     };
     let text = info(&app);
     assert!(text.contains("150.0") && text.contains("100.0"), "{text}");
@@ -7887,6 +7889,50 @@ fn space_ends_the_curve_of_every_line_tool() {
         assert!(app.curve.is_none(), "{tool:?}: the curve ended");
         assert!(shape_count(&app) > before, "{tool:?}: a line was made");
     }
+}
+
+/// Space ends a Freehand line of clicks where the pointer is, with a last
+/// node there (#3192): it ended at the last node clicked, leaving out the
+/// segment to the pointer.
+#[test]
+fn space_ends_a_freehand_line_at_the_pointer() {
+    let (ctx, mut app, _id) = setup();
+    app.snap.off = true;
+    app.set_tool(Tool::Freehand);
+    let view = app.view.clone();
+    let at = |x: f64, y: f64| view.to_screen(Point::new(x, y));
+    let before = shape_count(&app);
+    for p in [at(100.0, 100.0), at(160.0, 100.0)] {
+        click_at(&ctx, &mut app, p, Modifiers::NONE);
+        for _ in 0..20 {
+            frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+        }
+    }
+    let end = at(200.0, 140.0);
+    frame(&ctx, &mut app, vec![Event::PointerMoved(end)], Modifiers::NONE);
+    frame(
+        &ctx,
+        &mut app,
+        vec![key(egui::Key::Space, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert!(app.curve.is_none(), "the line ended");
+    assert_eq!(shape_count(&app), before + 1);
+    let s = app
+        .doc()
+        .find_shape(app.selection[0])
+        .expect("the line")
+        .clone();
+    let ShapeKind::Path { path, closed } = &s.kind else {
+        panic!("a curve: {:?}", s.kind);
+    };
+    assert!(!*closed, "an open line");
+    let page = s.transform * path.clone();
+    let nodes = tracedraw_core::nodes::nodes(&page);
+    assert_eq!(nodes.len(), 3, "a node at the pointer: {page:?}");
+    let last = nodes.last().expect("last").pos;
+    let want = view.to_page(end);
+    assert!((last - want).hypot() < 0.05, "{last:?} vs {want:?}");
 }
 
 #[test]
@@ -30007,4 +30053,39 @@ fn a_double_click_on_a_guideline_opens_the_guidelines_panel() {
     assert!(app.show_dockers);
     assert_eq!(app.docker_tab, crate::app::DockerTab::Guidelines);
     assert_eq!(app.guide_form_for, Some(0));
+}
+
+/// The Guidelines panel from the keyboard (#2883): after a double click
+/// on a guideline its position field has the focus with the value
+/// selected, so typing a number and Enter moves it; Alt+A adds a
+/// guideline at the fields' values and Alt+M modifies the selected one.
+#[test]
+fn the_guidelines_panel_works_from_the_keyboard() {
+    use tracedraw_core::document::Guide;
+    let (ctx, mut app, _id) = setup();
+    app.add_guide(Guide::horizontal(150.0));
+    app.show_dockers = false;
+    let on_h = app.view.to_screen(Point::new(100.0, 150.0));
+    double_click_at(&ctx, &mut app, on_h);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert!(!app.guide_focus_field, "the field took the focus");
+    frame(
+        &ctx,
+        &mut app,
+        vec![Event::Text("40".into()), key(egui::Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    frame(&ctx, &mut app, vec![key_up(egui::Key::Enter, Modifiers::NONE)], Modifiers::NONE);
+    let want = {
+        let mut f = app.guide_form;
+        f.y = 40.0 * app.units.world_mm();
+        f.line(&app)
+    };
+    assert_eq!(app.page_guides().len(), 1);
+    assert_eq!(app.page_guides()[0].line, want, "typed over, not added to");
+    // Alt+A: another guideline at the fields' values.
+    frame(&ctx, &mut app, vec![key(egui::Key::A, Modifiers::ALT)], Modifiers::ALT);
+    frame(&ctx, &mut app, vec![key_up(egui::Key::A, Modifiers::ALT)], Modifiers::NONE);
+    assert_eq!(app.page_guides().len(), 2, "Alt+A adds");
 }

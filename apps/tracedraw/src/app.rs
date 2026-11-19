@@ -410,6 +410,11 @@ pub enum Drag {
         /// snapped axis alone, so the side stays on what it snapped to
         /// (#2004).
         snapped: (bool, bool),
+        /// Where the selection stood when the handle was grabbed, built
+        /// once the handle has left the snapping radius of its start: the
+        /// handle then snaps to the selection's own nodes and edges as
+        /// they were, as a move does (#3074, #1765).
+        start_geometry: Option<std::rc::Rc<crate::snap::StillGeometry>>,
     },
     /// Skewing the selection with a side handle in rotate mode: the
     /// opposite side stays (the centre line with Shift).
@@ -1341,6 +1346,8 @@ pub struct App {
     pub graph_cols: u32,
     /// The Action Lines tool's settings (#1617).
     pub action_lines: crate::action_lines::ActionLines,
+    /// The Shape Generator panel's settings (#3412, #3413).
+    pub shape_gen: crate::shape_gen::ShapeGenSettings,
     /// Speech Balloon tool (#2179): the style, the tail's width (percent
     /// of the body's smaller side) and bend for new balloons, and the
     /// balloon whose tail tip is being dragged.
@@ -1416,6 +1423,16 @@ pub struct App {
     pub eyedropper_apply: bool,
     /// Bitmap sample box side in pixels: 1, 2 or 5.
     pub eyedropper_sample: u32,
+    /// Sample from Screen: the next click anywhere in the window samples
+    /// the colour shown there (#3040).
+    pub eyedropper_screen: bool,
+    /// The Shape tool's Bulge, percent: 100 bows a segment into a quarter
+    /// circle, negative the other way (#3335).
+    pub segment_bulge: f64,
+    /// A sample of the window's pixels on its way (#3040).
+    pub screen_sample: Option<crate::screen_sample::ScreenSample>,
+    /// Frames waited for the window's read-back.
+    pub screen_sample_frames: u32,
     /// The colour eyedroppers' readout beside the pointer (#990).
     pub eyedropper_hover: crate::eyedropper::HoverReadout,
     pub canvas_rect: egui::Rect,
@@ -1666,6 +1683,9 @@ pub struct App {
     /// The guideline whose values the Guidelines panel's fields hold
     /// (`sync_guide_form`); `None` with none or several selected.
     pub guide_form_for: Option<usize>,
+    /// The Guidelines panel's position field takes the focus, its value
+    /// selected, on the next frame (a double click on a guideline, #2883).
+    pub guide_focus_field: bool,
     /// The guideline the Guidelines panel's fields hold, as it was before
     /// a value typed there moved it: Add puts it back and adds the new
     /// one at the typed place (#3068).
@@ -2234,6 +2254,11 @@ pub struct App {
     pub area_fill_outline_edges: bool,
     pub mesh_rows: u32,
     pub mesh_cols: u32,
+    /// Mesh Fill bar: the colours Shuffle draws from (an index into
+    /// [`crate::mesh_tool::MESH_PALETTES`], past its end the document
+    /// palette) and the next mix it makes.
+    pub mesh_palette: usize,
+    pub mesh_seed: u64,
     /// Shape tool elastic mode: dragging one node pulls its neighbours.
     pub elastic_mode: bool,
     /// Shape tool: the node transform mode on the property bar.
@@ -2253,6 +2278,8 @@ pub struct App {
     pub coords: crate::coords::CoordsState,
     /// The Vector Mosaic docker's settings.
     pub vector_mosaic: crate::vector_mosaic::VectorMosaicSettings,
+    /// The Symbol Scatter docker's settings (and picked symbols).
+    pub symbol_scatter: crate::symbol_scatter::ScatterSettings,
     /// The Picture Mosaic docker's settings and indexed library.
     pub picture_mosaic: crate::picture_mosaic::PictureMosaicSettings,
     /// A Picture Mosaic library being indexed in the background.
@@ -2277,6 +2304,10 @@ pub struct App {
     /// and their numbers in its mesh. They count only while that node is
     /// still the one chosen.
     pub mesh_more_nodes: Option<((ShapeId, usize), Vec<usize>)>,
+    /// More envelope nodes chosen with the one in `selected_effect_node`
+    /// (Shift+click, a marquee; #3001): they move with it. They count
+    /// only while that node is still the one chosen.
+    pub envelope_more_nodes: Option<((ShapeId, usize), Vec<usize>)>,
     /// The Mesh Fill bar's eyedropper is on: the next click samples a
     /// colour for the chosen mesh nodes (discussion #2387).
     pub mesh_eyedropper: bool,
@@ -2444,6 +2475,8 @@ pub enum DockerTab {
     Coordinates,
     VectorMosaic,
     PictureMosaic,
+    ShapeGenerator,
+    SymbolScatter,
     Shelf,
     Export,
     Comments,
@@ -2454,7 +2487,7 @@ pub enum DockerTab {
 }
 
 impl DockerTab {
-    pub const ALL: [DockerTab; 44] = [
+    pub const ALL: [DockerTab; 46] = [
         DockerTab::Properties,
         DockerTab::Objects,
         DockerTab::Hints,
@@ -2495,6 +2528,8 @@ impl DockerTab {
         DockerTab::Coordinates,
         DockerTab::VectorMosaic,
         DockerTab::PictureMosaic,
+        DockerTab::ShapeGenerator,
+        DockerTab::SymbolScatter,
         DockerTab::Shelf,
         DockerTab::Effects,
         DockerTab::Macros,
@@ -2524,6 +2559,7 @@ impl DockerTab {
             DockerTab::AlignDistribute,
             DockerTab::StepAndRepeat,
             DockerTab::FitToPath,
+            DockerTab::ShapeGenerator,
         ],
         &[
             DockerTab::Shaping,
@@ -2551,7 +2587,7 @@ impl DockerTab {
     ];
 
     /// Window > Panels > Effects.
-    pub const EFFECTS_MENU: [DockerTab; 11] = [
+    pub const EFFECTS_MENU: [DockerTab; 12] = [
         DockerTab::Effects,
         DockerTab::Blend,
         DockerTab::Contour,
@@ -2563,6 +2599,7 @@ impl DockerTab {
         DockerTab::BitmapMask,
         DockerTab::VectorMosaic,
         DockerTab::PictureMosaic,
+        DockerTab::SymbolScatter,
     ];
 
     /// i18n key of the docker's title.
@@ -2605,6 +2642,8 @@ impl DockerTab {
             DockerTab::Coordinates => "docker.coordinates",
             DockerTab::VectorMosaic => "docker.vector_mosaic",
             DockerTab::PictureMosaic => "docker.picture_mosaic",
+            DockerTab::ShapeGenerator => "docker.shape_generator",
+            DockerTab::SymbolScatter => "docker.symbol_scatter",
             DockerTab::Shelf => "docker.shelf",
             DockerTab::Export => "docker.export",
             DockerTab::Comments => "docker.comments",
@@ -3123,6 +3162,7 @@ impl App {
             graph_rows: 4,
             graph_cols: 3,
             action_lines: Default::default(),
+            shape_gen: Default::default(),
             balloon_style: Default::default(),
             balloon_width: 30.0,
             balloon_bend: 0.0,
@@ -3165,6 +3205,10 @@ impl App {
             eyedropper_groups: Default::default(),
             eyedropper_apply: false,
             eyedropper_sample: 1,
+            eyedropper_screen: false,
+            segment_bulge: 50.0,
+            screen_sample: None,
+            screen_sample_frames: 0,
             eyedropper_hover: Default::default(),
             canvas_rect: egui::Rect::NOTHING,
             pointer_page: None,
@@ -3262,6 +3306,7 @@ impl App {
             guide_pivots: Vec::new(),
             guide_form: Default::default(),
             guide_form_for: None,
+            guide_focus_field: false,
             guide_form_from: None,
             guide_presets: Default::default(),
             grid_frequency: false,
@@ -3523,6 +3568,8 @@ impl App {
             area_fill_outline_edges: false,
             mesh_rows: 2,
             mesh_cols: 2,
+            mesh_palette: 0,
+            mesh_seed: 1,
             elastic_mode: false,
             node_transform: Default::default(),
             reflect_nodes: (false, false),
@@ -3531,6 +3578,7 @@ impl App {
             node_run: None,
             coords: Default::default(),
             vector_mosaic: Default::default(),
+            symbol_scatter: Default::default(),
             picture_mosaic: Default::default(),
             picture_mosaic_job: None,
             coord_pick: None,
@@ -3541,6 +3589,7 @@ impl App {
             selected_effect_node: None,
             shadow_picked: None,
             mesh_more_nodes: None,
+            envelope_more_nodes: None,
             mesh_eyedropper: false,
             docs: Vec::new(),
             active_doc: 0,
@@ -4171,6 +4220,7 @@ impl App {
                 bend: self.balloon_bend,
             },
             action_lines: self.action_lines,
+            shape_gen: self.shape_gen.clone(),
             painterly: self.painterly,
         }
     }
@@ -4288,6 +4338,7 @@ impl App {
             angle: finite(a.angle, -360.0, 360.0, 0.0),
             ..a
         };
+        self.shape_gen = t.shape_gen.sanitized();
         self.painterly = crate::painterly_tool::PainterlySettings {
             size: finite(t.painterly.size, 0.1, 200.0, 5.0),
             ..t.painterly
@@ -6153,6 +6204,11 @@ impl App {
             self.dimension_points.clear();
             self.previous_tool = self.tool;
             self.tool = tool;
+            // Cancel undoes only what the Shape Builder made since it was
+            // chosen (#3220).
+            if tool == Tool::ShapeBuilder {
+                self.builder.session_steps = 0;
+            }
             // Another tool ends a pick of Image > Color Mask (#2479).
             if tool != Tool::ColorEyedropper {
                 self.mask.picking = false;
@@ -10298,7 +10354,7 @@ impl App {
     }
 
     /// Read a `.cdr` file through the file layer (uploads in a browser).
-    fn open_cdr(
+    pub(crate) fn open_cdr(
         path: &std::path::Path,
     ) -> std::result::Result<(tracedraw_core::Document, tracedraw_cdr::ParseReport), String> {
         let bytes = crate::files::read(path).map_err(|e| e.to_string())?;
@@ -11400,7 +11456,7 @@ pub(crate) fn is_template_path(path: &std::path::Path) -> bool {
 
 /// `sym` with no object identities, for comparing symbols of two
 /// drawings (each drawing gives the objects identities of its own).
-fn symbol_without_uids(
+pub(crate) fn symbol_without_uids(
     mut sym: tracedraw_core::document::Symbol,
 ) -> tracedraw_core::document::Symbol {
     fn clear(s: &mut Shape) {
