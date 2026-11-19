@@ -528,11 +528,30 @@ impl RunStyle {
 
     /// The style with its East Asian font in place of the Latin one, for
     /// the letters set in it.
+    ///
+    /// A Latin font in its vertical form (named with a leading `@`) makes
+    /// the text vertical, whatever East Asian font the run names: a
+    /// version 22 file of #3217 sets one column in `@站酷文艺体` for Latin
+    /// letters and `站酷文艺体`, `Arial` and `@宋体` for the ideographs of
+    /// its three runs, and the program that wrote it draws the whole
+    /// column with its ideographs upright. The East Asian font then takes
+    /// the `@` too, so the text reads as vertical (see
+    /// `vertical_font_text`); the face itself is found without it.
     pub fn for_east_asian(&self) -> RunStyle {
         let Some(a) = &self.asian else {
             return self.clone();
         };
-        self.with_script_font(a)
+        let mut s = self.with_script_font(a);
+        let latin_vertical = self
+            .family
+            .as_deref()
+            .is_some_and(|f| f.starts_with('@') && f.len() > 1);
+        if latin_vertical {
+            if let Some(f) = s.family.as_mut().filter(|f| !f.starts_with('@')) {
+                f.insert(0, '@');
+            }
+        }
+        s
     }
 
     /// The style with its right-to-left font in place of the Latin one,
@@ -1731,6 +1750,7 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
         frame_text_styles: Vec::new(),
         columns: None,
     };
+    let mut graphics = 0;
     for _ in 0..np {
         let style_id = r.u32()?;
         r.skip(1);
@@ -1762,6 +1782,20 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
             let _st1 = r.u16()?;
             let st2 = r.u16()?;
             let st3 = r.u16()?;
+            // Bit 1: the run is a graphic placed in the line as a letter.
+            // A word (0 in the samples), the graphic's byte count (u32)
+            // and its bytes (a compressed Corel metafile that starts
+            // "CMX3") come first (a version 18 file's two texts, each a
+            // word with a graphic after its first letter, #3181: read
+            // without them, the style string's length was taken from the
+            // graphic and both texts were skipped). The graphic is not
+            // drawn; its letter stays.
+            if st3 & 0x02 != 0 {
+                r.skip(2);
+                let len = r.u32()? as usize;
+                r.skip(len);
+                graphics += 1;
+            }
             if st2 == 0x3fff && st3 & 0x11 == 0x11 {
                 let len = r.u32()? as usize;
                 r.skip(if v >= 17 { len } else { len.saturating_mul(2) });
@@ -1878,6 +1912,11 @@ fn read_txsm_16(d: &[u8], v: u16, charset: u8, warn: &mut dyn FnMut(String)) -> 
             base: default,
             runs,
         });
+    }
+    if graphics > 0 {
+        warn(format!(
+            "{graphics} graphic(s) placed in the text not drawn; their letters kept"
+        ));
     }
     Some(out)
 }
@@ -3282,6 +3321,28 @@ mod tests {
         assert_eq!(parse_style_string("{broken").size_pt, None);
     }
 
+    /// A Latin font in its vertical form (`@`) gives the East Asian font
+    /// of the run the `@` too, as the ideographs of a version 22 column
+    /// of #3217 are set in faces named without it under an `@` Latin face.
+    #[test]
+    fn a_vertical_latin_font_makes_the_east_asian_one_vertical() {
+        for (east, read) in [
+            ("站酷文艺体", "@站酷文艺体"),
+            ("Arial", "@Arial"),
+            ("@宋体", "@宋体"),
+        ] {
+            let s = parse_style_string(&format!(
+                r#"{{"character":{{"latin":{{"font":"@站酷文艺体"}},"farEast":{{"font":"{east}"}}}}}}"#
+            ));
+            assert_eq!(s.for_east_asian().family.as_deref(), Some(read), "{east}");
+        }
+        // Under a horizontal Latin face the East Asian one stays as named.
+        let s = parse_style_string(
+            r#"{"character":{"latin":{"font":"Arial"},"farEast":{"font":"SimSun"}}}"#,
+        );
+        assert_eq!(s.for_east_asian().family.as_deref(), Some("SimSun"));
+    }
+
     #[test]
     fn split_scripts_cuts_east_asian_runs() {
         assert!(is_east_asian('荣') && is_east_asian('〇') && is_east_asian('ア'));
@@ -3631,6 +3692,82 @@ mod tests {
         // A record cut inside the field name is not read past the end.
         for cut in 0..d.len() {
             let _ = read_txsm(&d[..cut], 24, 0, &mut |_| {});
+        }
+    }
+
+    /// A version 18 artistic text whose second style record is a graphic
+    /// placed in the line (bit 1 of its third word: a word, the graphic's
+    /// byte count and its bytes before the locale), as the two texts of
+    /// the file of #3181 hold one after their first letter. The text is
+    /// read, the graphic left out with a warning.
+    #[test]
+    fn version_18_text_with_a_graphic_in_the_line_is_read() {
+        fn style(b: &mut Vec<u8>, s: &str) {
+            b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        }
+        let graphic = b"CMX3\x1b\0\0\0\x16\0\0\0Corel Binary Meta File\x01\0\0\0";
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes()); // frame layout
+        b.extend_from_slice(&[0; 32]);
+        b.extend_from_slice(&1700u16.to_le_bytes());
+        b.extend_from_slice(&[0; 3]);
+        b.extend_from_slice(&1u32.to_le_bytes()); // one frame
+        b.extend_from_slice(&32u32.to_le_bytes());
+        b.extend_from_slice(&[0; 48]);
+        b.extend_from_slice(&0u32.to_le_bytes()); // not on a path
+        b.extend_from_slice(&[0; 8]);
+        b.extend_from_slice(&1u32.to_le_bytes()); // one paragraph
+        b.extend_from_slice(&66u32.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        style(
+            &mut b,
+            r#"{"character":{"latin":{"font":"Arial","size":"12700"}}}"#,
+        );
+        b.extend_from_slice(&2u32.to_le_bytes()); // two records
+        for (st, picture) in [([6u16, 0, 0x04], false), ([1, 0x3fff, 0x06], true)] {
+            for w in st {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+            if picture {
+                b.extend_from_slice(&0u16.to_le_bytes());
+                b.extend_from_slice(&(graphic.len() as u32).to_le_bytes());
+                b.extend_from_slice(graphic);
+            }
+            b.extend_from_slice(&3u32.to_le_bytes());
+            for u in "ENS".encode_utf16() {
+                b.extend_from_slice(&u.to_le_bytes());
+            }
+            if picture {
+                style(&mut b, r#"{"character":{"latin":{"font":"Gabriola"}}}"#);
+            } else {
+                style(&mut b, r#"{"character":{}}"#);
+            }
+        }
+        let text = b"G\xa0rass";
+        b.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        for k in 0..text.len() {
+            let idx = if k == 1 { 1u8 } else { 0 };
+            b.extend_from_slice(&[0, 0, idx << 1, 0, 0, 0, 0, 0]);
+        }
+        b.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        b.extend_from_slice(text);
+        b.push(0); // no letter positions
+        let mut warnings = Vec::new();
+        let t = read_txsm(&b, 18, 0, &mut |w| warnings.push(w)).expect("txsm");
+        let all: String = t.paragraphs[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(all, "G\u{a0}rass");
+        assert_eq!(
+            t.paragraphs[0].runs[1].style.family.as_deref(),
+            Some("Gabriola")
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("graphic")),
+            "{warnings:?}"
+        );
+        // A record cut inside the graphic is not read past the end.
+        for cut in 0..b.len() {
+            let _ = read_txsm(&b[..cut], 18, 0, &mut |_| {});
         }
     }
 }

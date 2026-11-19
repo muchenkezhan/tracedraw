@@ -37,6 +37,7 @@ pub mod crop_bar;
 pub mod cursors;
 pub mod curve_edit;
 pub mod defaults_dialog;
+pub mod detached;
 pub mod dialogs;
 pub mod dimension_bar;
 pub mod distort_bar;
@@ -104,6 +105,7 @@ pub mod print_preview;
 pub mod propbar;
 pub mod publish_pdf;
 pub mod recolor;
+pub mod replace_color;
 pub mod rulers;
 pub mod save_as;
 pub mod screen_margins;
@@ -327,6 +329,9 @@ pub fn root(app: &mut App, ui: &mut Ui) {
     } else {
         root_frame(app, ui);
     }
+    // The drawings in windows of their own (#2904).
+    let ctx = ui.ctx().clone();
+    detached::show(app, &ctx);
     // An import that asked a question first goes where it was placed.
     app.finish_waiting_import_placement();
     // The next of several files picked with File > Import (#2695).
@@ -496,6 +501,13 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     // without closing left. An idle window still checks in, with a frame
     // a minute, so another window never takes it for gone.
     app.session_tick(crate::recovery::now_secs());
+    // Help > Benchmark started TraceDraw again with or without the
+    // graphics card: its test runs again in this start.
+    if app.settings.benchmark_resume.is_some()
+        && matches!(app.dialog, crate::ui::dialogs::Dialog::None)
+    {
+        crate::ui::benchmark::resume(app);
+    }
     if app.session.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_secs(
             crate::recovery::HEARTBEAT_SECS,
@@ -554,12 +566,20 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
             let split = full.right() - crate::window_buttons::WIDTH;
             let left = egui::Rect::from_min_max(full.min, egui::pos2(split, full.bottom()));
             let right = egui::Rect::from_min_max(egui::pos2(split, full.top()), full.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
+                menus::menu_bar(app, ui)
+            });
+            // The bar takes the whole width it is given: the empty part
+            // starts after its last title. Taken from the bar's width it
+            // was always empty, so the bar never moved the window (#3134).
             let used = ui
-                .scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                    menus::menu_bar(app, ui);
-                    ui.min_rect().right()
+                .ctx()
+                .data(|d| {
+                    d.get_temp::<(Vec<egui::Rect>, usize)>(egui::Id::new(menus::MENU_BAR_LAYOUT))
                 })
-                .inner;
+                .and_then(|(titles, _)| titles.iter().map(|r| r.right()).reduce(f32::max))
+                .unwrap_or(left.left())
+                .clamp(left.left(), split);
             let gap = egui::Rect::from_min_max(
                 egui::pos2(used, full.top()),
                 egui::pos2(split, full.bottom()),
@@ -863,10 +883,14 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
         .frame(Frame::NONE)
         .show(ui, |ui| {
             let full = ui.available_rect_before_wrap();
-            if app.window_layout == windows::WindowLayout::Tabs || app.docs.is_empty() {
-                drawing_window(app, ui, full);
-            } else {
+            if app.window_layout != windows::WindowLayout::Tabs && !app.docs.is_empty() {
                 windows::arranged(app, ui, full);
+            } else if detached::is_detached(app, app.active_doc) {
+                // The active drawing is in its own window (#2904): this
+                // one shows its own drawing as it was left.
+                main_window_parked(app, ui, full);
+            } else {
+                drawing_window(app, ui, full);
             }
         });
     crate::frame_mark("the drawing");
@@ -998,6 +1022,23 @@ fn smooth_wheel_notch(unit: egui::MouseWheelUnit, line_speed: f32, height: f32, 
     points.max(1.0)
 }
 
+/// The main window's drawing while the active one is in a window of its
+/// own (#2904): its page as its view left it; a click makes it active.
+fn main_window_parked(app: &mut App, ui: &mut Ui, full: egui::Rect) {
+    match detached::main_doc(app) {
+        Some(m) => {
+            let resp = ui.interact(full, egui::Id::new("main_window_parked"), Sense::click());
+            windows::paint_parked(app, ui, m, full);
+            if resp.clicked() {
+                app.switch_document(m);
+            }
+        }
+        None => {
+            ui.painter().rect_filled(full, 0.0, Tokens::panel());
+        }
+    }
+}
+
 /// The active drawing's window in `full`: rulers, the canvas with its
 /// tools, scrollbars, the page tabs and the navigator.
 pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
@@ -1029,8 +1070,8 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
     let painter = ui.painter_at(canvas_rect);
 
     // Wheel: with the default setting the wheel zooms about the
-    // pointer, Ctrl+wheel scrolls vertically and Alt+wheel
-    // horizontally; with the scroll setting the wheel scrolls,
+    // pointer, Ctrl+wheel and Shift+wheel scroll horizontally and
+    // Alt+wheel vertically (#3087); with the scroll setting the wheel scrolls,
     // Shift+wheel horizontally and Ctrl+wheel zooms. Pinch zooms.
     // Edit Fill and Outline Pen leave the wheel to the drawing outside
     // them, so it can be zoomed to see the change; nothing else of the
@@ -1053,6 +1094,13 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
         // egui leaves unsmoothed) apply at once.
         let mut zoom_glide_notches = 0.0f32;
         let mut zoom_now_notches = 0.0f32;
+        // The wheel's own turn in points: egui takes Ctrl+wheel for a
+        // zoom and gives no scroll for it.
+        let mut wheel_points = egui::Vec2::ZERO;
+        // Whether this frame's wheel turned in notches (a mouse wheel),
+        // not in a touchpad's fine steps, and whether it held a pinch.
+        let mut wheel_notched = false;
+        let mut pinched = false;
         let (scroll, notches, any_notches, zoom_delta, mods) = ui.input(|i| {
             // Wheel notches this frame (the smoothed delta is spread
             // over several frames, so the zoom steps come from the
@@ -1069,11 +1117,16 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
                         ..
                     } => {
                         if *phase == egui::TouchPhase::Move {
-                            let points = match u {
-                                egui::MouseWheelUnit::Point => delta.y,
-                                egui::MouseWheelUnit::Line => delta.y * line,
-                                egui::MouseWheelUnit::Page => delta.y * height,
+                            let scale = match u {
+                                egui::MouseWheelUnit::Point => 1.0,
+                                egui::MouseWheelUnit::Line => line,
+                                egui::MouseWheelUnit::Page => height,
                             };
+                            wheel_points += *delta * scale;
+                            if *u != egui::MouseWheelUnit::Point || delta.length() >= 8.0 {
+                                wheel_notched = true;
+                            }
+                            let points = delta.y * scale;
                             let n = points / smooth_wheel_notch(*u, line, height, web);
                             if *u == egui::MouseWheelUnit::Point && delta.length() < 8.0 {
                                 zoom_now_notches += n;
@@ -1086,6 +1139,10 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
                         // sideways.
                         any_notches += (delta.x + delta.y) / per;
                         delta.y / per
+                    }
+                    egui::Event::Zoom(_) => {
+                        pinched = true;
+                        0.0
                     }
                     _ => 0.0,
                 })
@@ -1120,7 +1177,7 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
             // to the middle of the view, and the pointer with it, and the
             // zoom (its whole glide) goes about the middle.
             let wheel_zooms = if app.settings.wheel_zooms {
-                !mods.alt && !mods.ctrl
+                !mods.alt && !mods.ctrl && !mods.shift
             } else {
                 mods.ctrl
             };
@@ -1137,13 +1194,42 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
             } else {
                 h
             };
-            if zoom_delta != 1.0 {
+            // Ctrl+wheel scrolls sideways (#3087): egui makes a mouse
+            // wheel's turn with Ctrl a zoom, spread over a few frames, and
+            // the drawing zoomed as with the plain wheel. A touchpad's
+            // fine steps with Ctrl (a pinch on some systems) still zoom.
+            let ctrl_pans = app.settings.wheel_zooms && mods.ctrl && !pinched;
+            let pan_id = egui::Id::new("ctrl_wheel_pans");
+            if ctrl_pans && wheel_points != egui::Vec2::ZERO {
+                ui.ctx().data_mut(|d| d.insert_temp(pan_id, wheel_notched));
+            }
+            let ctrl_pans = ctrl_pans
+                && ui
+                    .ctx()
+                    .data(|d| d.get_temp::<bool>(pan_id))
+                    .unwrap_or(false);
+            if ctrl_pans {
+                if wheel_points != egui::Vec2::ZERO {
+                    app.view.pan(if wheel_points.y != 0.0 {
+                        egui::vec2(wheel_points.y, wheel_points.x)
+                    } else {
+                        wheel_points
+                    });
+                }
+            } else if zoom_delta != 1.0 {
                 app.view.zoom_at(h, zoom_delta);
             } else if app.settings.wheel_zooms {
+                // Alt+wheel scrolls up and down, Shift+wheel sideways (the
+                // system may send it sideways already); Alt+wheel scrolled
+                // sideways (#3087).
                 if mods.alt && scroll != egui::Vec2::ZERO {
-                    app.view.pan(egui::vec2(scroll.y, scroll.x));
-                } else if mods.ctrl && scroll != egui::Vec2::ZERO {
                     app.view.pan(scroll);
+                } else if mods.shift && scroll != egui::Vec2::ZERO {
+                    app.view.pan(if scroll.y != 0.0 {
+                        egui::vec2(scroll.y, scroll.x)
+                    } else {
+                        scroll
+                    });
                 } else if !mods.shift && (zoom_glide_notches != 0.0 || zoom_now_notches != 0.0) {
                     // A notch zooms in one glide over a few frames instead
                     // of one jump; its frames multiply to the step a
@@ -1286,7 +1372,7 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
         // pointer beside it (#990).
         let picker = crate::ui::color_picker::picking(ui.ctx());
         if let (true, Some(at), Some(p)) = (
-            (picker || app.eyedropper_sampling(ctrl)) && !primary && !middle,
+            (picker || app.color_readout_wanted(ctrl)) && !primary && !middle,
             pos,
             app.pointer_page,
         ) {

@@ -2719,7 +2719,8 @@ impl App {
         let Some(tmp) = self.selection_alone(area) else {
             return;
         };
-        let Some((png, w, h)) = render_alone_png(&tmp, dpi, o.transparent, o.anti_alias) else {
+        let Some((png, w, h)) = render_alone_png(&tmp, dpi, o.keeps_transparency(), o.anti_alias)
+        else {
             return;
         };
         let bounds = area;
@@ -3750,6 +3751,11 @@ impl App {
         let Some(kind) = crate::text_path::fit_kind(text, curve, at) else {
             return;
         };
+        // Fitted again just as it was: no step that undoes nothing.
+        if kind == text.kind {
+            self.selection = vec![text.id];
+            return;
+        }
         self.run(Command::SetShapeKind {
             shape: text.id,
             kind,
@@ -3825,7 +3831,12 @@ impl App {
         }
     }
 
+    /// Text > Change Case on the selected texts, all of them in one undo
+    /// step; texts already in that case are left alone, and when none
+    /// changes there is no step to undo. Each text was a step of its own,
+    /// and a text already in the case still gave an Undo that did nothing.
     pub fn change_case(&mut self, mode: CaseMode) {
+        let mut cmds = Vec::new();
         for s in self.text_shapes() {
             let ShapeKind::Text {
                 mut spans,
@@ -3840,10 +3851,13 @@ impl App {
             };
             let runs: Vec<&str> = spans.iter().map(|sp| sp.text.as_str()).collect();
             let changed = apply_case_runs(&runs, mode);
+            if changed.iter().map(String::as_str).eq(runs.iter().copied()) {
+                continue;
+            }
             for (sp, text) in spans.iter_mut().zip(changed) {
                 sp.text = text;
             }
-            self.run(Command::SetShapeKind {
+            cmds.push(Command::SetShapeKind {
                 shape: s.id,
                 kind: ShapeKind::Text {
                     spans,
@@ -3854,6 +3868,15 @@ impl App {
                     on_path,
                 },
             });
+        }
+        match cmds.len() {
+            0 => {}
+            1 => self.run(cmds.remove(0)),
+            _ => {
+                if let Err(e) = self.run_batch_keeping_lines("Edit Object", &cmds) {
+                    log::warn!("change case: {e}");
+                }
+            }
         }
     }
 
@@ -4016,6 +4039,15 @@ impl App {
     }
 
     pub fn run_script(&mut self, src: &str) {
+        // A script converted from a macro runs on the macros' object
+        // model, as a macro (docs/behavior/vba.md, "Converting macros").
+        if src.trim_start().starts_with(tracedraw_vba::convert::JS_MARKER) {
+            match tracedraw_vba::convert::js_run_name(src) {
+                Some(name) => self.run_macro_js(src, &name, "Scripts".into()),
+                None => self.scripts_output.push(tr("convert.nothing_to_run")),
+            }
+            return;
+        }
         let result = crate::scripting::run(self, src);
         match result {
             Ok(out) => {
@@ -5592,6 +5624,12 @@ impl App {
     /// are neither installed nor carried by a drawing (Font Manager,
     /// missing-font substitution notice).
     pub fn check_missing_fonts(&mut self) {
+        // Fonts still being installed are not missing: the check runs
+        // again once they are in (`poll_font_installs`).
+        if !self.font_installs.is_empty() {
+            self.missing_fonts.clear();
+            return;
+        }
         let missing: Vec<String> = self
             .doc()
             .font_families_used()
@@ -6554,6 +6592,13 @@ mod tests {
             )
         });
         assert!(fitted);
+        // Fitted again to the same path, just as it is: no step that
+        // undoes nothing.
+        let steps = app.engine.history_labels().0.len();
+        app.selection = vec![text, path];
+        app.fit_text_to_path();
+        assert_eq!(app.engine.history_labels().0.len(), steps);
+        assert_eq!(app.selection, vec![text]);
     }
 
     use kurbo::ParamCurve as _;
@@ -6869,6 +6914,51 @@ mod tests {
         }
     }
 
+    /// Change Case on several texts is one undo step, and a text already
+    /// in that case gives no step: each text was a step of its own, and
+    /// Upper on capitals left an Undo that did nothing.
+    #[test]
+    fn change_case_is_one_step_and_no_step_when_nothing_changes() {
+        let mut app = App::headless();
+        let text = |app: &mut App, s: &str, y: f64| {
+            app.new_shape(ShapeKind::Text {
+                spans: vec![TextSpan::new(s, "Arial", 12.0)],
+                origin: tracedraw_core::Point::new(10.0, y),
+                frame: None,
+                align: tracedraw_core::TextAlign::Left,
+                para: Default::default(),
+                on_path: None,
+            })
+            .expect("text")
+        };
+        let a = text(&mut app, "one", 10.0);
+        let b = text(&mut app, "two", 30.0);
+        let c = text(&mut app, "THREE", 50.0);
+        let steps = |app: &App| app.engine.history_labels().0.len();
+        let words = |app: &App| -> Vec<String> {
+            [a, b, c]
+                .iter()
+                .map(|id| match &app.doc().find_shape(*id).expect("text").kind {
+                    ShapeKind::Text { spans, .. } => spans[0].text.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        };
+        app.select(vec![a, b, c]);
+        let n = steps(&app);
+        app.change_case(CaseMode::Upper);
+        assert_eq!(words(&app), ["ONE", "TWO", "THREE"]);
+        assert_eq!(steps(&app), n + 1, "one step for every text");
+        app.change_case(CaseMode::Upper);
+        assert_eq!(steps(&app), n + 1, "nothing changed, no step");
+        app.undo();
+        assert_eq!(words(&app), ["one", "two", "THREE"]);
+        app.select(vec![c]);
+        let n = steps(&app);
+        app.change_case(CaseMode::Upper);
+        assert_eq!(steps(&app), n);
+    }
+
     /// #2220: a ring with a shadow converted to a bitmap went to the top
     /// of the layer, so its shadow covered the text that was above it.
     /// The picture takes the place of the topmost object it was made of.
@@ -7145,6 +7235,49 @@ mod tests {
                 "{c:?} {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn black_and_white_with_a_transparent_background_stays_one_bit() {
+        // #3204: Black and White with Transparent background ticked gave a
+        // grey PNG with alpha, which other programs open as grayscale.
+        use crate::bitmap_modes::{ConvertMode, ConvertOptions};
+        let o = ConvertOptions {
+            dpi: 72.0,
+            mode: ConvertMode::BlackWhite,
+            transparent: true,
+            ..Default::default()
+        };
+        assert!(!o.keeps_transparency());
+        assert!(ConvertOptions {
+            mode: ConvertMode::Grayscale,
+            ..o
+        }
+        .keeps_transparency());
+        let mut app = App::headless();
+        // An ellipse leaves its box's corners empty.
+        let id = app
+            .new_shape(ShapeKind::Ellipse {
+                rect: Rect::new(0.0, 0.0, 20.0, 20.0),
+                arc: None,
+            })
+            .expect("ellipse");
+        app.run(Command::SetFill {
+            shapes: vec![id],
+            fill: Fill::Solid(Color::rgb8(0, 0, 0)),
+        });
+        app.select(vec![id]);
+        app.convert_to_bitmap_with(&o);
+        let s = app.selected_shapes().into_iter().next().expect("bitmap");
+        let ShapeKind::Bitmap { png, .. } = &s.kind else {
+            panic!("not a bitmap");
+        };
+        // IHDR: bit depth 1, colour type 0 (grey, no alpha).
+        assert_eq!((png[24], png[25]), (1, 0));
+        let img = crate::bitmap_fx::decode(png).expect("png");
+        assert_eq!(*img.get_pixel(0, 0), image::Rgba([255, 255, 255, 255]));
+        let mid = img.get_pixel(img.width() / 2, img.height() / 2);
+        assert_eq!(*mid, image::Rgba([0, 0, 0, 255]));
     }
 
     #[test]

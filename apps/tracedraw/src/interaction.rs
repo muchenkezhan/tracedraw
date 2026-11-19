@@ -1023,25 +1023,17 @@ impl App {
     }
 
     /// Whether a Pick press at `p` on a guideline takes the guideline
-    /// rather than what lies under it: objects win, as they are what is
-    /// usually edited, but not a picture that is not selected, so a
-    /// guideline over a photo moves (#2640: it could not be picked over
-    /// an image); the rotation handles of a guideline in rotate mode win
-    /// over everything.
+    /// rather than what lies under it. Guidelines lie above the layers, so
+    /// one over an object that is not selected takes the press, as in
+    /// CorelDRAW (#2640: over a picture first, then over any object, a
+    /// shape or a group too); over what is selected the press still moves
+    /// the selection. The rotation handles of a guideline in rotate mode
+    /// win over everything.
     pub fn guide_wins_press(&self, p: Point) -> bool {
         if self.guide_rotate.is_some() {
             return true;
         }
-        match self.hit_test(p) {
-            None => true,
-            Some(id) => {
-                !self.selection.contains(&id)
-                    && self
-                        .doc()
-                        .find_shape(id)
-                        .is_some_and(|s| matches!(s.kind, ShapeKind::Bitmap { .. }))
-            }
-        }
+        self.over_selection(p) != Some(true)
     }
 
     /// Whether a Pick press at `p` lands on what is selected: `None`
@@ -2477,9 +2469,10 @@ impl App {
                 self.start_move(p);
                 return;
             }
-            // Guidelines lie above the layers but objects win a press, as
-            // they are what is usually edited; the rotation handles of a
-            // guideline in rotate mode win over objects.
+            // Guidelines lie above the layers: one over an object that is
+            // not selected takes the press (#2640); over the selection the
+            // press moves it. The rotation handles of a guideline in rotate
+            // mode win over objects.
             if self.guide_wins_press(p) && self.press_guide(p, mods.shift) {
                 return;
             }
@@ -3329,6 +3322,23 @@ impl App {
             return;
         }
         if response.clicked_by(PointerButton::Primary) && self.tool == Tool::Freehand {
+            // A click on the first node of a line of three nodes or more
+            // closes it, as the pointer's close mark says; it added a
+            // node there and the line went on (#2339). The second click
+            // of a double-click on it starts nothing.
+            let reach = self.curve_end_reach_px() / self.view.zoom as f64;
+            let closes = self.curve.as_ref().is_some_and(|c| {
+                c.closes_at_first() && c.nodes.first().is_some_and(|n| (n.0 - p).hypot() <= reach)
+            });
+            if closes {
+                if let Some(c) = self.curve.take() {
+                    self.close_curve(c);
+                }
+                return;
+            }
+            if double && self.curve.is_none() {
+                return;
+            }
             let p = self.curve_point(self.snap_point(p), self.constrain_held(&mods));
             let c = self.curve.get_or_insert_with(|| CurveInProgress {
                 nodes: Vec::new(),
@@ -3678,7 +3688,7 @@ impl App {
 
     /// The curve being drawn, closed onto its first node, becomes a
     /// curve object and is selected.
-    fn close_curve(&mut self, c: CurveInProgress) {
+    pub(crate) fn close_curve(&mut self, c: CurveInProgress) {
         let history = std::mem::take(&mut self.curve_steps.undo);
         self.curve_steps.clear();
         let path = c.path_closed(None, true);
@@ -4625,6 +4635,9 @@ impl App {
         // The pen's pressure, which the raw input hook read from this
         // frame's touch events, before the tools see the pointer (#850).
         self.pen_pressure = crate::pen::pressure(ctx);
+        // Q held on its own: snapping off for as long as it is held,
+        // set again below when the drawing has the keyboard (#3072).
+        self.snap_held_off = false;
         // A macro's message, input box, modal form or error owns the
         // keyboard (see ui/macros_ui.rs); Esc stops a running macro.
         if self.macros.modal() {
@@ -4713,6 +4726,13 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        // Q held with no modifier while the drawing has the keyboard (no
+        // text being typed, no dialog): snapping is off until it is let
+        // go, for one move or node drag placed freely without turning
+        // Alt+Q on and off (#3072).
+        self.snap_held_off = self.text_edit.is_none()
+            && !dialog_open
+            && ctx.input(|i| i.key_down(Key::Q) && i.modifiers.is_none());
         // Text typing has priority; the zoom keys, which type nothing,
         // still zoom (#1699).
         if self.text_edit.is_some() && !dialog_open {

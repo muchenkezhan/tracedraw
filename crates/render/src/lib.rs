@@ -1280,18 +1280,29 @@ impl Renderer<'_> {
                     self.draw_object_shadow(sh, frame, transform, &page_path);
                 }
             }
-            // Frame's fill first, contents clipped to the frame, then the frame's outline.
+            // Frame's fill first, contents clipped to the frame, then the
+            // frame's outline; an outline behind the fill goes first of
+            // all, beneath the fill and the contents. It came over both,
+            // so a text frame with a wide outline behind its fill showed
+            // the outline's colour where its fill was (#3110).
+            let behind = frame.stroke.as_ref().is_some_and(|st| st.behind_fill);
+            let outline = || {
+                let mut outline_only = (**frame).clone();
+                outline_only.fill = Fill::None;
+                outline_only.shadow = None;
+                outline_only.opacity = shape.opacity;
+                outline_only
+            };
+            if behind {
+                self.draw_shape(&outline(), transform);
+            }
             let mut frame_fill_only = (**frame).clone();
             frame_fill_only.stroke = None;
             frame_fill_only.shadow = None;
             frame_fill_only.opacity = shape.opacity;
             self.draw_clip_frame_inside(shape, &frame_fill_only, contents, transform);
-            if frame.stroke.is_some() {
-                let mut outline_only = (**frame).clone();
-                outline_only.fill = Fill::None;
-                outline_only.shadow = None;
-                outline_only.opacity = shape.opacity;
-                self.draw_shape(&outline_only, transform);
+            if frame.stroke.is_some() && !behind {
+                self.draw_shape(&outline(), transform);
             }
             return;
         }
@@ -1604,6 +1615,7 @@ impl Renderer<'_> {
             {
                 // A filled outline: the stroke's area painted with the fill,
                 // spread over the outline's bounds.
+                let sk = headed_line(&page_path, stroke, self.screen).unwrap_or_else(|| sk.clone());
                 if let Some(band) = sk.stroke(&sk_stroke, 1.0) {
                     use tracedraw_core::geometry::Shape as _;
                     let pad = (sk_stroke.width as f64 / self.zoom.max(1e-9)) / 2.0;
@@ -1611,6 +1623,8 @@ impl Renderer<'_> {
                     self.draw_fill(&fill, &b.to_path(0.01), &band, FillRule::Winding);
                 }
             } else {
+                // Cut back under its arrowheads (#2981).
+                let sk = headed_line(&page_path, stroke, self.screen).unwrap_or_else(|| sk.clone());
                 self.pixmap
                     .stroke_path(&sk, &paint, &sk_stroke, Transform::identity(), None);
             }
@@ -3618,6 +3632,7 @@ fn paint_shown(
             },
             dash,
         };
+        let sk = headed_line(shown.path, stroke, to_screen).unwrap_or(sk);
         layer.stroke_path(&sk, &paint, &line, Transform::identity(), clip);
     }
     for head in tracedraw_core::style::arrowhead_paths(shown.path, stroke) {
@@ -5075,6 +5090,13 @@ pub fn sk_color(c: Color) -> SkColor {
 pub fn sk_color_alpha(c: Color, opacity: f32) -> SkColor {
     let [r, g, b] = c.to_rgb8();
     SkColor::from_rgba8(r, g, b, (opacity.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// An open line with arrowheads cut back under them (page space), on
+/// screen: `None` when nothing is cut (#2981).
+fn headed_line(page_path: &BezPath, stroke: &Stroke, screen: Affine) -> Option<SkPath> {
+    let cut = tracedraw_core::style::arrowhead_stroke_path(page_path, stroke)?;
+    to_sk_path(&(screen * cut))
 }
 
 /// How far from the target a path may reach, pixels, before it is cut
@@ -6868,6 +6890,33 @@ mod tests {
             "no content lines to the right of the frame"
         );
         assert_eq!(px(&pm, 50, 60), (255, 255, 255), "no fill");
+    }
+
+    /// A clip frame whose outline is behind its fill draws the outline
+    /// beneath the fill and the contents, as text in a PowerClip with a
+    /// wide outline behind its fill is drawn in the file of #3110: the
+    /// outline came over both, so the frame showed the outline's colour
+    /// where its fill and contents were.
+    #[test]
+    fn a_clip_frame_outline_behind_its_fill_goes_beneath() {
+        let mut frame = rect(1, Rect::new(20.0, 20.0, 60.0, 60.0), Color::rgb8(0, 0, 255));
+        let mut st = tracedraw_core::Stroke::new(Color::BLACK, 30.0);
+        st.behind_fill = true;
+        frame.stroke = Some(st);
+        let content = rect(2, Rect::new(24.0, 24.0, 32.0, 32.0), Color::rgb8(255, 0, 0));
+        let clip = Shape::new(
+            ShapeId(3),
+            ShapeKind::ClipFrame {
+                frame: Box::new(frame),
+                contents: vec![content],
+            },
+        );
+        let (doc, page) = doc_with(vec![clip]);
+        let pm = render_page_image_with(&doc, page, 25.4, &RenderOptions::default()).unwrap();
+        // Page y 40 is row 60 of the 100 px picture.
+        assert_eq!(px(&pm, 40, 60), (0, 0, 255), "the fill, over the outline");
+        assert_eq!(px(&pm, 28, 72), (255, 0, 0), "the contents, over the outline");
+        assert_eq!(px(&pm, 12, 60), (0, 0, 0), "the outline, past the frame");
     }
 
     /// A picture in the Wireframe view is a grey box crossed corner to

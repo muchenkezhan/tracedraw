@@ -2587,7 +2587,32 @@ impl<'a> Importer<'a> {
         } else {
             None
         };
-        shape.opacity = if fill { gs.fill_alpha } else { gs.stroke_alpha };
+        // A paint at alpha 0 draws nothing (Canva puts such see-through
+        // boxes over its pictures, #2640). Leave that part out so the shape
+        // is not an invisible object on the page, and keep the other part
+        // at its own alpha.
+        let has_fill = !matches!(shape.fill, Fill::None);
+        let fill_gone = has_fill && gs.fill_alpha <= 0.0;
+        let stroke_gone = shape.stroke.is_some() && gs.stroke_alpha <= 0.0;
+        if fill_gone {
+            shape.fill = Fill::None;
+        }
+        if stroke_gone {
+            shape.stroke = None;
+        }
+        if (fill_gone || stroke_gone) && matches!(shape.fill, Fill::None) && shape.stroke.is_none()
+        {
+            return;
+        }
+        shape.opacity = if has_fill && !fill_gone {
+            gs.fill_alpha
+        } else if shape.stroke.is_some() {
+            gs.stroke_alpha
+        } else if fill {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
         self.push(shape, &gs.clip);
     }
 
@@ -2908,6 +2933,7 @@ impl<'a> Importer<'a> {
                         .collect(),
                     _ => Vec::new(),
                 };
+                let mut cmyk_screen = CmykScreen::default();
                 for _ in 0..h {
                     if source.read_exact(&mut row).is_err() {
                         self.warn("image data shorter than its size; skipped");
@@ -2980,11 +3006,9 @@ impl<'a> Importer<'a> {
                                     } else {
                                         (comps[0], comps[1], comps[2], comps[3])
                                     };
-                                    (
-                                        to8((1.0 - c) * (1.0 - k)),
-                                        to8((1.0 - m) * (1.0 - k)),
-                                        to8((1.0 - yy) * (1.0 - k)),
-                                    )
+                                    let [r, g, b] =
+                                        cmyk_screen.rgb([to8(c), to8(m), to8(yy), to8(k)]);
+                                    (r, g, b)
                                 }
                                 ColorSpace::DeviceN(_) => {
                                     let n = cs.components();
@@ -5652,6 +5676,7 @@ fn cmyk_jpeg_rgba(data: &[u8], decode: &[f64]) -> Option<Vec<u8>> {
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(data), options);
     let raw = dec.decode().ok()?;
     let turn: [bool; 4] = std::array::from_fn(|i| decode.get(2 * i).is_some_and(|v| *v == 1.0));
+    let mut screen = CmykScreen::default();
     let mut out = Vec::with_capacity(raw.len());
     for px in raw.chunks_exact(4) {
         let mut ink = [px[0], px[1], px[2], px[3]];
@@ -5669,11 +5694,35 @@ fn cmyk_jpeg_rgba(data: &[u8], decode: &[f64]) -> Option<Vec<u8>> {
                 *v = 255 - *v;
             }
         }
-        let k = 255 - ink[3] as u32;
-        let rgb = |c: u8| (((255 - c as u32) * k + 127) / 255) as u8;
-        out.extend_from_slice(&[rgb(ink[0]), rgb(ink[1]), rgb(ink[2]), 255]);
+        let [r, g, b] = screen.rgb(ink);
+        out.extend_from_slice(&[r, g, b, 255]);
     }
     Some(out)
+}
+
+/// Screen colours of CMYK samples, as a CMYK colour of the drawing shows
+/// (the press model, or the CMYK profile when one is loaded), each
+/// sample worked out once. Taken as plain 1 - ink, solid cyan and
+/// magenta came in as a pure RGB blue far brighter than any press
+/// prints, unlike the same colour drawn as a vector (#3225).
+#[derive(Default)]
+struct CmykScreen {
+    seen: std::collections::HashMap<[u8; 4], [u8; 3]>,
+}
+
+impl CmykScreen {
+    fn rgb(&mut self, ink: [u8; 4]) -> [u8; 3] {
+        *self.seen.entry(ink).or_insert_with(|| {
+            let f = |v: u8| v as f32 / 255.0;
+            Color::Cmyk {
+                c: f(ink[0]),
+                m: f(ink[1]),
+                y: f(ink[2]),
+                k: f(ink[3]),
+            }
+            .to_rgb8()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -6308,6 +6357,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn paint_at_alpha_zero_leaves_no_invisible_object() {
+        // Canva lays see-through boxes (ca 0) over its pictures (#2640).
+        let bytes = one_page(
+            "0 0 0 rg 0 0 50 50 re f /G0 gs 60 0 40 40 re f \
+             1 0 0 RG 5 w 0 60 40 40 re B /G1 gs 0 0 1 rg 60 60 30 30 re B",
+            "<< /ExtGState << /G0 << /ca 0 >> /G1 << /ca 1 /CA 0 >> >> >>",
+            &[],
+        );
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let p = &imp.pages[0];
+        assert_eq!(p.shapes.len(), 3, "{:?}", imp.warnings);
+        assert!(matches!(p.shapes[0].fill, Fill::Solid(_)));
+        // Fill at alpha 0 and a red outline: only the outline, seen.
+        assert!(matches!(p.shapes[1].fill, Fill::None));
+        assert!(p.shapes[1].stroke.is_some());
+        assert!((p.shapes[1].opacity - 1.0).abs() < 1e-9);
+        // Outline at alpha 0: only the blue fill.
+        assert!(matches!(p.shapes[2].fill, Fill::Solid(_)));
+        assert!(p.shapes[2].stroke.is_none());
+        assert!((p.shapes[2].opacity - 1.0).abs() < 1e-9);
+    }
+
     /// A circle as four curves, counter-clockwise from its right end, for
     /// the content streams of the clip tests.
     fn circle_ops(cx: f64, cy: f64, r: f64) -> String {
@@ -6754,17 +6827,69 @@ mod tests {
     /// A CMYK JPEG stored with its inks turned over and drawn with an
     /// inverting Decode array, the usual way such pictures are written,
     /// comes in as it looks, not as a negative (#2322). Its left half is
-    /// full cyan, its right half half black.
+    /// full cyan, its right half half black. The inks show as the same
+    /// CMYK colours drawn as vectors do (#3225).
     #[test]
     fn cmyk_jpeg_with_inverting_decode_is_not_a_negative() {
         let jpeg = include_bytes!("../testdata/cmyk-inverted.jpg");
         let (cyan, grey) = cmyk_jpeg_pixels(jpeg, "/Decode [1 0 1 0 1 0 1 0]");
-        assert!(cyan[0] < 30 && cyan[1] > 225 && cyan[2] > 225, "{cyan:?}");
-        assert!(grey.iter().all(|v| (110..=145).contains(v)), "{grey:?}");
+        let near = |got: [u8; 3], c: f32, k: f32| {
+            let want = Color::Cmyk {
+                c,
+                m: 0.0,
+                y: 0.0,
+                k,
+            }
+            .to_rgb8();
+            got.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 16)
+        };
+        assert!(near(cyan, 1.0, 0.0), "{cyan:?}");
+        assert!(near(grey, 0.0, 0.5), "{grey:?}");
         // Without the Decode array the same samples are the inks as
         // stored: no cyan and full black on the left, so near black.
         let (left, _) = cmyk_jpeg_pixels(jpeg, "");
         assert!(left.iter().all(|v| *v < 40), "{left:?}");
+    }
+
+    /// Solid cyan and magenta in a plain CMYK picture show as the press
+    /// prints that blue, as the same colour drawn as a vector, not as
+    /// a pure RGB blue (#3225).
+    #[test]
+    fn cmyk_pictures_show_as_cmyk_colours_do() {
+        // 2 x 1 pixels: C+M, then paper.
+        let samples = [255u8, 255, 0, 0, 0, 0, 0, 0];
+        let mut image = format!(
+            "<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Length {} >>\nstream\n",
+            samples.len()
+        )
+        .into_bytes();
+        image.extend_from_slice(&samples);
+        image.extend_from_slice(b"\nendstream");
+        let bytes = pdf_bin(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>".to_vec(),
+            stream("", "q 80 0 0 80 10 10 cm /Im1 Do Q").into_bytes(),
+            image,
+        ]);
+        let mut ids = IdSource::default();
+        let imp = parse(&bytes, &mut ids).expect("parse");
+        let ShapeKind::Bitmap { png, .. } = &imp.pages[0].shapes[0].kind else {
+            panic!("{:?}", imp.pages[0].shapes[0].kind);
+        };
+        let pm = tiny_skia::Pixmap::decode_png(png).expect("png");
+        let p = pm.pixels()[0];
+        let blue = Color::Cmyk {
+            c: 1.0,
+            m: 1.0,
+            y: 0.0,
+            k: 0.0,
+        }
+        .to_rgb8();
+        assert_eq!([p.red(), p.green(), p.blue()], blue);
+        assert_ne!(blue, [0, 0, 255], "not the plain 1 - ink blue");
+        let paper = pm.pixels()[1];
+        assert_eq!([paper.red(), paper.green(), paper.blue()], [255, 255, 255]);
     }
 
     /// A one-page PDF whose objects may hold binary streams: each object
