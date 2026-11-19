@@ -238,7 +238,7 @@ impl App {
     /// The pieces of `still` within the snapping radius of `p`: what a
     /// node dragged there snaps to of its own curves.
     pub(crate) fn still_near<'a>(&self, still: &'a StillGeometry, p: Point) -> Vec<&'a Geo> {
-        if self.snap.off || !self.snaps_to_objects() || !self.snap_enabled() {
+        if self.snaps_off() || !self.snaps_to_objects() || !self.snap_enabled() {
             return Vec::new();
         }
         let tol = self.snap_tolerance();
@@ -756,7 +756,7 @@ impl App {
     /// excluded objects that stays put meanwhile (a node being dragged
     /// snaps to the other nodes and segments of its own curve, #673).
     pub fn snap_point_with(&self, p: Point, exclude: &[ShapeId], own: &[&Geo]) -> Point {
-        if self.snap.off {
+        if self.snaps_off() {
             return p;
         }
         let enabled = self.snap_enabled();
@@ -867,7 +867,7 @@ impl App {
     /// exactly (#2352); the point it takes is marked with its name. Else
     /// it snaps as the pointer does (guidelines, the grid, the page).
     pub fn snap_pivot(&self, p: Point) -> Point {
-        if self.snap.off {
+        if self.snaps_off() {
             return p;
         }
         let tol = self.snap_tolerance();
@@ -1022,7 +1022,7 @@ impl App {
         d: Vec2,
         start: Option<&StillGeometry>,
     ) -> Vec2 {
-        if self.snap.off {
+        if self.snaps_off() {
             return d;
         }
         let enabled = self.snap_enabled();
@@ -1126,11 +1126,11 @@ impl App {
     }
 
     pub fn alignment_guides_on(&self) -> bool {
-        self.snap.alignment_guides && !self.snap.off
+        self.snap.alignment_guides && !self.snaps_off()
     }
 
     pub fn dynamic_guides_on(&self) -> bool {
-        self.snap.dynamic_guides && !self.snap.off
+        self.snap.dynamic_guides && !self.snaps_off()
     }
 
     fn set_overlay(
@@ -1425,8 +1425,55 @@ impl App {
         Vec2::new(d.x + best_dx.unwrap_or(0.0), d.y + best_dy.unwrap_or(0.0))
     }
 
+    /// All snapping off: Alt+Q, or Q held down on its own for the
+    /// moment (#3072).
+    pub fn snaps_off(&self) -> bool {
+        self.snap.off || self.snap_held_off
+    }
+
+    /// The guidelines what is being dragged lies on: the edges and
+    /// centre of the selection being moved or scaled, or of the box
+    /// being drawn, with Snap to Guidelines on. The drawing window
+    /// shows them highlighted, so a snap to a guideline is seen in a
+    /// cluttered drawing (#3073).
+    pub fn snapped_guides(&self) -> Vec<GuideLine> {
+        use crate::app::Drag;
+        if self.snaps_off() || !self.snap.guides {
+            return Vec::new();
+        }
+        let b = match &self.drag {
+            Drag::Move {
+                start_bounds,
+                total,
+                ..
+            } => *start_bounds + *total,
+            Drag::Scale { start_bounds, .. } => match self.preview_transform_of(&self.drag) {
+                Some(t) => t.transform_rect_bbox(*start_bounds),
+                None => return Vec::new(),
+            },
+            Drag::Box { start, current, .. } | Drag::ThreePointBase { start, current } => {
+                Rect::from_points(*start, *current)
+            }
+            _ => return Vec::new(),
+        };
+        let Ok(guides) = self.doc().guides_on_page(self.page) else {
+            return Vec::new();
+        };
+        let on = |v: f64, edges: [f64; 3]| edges.iter().any(|e| (e - v).abs() < 1e-6);
+        let (xs, ys) = ([b.x0, b.x1, b.center().x], [b.y0, b.y1, b.center().y]);
+        guides
+            .iter()
+            .map(|g| g.line)
+            .filter(|line| match *line {
+                GuideLine::Vertical { x } => on(x, xs),
+                GuideLine::Horizontal { y } => on(y, ys),
+                GuideLine::Angled { .. } => false,
+            })
+            .collect()
+    }
+
     pub fn snap_enabled(&self) -> bool {
-        !self.snap.off
+        !self.snaps_off()
             && (self.snap.grid
                 || self.snap.guides
                 || self.snaps_to_objects()
@@ -2263,6 +2310,53 @@ mod tests {
         app.drag = scale(Rect::new(10.0, 20.0, 30.0, 30.0), 25.0);
         let (q, axes) = app.snap_scale_handle(Point::new(49.0, 25.0));
         assert_eq!((q, axes), (Point::new(49.0, 25.0), (false, false)));
+    }
+
+    /// An object moved onto guidelines shows them highlighted: the ones
+    /// its edges or centre lie on, and only while Snap to Guidelines is
+    /// on (#3073).
+    #[test]
+    fn guidelines_an_object_snapped_to_are_highlighted() {
+        use crate::app::Drag;
+        let mut app = app();
+        let page = app.page;
+        for guide in [
+            Guide::vertical(50.0),
+            Guide::horizontal(100.0),
+            Guide::vertical(80.0),
+        ] {
+            app.run(Command::AddGuide { page, guide });
+        }
+        let id = rect(&mut app, 10.0, 10.0, 30.0, 30.0);
+        app.select(vec![id]);
+        let b = app.selection_bounds().expect("bounds");
+        let moved = |total: Vec2| Drag::Move {
+            start: Point::ZERO,
+            last: Point::ZERO,
+            total,
+            start_bounds: b,
+            source: None,
+            start_geometry: None,
+        };
+        // The left edge onto x = 50, the top onto y = 100.
+        app.drag = moved(Vec2::new(50.0 - b.x0, 100.0 - b.y1));
+        assert_eq!(
+            app.snapped_guides(),
+            vec![
+                GuideLine::Vertical { x: 50.0 },
+                GuideLine::Horizontal { y: 100.0 }
+            ]
+        );
+        // Off the guidelines: none.
+        app.drag = moved(Vec2::new(3.0, 3.0));
+        assert!(app.snapped_guides().is_empty());
+        // Snap to Guidelines off: none.
+        app.drag = moved(Vec2::new(50.0 - b.x0, 100.0 - b.y1));
+        app.snap.guides = false;
+        assert!(app.snapped_guides().is_empty());
+        app.snap.guides = true;
+        app.drag = Drag::None;
+        assert!(app.snapped_guides().is_empty());
     }
 
     /// A corner keeping the proportions, snapped onto a vertical

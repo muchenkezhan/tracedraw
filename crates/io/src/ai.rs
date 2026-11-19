@@ -514,6 +514,14 @@ impl Writer<'_> {
             }
             ShapeKind::ClipFrame { frame, contents } => {
                 self.line("u");
+                // An outline behind the frame's fill goes beneath the fill
+                // and the contents (#3110).
+                let behind = frame.stroke.as_ref().is_some_and(|st| st.behind_fill);
+                let mut outline = (**frame).clone();
+                outline.fill = Fill::None;
+                if behind {
+                    self.shape(&outline, transform);
+                }
                 let mut fill_only = (**frame).clone();
                 fill_only.stroke = None;
                 self.shape(&fill_only, transform);
@@ -526,9 +534,9 @@ impl Writer<'_> {
                     }
                     self.line("Q");
                 }
-                let mut outline = (**frame).clone();
-                outline.fill = Fill::None;
-                self.shape(&outline, transform);
+                if !behind {
+                    self.shape(&outline, transform);
+                }
                 self.line("U");
                 return;
             }
@@ -546,6 +554,14 @@ impl Writer<'_> {
         // Text is filled by winding, the rest even-odd.
         let subs = if filled && !matches!(shape.kind, ShapeKind::Text { .. }) {
             orient_for_nonzero(subs)
+        } else if let Some(cut) = shape
+            .stroke
+            .as_ref()
+            .filter(|_| !filled)
+            .and_then(|s| tracedraw_core::arrowhead_stroke_path(&shape.page_path(), s))
+        {
+            // An unfilled line with arrowheads ends under them (#2981).
+            subpaths(&(parent * cut))
         } else {
             subs
         };
