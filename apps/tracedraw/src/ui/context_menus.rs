@@ -472,6 +472,7 @@ pub(crate) const CATALOG: &[MenuDefinition] = &[
             "options.scope_odd",
             "options.scope_even",
             "docker.master_in_front",
+            "docker.desktop_takes_beside_page",
             "docker.master_to_page",
             "docker.layer_to_master",
             "docker.move_to_page",

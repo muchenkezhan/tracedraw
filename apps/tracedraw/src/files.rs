@@ -132,6 +132,7 @@ pub fn name_with_extension(name: &str, mime: &str) -> String {
         "image/gif" => "gif",
         "image/bmp" => "bmp",
         "image/webp" => "webp",
+        "image/jxl" => "jxl",
         "image/tiff" => "tiff",
         "image/svg+xml" => "svg",
         "text/plain" => "txt",
@@ -225,6 +226,7 @@ pub fn mime_for_extension(ext: &str) -> &'static str {
         "gif" => "image/gif",
         "bmp" => "image/bmp",
         "webp" => "image/webp",
+        "jxl" => "image/jxl",
         "tif" | "tiff" => "image/tiff",
         "svg" => "image/svg+xml",
         "txt" => "text/plain",
@@ -614,11 +616,14 @@ pub enum FolderUse {
     BackupFolder,
     /// Options > Save, the auto-backups.
     AutoBackupFolder,
+    /// The Save Drawing dialog's Browse, the system's folder window
+    /// with the places only it knows (#3416).
+    SaveDrawing,
 }
 
 impl FolderUse {
     #[cfg(test)]
-    pub const ALL: [FolderUse; 8] = [
+    pub const ALL: [FolderUse; 9] = [
         FolderUse::ExportAssets,
         FolderUse::Package,
         FolderUse::FontFolder,
@@ -627,6 +632,7 @@ impl FolderUse {
         FolderUse::DictionaryFolder,
         FolderUse::BackupFolder,
         FolderUse::AutoBackupFolder,
+        FolderUse::SaveDrawing,
     ];
 
     /// What the folder button does in this build.
@@ -681,6 +687,7 @@ pub fn folder_action(place: FolderUse, platform: Platform) -> FolderAction {
         (Platform::Android, BackupFolder | AutoBackupFolder) => {
             Unavailable("folder.backup_android")
         }
+        (_, SaveDrawing) => Unavailable("folder.save_desktop"),
     }
 }
 
@@ -703,13 +710,23 @@ pub fn folder_tip(place: FolderUse, platform: Platform) -> Option<&'static str> 
 /// Choose a folder with the system's dialog (`None` when cancelled). The
 /// token comes from [`folder_action`], which gives one on the desktop only.
 pub fn pick_folder(token: FolderToken) -> Option<PathBuf> {
+    pick_folder_from(token, None)
+}
+
+/// [`pick_folder`] opening on `start` when it is a folder.
+pub fn pick_folder_from(token: FolderToken, start: Option<&Path>) -> Option<PathBuf> {
     let _ = token;
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
-        rfd::FileDialog::new().pick_folder()
+        let mut d = rfd::FileDialog::new();
+        if let Some(start) = start.filter(|s| s.is_dir()) {
+            d = d.set_directory(start);
+        }
+        d.pick_folder()
     }
     #[cfg(any(target_arch = "wasm32", target_os = "android"))]
     {
+        let _ = start;
         None
     }
 }
@@ -956,6 +973,10 @@ pub enum Place {
     /// A mounted drive, memory card, network share or other volume
     /// (#1391): named after its folder.
     Drive,
+    /// A cloud storage folder (OneDrive, Dropbox, Google Drive, iCloud
+    /// Drive), named after its folder: the system's own file windows
+    /// list them, the Save Drawing dialog did not (#3416).
+    Cloud,
 }
 
 /// The user's home folder.
@@ -995,6 +1016,11 @@ pub fn places() -> Vec<(Place, PathBuf)> {
             out.push((place, dir));
         }
     }
+    for dir in cloud_dirs(&home, &|k| std::env::var_os(k)) {
+        if dir.is_dir() && !out.iter().any(|(_, p)| *p == dir) {
+            out.push((Place::Cloud, dir));
+        }
+    }
     if cfg!(windows) {
         for letter in b'C'..=b'Z' {
             let root = PathBuf::from(format!("{}:\\", letter as char));
@@ -1010,6 +1036,31 @@ pub fn places() -> Vec<(Place, PathBuf)> {
             out.push((Place::Drive, drive));
         }
     }
+    out
+}
+
+/// The cloud storage folders the desktop programs of OneDrive, Dropbox,
+/// Google Drive and iCloud make in the home folder `home` (or name in
+/// the variables `var` reads), whether they exist or not (#3416).
+pub fn cloud_dirs(
+    home: &Path,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for key in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        if let Some(v) = var(key).filter(|v| !v.is_empty()) {
+            out.push(PathBuf::from(v));
+        }
+    }
+    for name in ["OneDrive", "Dropbox", "Google Drive", "iCloudDrive"] {
+        out.push(home.join(name));
+    }
+    let mut seen = Vec::new();
+    out.retain(|p| {
+        let fresh = !seen.contains(p);
+        seen.push(p.clone());
+        fresh
+    });
     out
 }
 
@@ -1336,6 +1387,9 @@ pub fn decode_picture(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
 /// stands upright, #2167).
 pub fn decode_picture_within(bytes: &[u8], limit: u64) -> image::ImageResult<image::DynamicImage> {
     use image::ImageDecoder;
+    if is_jxl(bytes) {
+        return decode_jxl(bytes, limit);
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(limit);
@@ -1349,6 +1403,24 @@ pub fn decode_picture_within(bytes: &[u8], limit: u64) -> image::ImageResult<ima
     let mut img = image::DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
     Ok(img)
+}
+
+/// A JPEG XL file: the bare codestream or the ISO container (#3210).
+pub fn is_jxl(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0x0a]) || bytes.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n")
+}
+
+/// Decode a JPEG XL file within `limit` bytes (#3210). The codestream's
+/// own orientation is applied by the decoder; an Exif orientation in the
+/// file is not applied again, as the format says.
+fn decode_jxl(bytes: &[u8], limit: u64) -> image::ImageResult<image::DynamicImage> {
+    use image::ImageDecoder;
+    let mut decoder = jxl_oxide::integration::JxlDecoder::new(std::io::Cursor::new(bytes))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(limit);
+    decoder.set_limits(limits.clone())?;
+    limits.reserve(decoder.total_bytes())?;
+    image::DynamicImage::from_decoder(decoder)
 }
 
 /// Whether the Exif orientation of picture file `bytes` turns it a
@@ -2011,6 +2083,30 @@ pub mod test_save {
 mod tests {
     use super::*;
 
+    /// The cloud folders offered in the Save Drawing dialog: OneDrive
+    /// where Windows names it, and the folders the cloud programs make
+    /// in the home folder, each once (#3416).
+    #[test]
+    fn cloud_folders_come_from_the_home_folder_and_onedrive() {
+        let home = Path::new("/home/me");
+        let var = |k: &str| match k {
+            "OneDrive" => Some(std::ffi::OsString::from("/home/me/OneDrive")),
+            "OneDriveCommercial" => Some(std::ffi::OsString::from("/home/me/OneDrive - Work")),
+            _ => None,
+        };
+        let dirs = cloud_dirs(home, &var);
+        assert_eq!(
+            dirs,
+            vec![
+                home.join("OneDrive"),
+                home.join("OneDrive - Work"),
+                home.join("Dropbox"),
+                home.join("Google Drive"),
+                home.join("iCloudDrive"),
+            ]
+        );
+    }
+
     /// A write that fails half way (a full disk, an error while the
     /// drawing is written) leaves the file it was replacing as it was:
     /// it was written over from the start and left cut short. A write
@@ -2327,6 +2423,7 @@ mod tests {
                 OpenFiles,
                 Unavailable("folder.backup_web"),
                 Unavailable("folder.backup_web"),
+                Unavailable("folder.save_desktop"),
             ]
         );
         assert_eq!(
@@ -2340,6 +2437,7 @@ mod tests {
                 OpenFiles,
                 Unavailable("folder.backup_android"),
                 Unavailable("folder.backup_android"),
+                Unavailable("folder.save_desktop"),
             ]
         );
         assert_eq!(
@@ -2442,6 +2540,7 @@ mod tests {
             "options.rs",
             "picture_mosaic_docker.rs",
             "export_assets.rs",
+            "save_as.rs",
         ] {
             let (_, text) = sources
                 .iter()

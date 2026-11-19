@@ -54,6 +54,8 @@ struct Actions {
     locked: Option<(LayerId, bool)>,
     scope: Option<(LayerId, MasterScope)>,
     in_front: Option<(LayerId, bool)>,
+    /// The desktop takes objects put beside the page, or not (#3100).
+    desktop_takes: Option<bool>,
     pick: Option<LayerId>,
     select: Option<ShapeId>,
     /// An object's eye or padlock was clicked (#832).
@@ -168,7 +170,7 @@ enum Look {
 pub fn object_label(s: &Shape) -> String {
     match s.name.as_deref().map(str::trim) {
         Some(n) if !n.is_empty() => n.to_string(),
-        _ => kind_name(&s.kind),
+        _ => crate::ui::dockers::tagged_kind(s, kind_name(&s.kind)),
     }
 }
 
@@ -854,6 +856,7 @@ fn layer_rows(
             "docker.move_down",
             "docker.show_on",
             "docker.master_in_front",
+            "docker.desktop_takes_beside_page",
             "docker.master_to_page",
             "docker.layer_to_master",
             "docker.move_to_page",
@@ -1035,6 +1038,19 @@ fn layer_rows(
                                 .clicked()
                         {
                             act.in_front = Some((layer.id, front));
+                            ui.close();
+                        }
+                    }
+                }
+                "docker.desktop_takes_beside_page" => {
+                    if at.master && layer.desktop && show_item(ui, key) {
+                        let mut takes = app.settings.desktop_takes_objects_beside_page;
+                        if ui
+                            .checkbox(&mut takes, tr(key))
+                            .on_hover_text(tr("docker.desktop_takes_beside_page_tip"))
+                            .clicked()
+                        {
+                            act.desktop_takes = Some(takes);
                             ui.close();
                         }
                     }
@@ -2109,7 +2125,7 @@ fn select_layer_objects(app: &mut App, layer: LayerId) {
 /// The commands that move the top-level objects `ids` to the top of
 /// `layer`, keeping their order (bottom first) and their place on the
 /// page; objects already there stay.
-fn move_commands(app: &App, ids: &[ShapeId], layer: LayerId) -> Vec<Command> {
+pub(crate) fn move_commands(app: &App, ids: &[ShapeId], layer: LayerId) -> Vec<Command> {
     let doc = app.doc();
     let mut found: Vec<(usize, usize, Shape)> = Vec::new();
     for (rank, l) in doc.all_layers().enumerate() {
@@ -2921,6 +2937,9 @@ fn apply(app: &mut App, ui: &Ui, mut act: Actions) {
     }
     if let Some((layer, in_front)) = act.in_front {
         app.run(Command::SetLayerInFront { layer, in_front });
+    }
+    if let Some(takes) = act.desktop_takes {
+        app.settings.desktop_takes_objects_beside_page = takes;
     }
     if let Some(layer) = act.collapse {
         if !app.objects_collapsed.remove(&layer) {

@@ -4151,6 +4151,10 @@ fn outline_editor_mixed(
                 (vec![4.0, 2.0], "docker.dash_dashed"),
                 (vec![1.0, 1.0], "docker.dash_dotted"),
                 (vec![6.0, 2.0, 1.0, 2.0], "docker.dash_dash_dot"),
+                (
+                    tracedraw_core::Stroke::ROUND_DOTS.to_vec(),
+                    "docker.dash_round_dots",
+                ),
             ] {
                 if ui
                     .selectable_label(!mixed && s.dash == d, tr(n))
@@ -4160,7 +4164,10 @@ fn outline_editor_mixed(
                     ))
                     .clicked()
                 {
-                    s.dash = d;
+                    // Round dots take round caps (#3404).
+                    if s.set_dash(&d) {
+                        touched.push(StrokeField::Cap);
+                    }
                     touched.push(StrokeField::Dash);
                     changed = true;
                 }
@@ -4398,6 +4405,23 @@ pub fn kind_id(k: &ShapeKind) -> &'static str {
         ShapeKind::Table(_) => "Table",
         ShapeKind::SymbolInstance { .. } => "Symbol",
     }
+}
+
+/// What an object is, with what makes it more than its kind: a
+/// symmetry (#2997) or an object clone (#2877).
+pub fn tagged_kind(s: &tracedraw_core::document::Shape, kind: String) -> String {
+    let mut kind = kind;
+    if s
+        .effects
+        .iter()
+        .any(|e| matches!(e, tracedraw_core::live::Effect::Symmetry { .. }))
+    {
+        kind = trf("status.symmetry_kind", &[("k", &kind)]);
+    }
+    if crate::object_clone::clone_link(&s.data).is_some() {
+        kind = trf("status.clone_kind", &[("k", &kind)]);
+    }
+    kind
 }
 
 pub fn kind_name(k: &ShapeKind) -> String {
@@ -6249,6 +6273,7 @@ pub(crate) mod tests {
                 sharpness: 50.0,
                 complex: None,
                 twist: 0.0,
+                bend: 0.0,
             })
             .expect("polygon");
         app.start_text(Point::new(20.0, 80.0), None);
