@@ -19,6 +19,7 @@
 mod extra;
 pub mod vba_run;
 mod vg;
+pub mod vg_catalog;
 
 use crate::app::App;
 use boa_engine::{
@@ -447,7 +448,7 @@ fn host_for(app: &App, trust: Trust) -> HostInner {
         selection: app.selection.clone(),
         commands: Vec::new(),
         output: Vec::new(),
-        next_id: app.engine.document().ids().peek_next(),
+        next_id: app.engine.ids().peek_next(),
         trust,
         file: app.file.as_ref().map(|f| f.display().to_string()),
         vg: false,
@@ -2493,6 +2494,7 @@ impl HostInner {
                         sharpness: num(a, "sharpness", 0.0),
                         complex: None,
                         twist: 0.0,
+                        bend: 0.0,
                     },
                 );
                 self.add(layer, s)?

@@ -798,6 +798,7 @@ fn complex_stars_are_written_as_curves() {
             sharpness: 0.0,
             complex: Some(1),
             twist: 0.0,
+            bend: 0.0,
         },
     );
     star.fill = Fill::Solid(Color::BLACK);
@@ -823,6 +824,7 @@ fn inverted_stars_are_written_as_the_curves_they_draw() {
             sharpness: -0.6,
             complex: None,
             twist: 0.0,
+            bend: 0.0,
         },
     );
     star.fill = Fill::Solid(Color::BLACK);
@@ -2334,6 +2336,67 @@ fn a_drawings_cmyk_profile_is_stored_and_named() {
     // It comes back with the drawing.
     let (back, _) = crate::open_bytes(&bytes, "back").expect("reads");
     assert_eq!(back.cmyk_profile.map(|p| p.data.len()), Some(data.len()));
+}
+
+/// #3425: an RGB document is saved as one (`ColorModel` Rgb in
+/// `color/color.xml`), a CMYK one as CMYK, and the mode comes back; the
+/// RGB colour of an object inside a clip frame stays RGB.
+#[test]
+fn an_rgb_drawing_is_saved_as_an_rgb_document() {
+    use std::io::Read;
+    use tracedraw_core::document::PrimaryColorMode;
+    let mut doc = Document::new("w", Size::new(200.0, 100.0));
+    let mut ids = doc.ids().clone();
+    let mut inside = Shape::new(
+        ids.shape(),
+        ShapeKind::Rect {
+            rect: Rect::new(10.0, 10.0, 90.0, 60.0),
+            radius: 0.0,
+            corners: None,
+        },
+    );
+    inside.fill = Fill::Solid(Color::rgb8(30, 160, 90));
+    inside.stroke = None;
+    let mut frame = Shape::new(
+        ids.shape(),
+        ShapeKind::Ellipse {
+            rect: Rect::new(20.0, 20.0, 70.0, 50.0),
+            arc: None,
+        },
+    );
+    frame.fill = Fill::None;
+    let pc = Shape::new(
+        ids.shape(),
+        ShapeKind::ClipFrame {
+            frame: Box::new(frame),
+            contents: vec![inside],
+        },
+    );
+    doc.pages[0].layers[0].shapes = vec![pc];
+    doc.set_ids(ids);
+    for (mode, model) in [
+        (PrimaryColorMode::Rgb, "<ColorModel>Rgb</ColorModel>"),
+        (PrimaryColorMode::Cmyk, "<ColorModel>Cmyk</ColorModel>"),
+    ] {
+        doc.metadata.primary_color_mode = mode;
+        for v in [17u16, 24] {
+            let bytes = document_to_cdr_version(&doc, v);
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+            let mut color = String::new();
+            z.by_name("color/color.xml")
+                .expect("colour settings")
+                .read_to_string(&mut color)
+                .expect("text");
+            assert!(color.contains(model), "{v}: {color}");
+            let (back, _) = crate::open_bytes(&bytes, "back").expect("reads");
+            assert_eq!(back.metadata.primary_color_mode, mode, "{v}");
+            let ShapeKind::ClipFrame { contents, .. } = &back.pages[0].layers[0].shapes[0].kind
+            else {
+                panic!("{v}: {:?}", back.pages[0].layers[0].shapes[0].kind);
+            };
+            assert_eq!(contents[0].fill, Fill::Solid(Color::rgb8(30, 160, 90)), "{v}");
+        }
+    }
 }
 
 #[test]
@@ -7143,6 +7206,7 @@ fn a_contour_opens_live_again() {
         offset: 2.0,
         outside: true,
         to_center: false,
+        both: false,
         fill_to: Color::rgb8(0, 0, 255),
         outline_to: None,
         fill_end_to: None,
@@ -10227,4 +10291,185 @@ fn arrowheads_go_out_as_curves_and_open_again_on_the_line() {
         assert_eq!(read.len(), 1, "{v}: {read:?}");
         assert_eq!(read[0].stroke, line.stroke, "{v}");
     }
+}
+
+/// An emoji or a mathematical letter (beyond U+FFFF) is two letters of a
+/// file, a surrogate pair of marked UTF-16 units, from version 12. They
+/// went out as "?", and read back, every run after such a letter started
+/// one letter late (it took the letter before it), in every version.
+#[test]
+fn letters_beyond_u_ffff_round_trip_with_their_runs() {
+    let mut ids = tracedraw_core::id::IdSource::default();
+    let mut bold = TextSpan::new("B\u{1F600}b", "Arial", 20.0);
+    bold.bold = true;
+    let spans = vec![
+        TextSpan::new("a\u{1F600}\u{1D538}", "Arial", 12.0),
+        bold,
+        TextSpan::new(
+            "\u{e9}\u{1F44D}\u{1F3FD} family \u{1F468}\u{200d}\u{1F467}z",
+            "Arial",
+            12.0,
+        ),
+    ];
+    let t = text_shape(&mut ids, spans.clone(), TextAlign::Left);
+    let doc = doc_with(vec![t]);
+    for v in 12u16..=*crate::write::versions().end() {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        let runs: Vec<(String, bool)> = back
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .filter_map(|s| match &s.kind {
+                ShapeKind::Text { spans, .. } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|sp| (sp.text.clone(), sp.bold))
+            .collect();
+        let want: Vec<(String, bool)> = spans.iter().map(|sp| (sp.text.clone(), sp.bold)).collect();
+        assert_eq!(runs, want, "{v}");
+    }
+}
+
+/// A drawing's symbols are saved as symbols (#3250): the definition once
+/// in the document's `LIST sytr` and the table naming it, each instance
+/// a `LIST symb` placing it. Opened again, the symbol is there with its
+/// name and the instances stand where they stood; they used to be
+/// written as groups of the definition's objects.
+#[test]
+fn symbols_are_saved_as_symbols_and_their_instances() {
+    use tracedraw_core::document::Symbol;
+    let mut doc = Document::new("w", Size::new(200.0, 100.0));
+    let mut ids = doc.ids().clone();
+    let mut def = Shape::new(
+        tracedraw_core::id::ShapeId(0),
+        ShapeKind::Ellipse {
+            rect: Rect::new(-10.0, -5.0, 10.0, 5.0),
+            arc: None,
+        },
+    );
+    def.fill = Fill::Solid(Color::rgb8(200, 30, 30));
+    def.stroke = None;
+    doc.symbols.push(Symbol {
+        name: "Logo".into(),
+        shape: def,
+    });
+    let placements = [
+        Affine::translate((40.0, 30.0)),
+        Affine::translate((120.0, 60.0)) * Affine::rotate(0.5),
+        Affine::translate((160.0, 20.0)) * Affine::scale_non_uniform(2.0, 0.5),
+    ];
+    for t in placements {
+        let mut inst = Shape::new(ids.shape(), ShapeKind::SymbolInstance { index: 0 });
+        inst.transform = t;
+        inst.fill = Fill::None;
+        inst.stroke = None;
+        doc.pages[0].layers[0].shapes.push(inst);
+    }
+    doc.set_ids(ids);
+    let before: Vec<Rect> = doc.pages[0].layers[0]
+        .shapes
+        .iter()
+        .map(|s| {
+            s.expand(&doc.symbols)
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+                .expect("drawn")
+        })
+        .collect();
+    for v in [14, 27] {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "w.cdr").expect("reopens");
+        assert_eq!(back.symbols.len(), 1, "version {v}");
+        assert_eq!(back.symbols[0].name, "Logo", "version {v}");
+        let shapes: Vec<&Shape> = back
+            .pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .flat_map(|l| &l.shapes)
+            .collect();
+        assert_eq!(shapes.len(), 3, "version {v}");
+        let mut after: Vec<Rect> = Vec::new();
+        for s in &shapes {
+            assert!(
+                matches!(s.kind, ShapeKind::SymbolInstance { index: 0 }),
+                "version {v}: {:?}",
+                s.kind
+            );
+            let b = s
+                .expand(&back.symbols)
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.absorb(s.transform);
+                    c.bounds()
+                })
+                .reduce(|a, b| a.union(b))
+                .expect("drawn");
+            after.push(b);
+        }
+        for b in &before {
+            assert!(
+                after.iter().any(|a| (a.x0 - b.x0).abs() < 0.05
+                    && (a.y0 - b.y0).abs() < 0.05
+                    && (a.x1 - b.x1).abs() < 0.05
+                    && (a.y1 - b.y1).abs() < 0.05),
+                "version {v}: {b:?} not among {after:?}"
+            );
+        }
+    }
+}
+
+/// The document palette with its names, the spot inks, the colour styles
+/// and the object styles open again from a package, and an object keeps
+/// the object style it follows; they have no record written yet, so they
+/// used to be lost on saving. A RIFF file has no place for them.
+#[test]
+fn palette_inks_and_styles_open_again() {
+    use tracedraw_core::document::{ColorStyle, Ink, ObjectStyle, PaletteName, StyleParts};
+    let mut doc = kept_rect(Fill::Solid(Color::rgb8(200, 30, 30)));
+    doc.inks.push(Ink {
+        id: 7,
+        name: "PANTONE 185 C".into(),
+        cmyk: [0.0, 0.93, 0.79, 0.0],
+    });
+    let spot = doc.inks[0].color(0.6);
+    doc.palette = vec![Color::rgb8(1, 2, 3), spot];
+    doc.palette_names = vec![PaletteName {
+        color: Color::rgb8(1, 2, 3),
+        name: "Night".into(),
+    }];
+    doc.color_styles = vec![ColorStyle {
+        name: "Brand red".into(),
+        color: Color::rgb8(200, 30, 30),
+        harmony: None,
+    }];
+    doc.object_styles = vec![ObjectStyle {
+        name: "Card".into(),
+        fill: Fill::Solid(Color::rgb8(200, 30, 30)),
+        stroke: None,
+        id: 3,
+        parts: StyleParts::default(),
+        opacity: 1.0,
+    }];
+    doc.pages[0].layers[0].shapes[0].style = Some(3);
+    for v in [14u16, 16, 27] {
+        let bytes = document_to_cdr_version(&doc, v);
+        let (back, _) = crate::open_bytes(&bytes, "back").expect("reads back");
+        assert_eq!(back.palette, doc.palette, "{v}");
+        assert_eq!(back.palette_names, doc.palette_names, "{v}");
+        assert_eq!(back.inks, doc.inks, "{v}");
+        assert_eq!(back.color_styles, doc.color_styles, "{v}");
+        assert_eq!(back.object_styles, doc.object_styles, "{v}");
+        assert_eq!(back.pages[0].layers[0].shapes[0].style, Some(3), "{v}");
+    }
+    let (back, _) = crate::open_bytes(&document_to_cdr_version(&doc, 13), "back").expect("reads");
+    assert!(back.palette.is_empty() && back.object_styles.is_empty());
 }
