@@ -46,7 +46,8 @@ positive), scales in percent.
   With n copies the selection stays as it is and n copies are added to
   the active layer, copy k transformed k times; the last copies become
   the selection, so another Apply goes on from there. The copies are one
-  undo step named after the page.
+  undo step named after the page. Copies of linked text frames copied
+  together are linked to each other, as Step and Repeat links them.
 - Rotate keeps its centre: after Apply (with or without copies) the
   centre of rotation of the new selection is the point it turned about,
   so Apply again goes on round the same point (copies make a wheel
@@ -55,6 +56,20 @@ positive), scales in percent.
   about that point again.
 - With nothing selected the fields, the boxes, Copies and Apply are pale;
   the page buttons stay usable.
+
+## Rotate by Two Lines (#2870)
+
+Object > Transformations > Rotate by Two Lines (with something
+selected, `rotate_lines.rs`) waits for four clicks, each snapped as a
+drawing click: the two ends of a base line on the selection, then the
+two ends of a target line anywhere. The clicked lines show on the
+canvas, the last to the pointer, and the status line says which line
+comes next. After the fourth click the selection turns about the base
+line's first end by the angle from the base line to the target line
+(first end to second, the shorter way round), one "Rotate" undo step.
+A line whose ends are the same point turns nothing; a right click
+cancels
+(`rotate_lines::tests::the_base_line_takes_the_target_lines_angle`).
 
 ## Checks
 
@@ -67,3 +82,4 @@ positive), scales in percent.
 - `ui::transform_docker::tests::the_docker_draws_with_nothing_selected`
 - `ui::transform_docker::tests::the_shortcuts_open_a_page_and_close_it_again`
 - `ui::transform_docker::tests::the_docker_draws_every_page`
+- `textflow::tests::transformation_copies_of_a_chain_are_linked`

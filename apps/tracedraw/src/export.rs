@@ -248,7 +248,7 @@ fn page_file(
         "eps" => tracedraw_io::eps::page_to_eps(doc, k).into_bytes(),
         // The classic AI file: one artboard, so one page per file (#1728).
         "ai" if st.classic_ai() => tracedraw_io::ai::page_to_ai8(doc, k).into_bytes(),
-        "dxf" => tracedraw_io::dxf::page_to_dxf(doc, k).into_bytes(),
+        "dxf" => tracedraw_io::dxf::page_to_dxf_with(doc, k, &st.dxf_options()).into_bytes(),
         "emf" => tracedraw_io::emf::page_to_emf(doc, k),
         "wmf" => tracedraw_io::emf::page_to_wmf(doc, k),
         "plt" => tracedraw_io::plt::page_to_plt_with(doc, k, &st.plt_options()).into_bytes(),
@@ -277,9 +277,25 @@ fn page_file(
                 }
                 ExportColorMode::Rgb => {}
             }
+            let p = doc.page(pid).map_err(|e| e.to_string())?;
+            let fit = tracedraw_render::ViewTransform::whole_page(
+                p.size.width,
+                p.size.height,
+                st.render_dpi() / 25.4,
+            );
+            let pixels = u64::from(fit.0) * u64::from(fit.1);
+            // A large picture is drawn and written a strip at a time, so
+            // it is never whole in memory (#3039).
+            if matches!(ext, "png" | "tif") && pixels > STREAMED_PIXELS {
+                let transparent = st.transparent && ext == "png";
+                return streamed_picture(doc, pid, fit, ext, transparent, st.dpi, STRIP_PIXELS);
+            }
+            if pixels > tracedraw_render::MAX_PIXELS {
+                return Err(too_large(fit.0, fit.1));
+            }
             let mut pm = tracedraw_render::render_page_export_image(doc, pid, st.render_dpi())
                 .ok_or("render failed")?;
-            if st.transparent && matches!(ext, "png" | "webp" | "gif") {
+            if st.transparent && matches!(ext, "png" | "webp" | "gif" | "jxl") {
                 // Re-render on a transparent background.
                 let p = doc.page(pid).map_err(|e| e.to_string())?;
                 let (w, h, view) = tracedraw_render::ViewTransform::whole_page(
@@ -307,6 +323,148 @@ fn page_file(
             record_dpi(bytes, ext, st.dpi)
         }
     })
+}
+
+/// Pages of more pixels than this are exported as PNG or TIFF a strip at
+/// a time (#3039).
+const STREAMED_PIXELS: u64 = 1 << 26;
+
+/// The most pixels of one strip of a picture written a strip at a time
+/// (64 MB of RGBA).
+const STRIP_PIXELS: u64 = 1 << 24;
+
+/// Why a picture of `w` x `h` pixels was not made.
+fn too_large(w: u32, h: u32) -> String {
+    format!(
+        "The picture ({w} x {h} pixels) is too large for this format: \
+         export it as PNG or TIFF, or at a lower resolution"
+    )
+}
+
+/// The page `pid` as a PNG or TIFF (`ext`) file of `w` x `h` pixels drawn
+/// through `view`, saying it was made at `dpi`: drawn and encoded strips
+/// of at most `strip_pixels` pixels at a time, the same pixels as the page
+/// drawn whole, on white or (`transparent`, PNG only) on nothing. The
+/// page drawn whole took four times the picture's size in memory and
+/// failed above a billion pixels, so a banner of 180 ft exported at 50 or
+/// 72 dpi was not made (#3039). A TIFF of more than 4 GB is a BigTIFF.
+fn streamed_picture(
+    doc: &Document,
+    pid: tracedraw_core::PageId,
+    (w, h, view): (u32, u32, tracedraw_render::ViewTransform),
+    ext: &str,
+    transparent: bool,
+    dpi: f64,
+    strip_pixels: u64,
+) -> Result<Vec<u8>, String> {
+    let opts = tracedraw_render::RenderOptions {
+        width: w,
+        height: h,
+        view,
+        ..Default::default()
+    };
+    // Whole multiples of 16 rows, as the coarse grid of procedural fills.
+    let rows =
+        ((strip_pixels / u64::from(w)) / 16 * 16).clamp(16, u64::from(h).div_ceil(16) * 16) as u32;
+    let channels: usize = if transparent { 4 } else { 3 };
+    // Each strip's pixels, demultiplied, `channels` bytes each.
+    let strip = |y0: u32| -> Result<Vec<u8>, String> {
+        let band = rows.min(h - y0);
+        let objects = tracedraw_render::render_page_rows(doc, pid, &opts, y0, y0 + band)
+            .ok_or_else(|| too_large(w, h))?;
+        let pm = if transparent {
+            objects
+        } else {
+            let mut pm = tiny_skia::Pixmap::new(w, band).ok_or_else(|| too_large(w, h))?;
+            pm.fill(tiny_skia::Color::WHITE);
+            pm.draw_pixmap(
+                0,
+                0,
+                objects.as_ref(),
+                &Default::default(),
+                tiny_skia::Transform::identity(),
+                None,
+            );
+            pm
+        };
+        let mut out = Vec::with_capacity(pm.pixels().len() * channels);
+        for p in pm.pixels() {
+            let d = p.demultiply();
+            out.extend_from_slice(&[d.red(), d.green(), d.blue(), d.alpha()][..channels]);
+        }
+        Ok(out)
+    };
+    let dpi = if dpi.is_finite() && dpi >= 1.0 {
+        dpi
+    } else {
+        96.0
+    };
+    let mut file = std::io::Cursor::new(Vec::new());
+    if ext == "png" {
+        let mut enc = png::Encoder::new(&mut file, w, h);
+        enc.set_color(if transparent {
+            png::ColorType::Rgba
+        } else {
+            png::ColorType::Rgb
+        });
+        enc.set_depth(png::BitDepth::Eight);
+        let per_metre = (dpi / 0.0254).round().min(f64::from(i32::MAX)) as u32;
+        enc.set_pixel_dims(Some(png::PixelDimensions {
+            xppu: per_metre,
+            yppu: per_metre,
+            unit: png::Unit::Meter,
+        }));
+        let mut writer = enc.write_header().map_err(|e| e.to_string())?;
+        let mut stream = writer.stream_writer().map_err(|e| e.to_string())?;
+        let mut y0 = 0;
+        while y0 < h {
+            std::io::Write::write_all(&mut stream, &strip(y0)?).map_err(|e| e.to_string())?;
+            y0 += rows;
+        }
+        stream.finish().map_err(|e| e.to_string())?;
+        writer.finish().map_err(|e| e.to_string())?;
+    } else {
+        use tiff::encoder::{colortype, Rational, TiffEncoder, TiffKind};
+        fn write<K: TiffKind>(
+            mut enc: TiffEncoder<&mut std::io::Cursor<Vec<u8>>, K>,
+            (w, h, rows, dpi): (u32, u32, u32, f64),
+            strip: &dyn Fn(u32) -> Result<Vec<u8>, String>,
+        ) -> Result<(), String> {
+            let mut image = enc
+                .new_image::<colortype::RGB8>(w, h)
+                .map_err(|e| e.to_string())?;
+            image.resolution(
+                tiff::tags::ResolutionUnit::Inch,
+                Rational {
+                    n: (dpi * 100.0).round() as u32,
+                    d: 100,
+                },
+            );
+            image.rows_per_strip(rows).map_err(|e| e.to_string())?;
+            let mut y0 = 0;
+            while y0 < h {
+                image.write_strip(&strip(y0)?).map_err(|e| e.to_string())?;
+                y0 += rows;
+            }
+            image.finish().map_err(|e| e.to_string())
+        }
+        let dims = (w, h, rows, dpi);
+        // Classic TIFF counts its bytes in 32 bits.
+        if u64::from(w) * u64::from(h) * 3 > u64::from(u32::MAX) - (1 << 20) {
+            write(
+                TiffEncoder::new_big(&mut file).map_err(|e| e.to_string())?,
+                dims,
+                &strip,
+            )?;
+        } else {
+            write(
+                TiffEncoder::new(&mut file).map_err(|e| e.to_string())?,
+                dims,
+                &strip,
+            )?;
+        }
+    }
+    Ok(file.into_inner())
 }
 
 /// The output intent's profile for a PDF/X file: the CMYK profile picked
@@ -521,7 +679,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// True when the export format `ext` keeps transparency.
 pub fn keeps_alpha(ext: &str) -> bool {
-    matches!(ext, "png" | "webp" | "gif")
+    matches!(ext, "png" | "webp" | "gif" | "jxl")
 }
 
 /// What the export will look like: the page (or the selection) of `st`
@@ -600,7 +758,7 @@ pub fn estimated_size(app: &App, st: &ExportState, preview: &tiny_skia::Pixmap) 
         "ps" | "prn" => Some(tracedraw_io::eps::document_to_ps(&doc).len()),
         "ai" if st.classic_ai() => Some(tracedraw_io::ai::page_to_ai8(&doc, 0).len() * pages),
         "pdf" | "ai" => Some(tracedraw_io::pdf::document_to_pdf(&doc).len()),
-        "png" | "jpg" | "bmp" | "tif" | "webp" | "gif" | "psd" => {
+        "png" | "jpg" | "bmp" | "tif" | "webp" | "gif" | "psd" | "jxl" => {
             let enc = if ext == "psd" { "tif" } else { ext };
             let (w, h) = (preview.width(), preview.height());
             let bytes = match st.color_mode_for(ext) {
@@ -721,6 +879,40 @@ fn webp_lossy_pure(img: &image::RgbaImage, quality: u8) -> Option<Vec<u8>> {
     }
 }
 
+/// A JPEG XL file of `img`, lossless (#3063): RGB when it is opaque,
+/// RGBA otherwise. The encoder takes no picture of one pixel across or
+/// down, so such a picture is widened to two by repeating it.
+pub fn encode_jxl(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
+    use zune_core::{bit_depth::BitDepth, colorspace::ColorSpace, options::EncoderOptions};
+    let img = if img.width() < 2 || img.height() < 2 {
+        image::imageops::resize(
+            img,
+            img.width().max(2),
+            img.height().max(2),
+            image::imageops::FilterType::Nearest,
+        )
+    } else {
+        img.clone()
+    };
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let opaque = img.pixels().all(|p| p.0[3] == 255);
+    let (data, space) = if opaque {
+        let rgb: Vec<u8> = img
+            .pixels()
+            .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+            .collect();
+        (rgb, ColorSpace::RGB)
+    } else {
+        (img.into_raw(), ColorSpace::RGBA)
+    };
+    let options = EncoderOptions::new(w, h, space, BitDepth::Eight);
+    let mut out = Vec::new();
+    zune_jpegxl::JxlSimpleEncoder::new(&data, options)
+        .encode(&mut out)
+        .map_err(|e| format!("JPEG XL: {e:?}"))?;
+    Ok(out)
+}
+
 /// Encode a rendered page in the bitmap format `ext`; WebP lossless
 /// (`lossless`, colours rounded below quality 100) or lossy at the
 /// quality (#592).
@@ -737,6 +929,9 @@ fn encode_raster_with(
         rgba.extend_from_slice(&[d.red(), d.green(), d.blue(), d.alpha()]);
     }
     let img = image::RgbaImage::from_raw(w, h, rgba).ok_or("image buffer")?;
+    if ext == "jxl" {
+        return encode_jxl(&img);
+    }
     let dynimg = image::DynamicImage::ImageRgba8(img);
     let format = match ext {
         "png" => image::ImageFormat::Png,
@@ -1710,6 +1905,18 @@ pub fn print_sheets(app: &App, st: &PrintState) -> Document {
     if st.grayscale && !st.separations {
         grayscale_doc(&mut doc);
     }
+    // The printer's colour profile (#3374): composite colours and
+    // pictures as the printer needs them, for printers whose colour the
+    // driver does not manage (sublimation, for one).
+    if !st.grayscale && !st.separations {
+        if let Some(t) = st
+            .output_profile
+            .as_deref()
+            .and_then(|p| printer_transform(p, st.output_intent))
+        {
+            printer_profile_doc(&mut doc, &t);
+        }
+    }
     // Tile: each sheet (fitted to the pages, mirrored or inverted as a
     // whole) cut into tiles of the paper, a poster.
     if st.tile {
@@ -1750,10 +1957,28 @@ fn gray_of(c: tracedraw_core::Color) -> tracedraw_core::Color {
 /// pixels). The colours are found wherever the document keeps one, by
 /// walking the objects' serialized form, so no kind of object is missed.
 pub fn grayscale_doc(doc: &mut Document) {
-    fn walk(v: &mut serde_json::Value) {
+    map_doc_colors(doc, &gray_of, &|img| crate::bitmap_fx::encode_gray(img));
+}
+
+/// Every colour the sheets hold (fills, outlines, text, gradients,
+/// meshes, patterns, effects, shadows and lenses) through `color`, and
+/// every picture through `picture` (its new PNG; `None` leaves it). A
+/// CMYK picture's own inks are left out, so it prints from the new
+/// pixels. The colours are found wherever the document keeps one, by
+/// walking the objects' serialized form, so no kind of object is missed.
+pub fn map_doc_colors(
+    doc: &mut Document,
+    color: &dyn Fn(tracedraw_core::Color) -> tracedraw_core::Color,
+    picture: &dyn Fn(&image::RgbaImage) -> Option<Vec<u8>>,
+) {
+    type Maps<'a> = (
+        &'a dyn Fn(tracedraw_core::Color) -> tracedraw_core::Color,
+        &'a dyn Fn(&image::RgbaImage) -> Option<Vec<u8>>,
+    );
+    fn walk(v: &mut serde_json::Value, f: Maps) {
         use serde_json::Value;
         match v {
-            Value::Array(a) => a.iter_mut().for_each(walk),
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, f)),
             Value::Object(m) => {
                 if m.get("model").is_some_and(Value::is_string) {
                     if let Ok(c) =
@@ -1762,13 +1987,13 @@ pub fn grayscale_doc(doc: &mut Document) {
                         // A colour can share its object with the tag of
                         // what holds it (a solid fill is `{"fill":
                         // "solid", "model": ...}`): only its own keys go.
-                        if let (Ok(Value::Object(was)), Ok(Value::Object(gray))) =
-                            (serde_json::to_value(c), serde_json::to_value(gray_of(c)))
+                        if let (Ok(Value::Object(was)), Ok(Value::Object(new))) =
+                            (serde_json::to_value(c), serde_json::to_value((f.0)(c)))
                         {
                             for k in was.keys() {
                                 m.remove(k);
                             }
-                            m.extend(gray);
+                            m.extend(new);
                         }
                         return;
                     }
@@ -1778,37 +2003,127 @@ pub fn grayscale_doc(doc: &mut Document) {
                 if let Some(Value::String(b64)) = m.get_mut("png") {
                     use base64::Engine;
                     let engine = base64::engine::general_purpose::STANDARD;
-                    let gray = engine
+                    let new = engine
                         .decode(b64.as_bytes())
                         .ok()
                         .and_then(|png| crate::bitmap_fx::decode(&png))
-                        .and_then(|img| crate::bitmap_fx::encode_gray(&img));
-                    if let Some(gray) = gray {
-                        *b64 = engine.encode(gray);
+                        .and_then(|img| (f.1)(&img));
+                    if let Some(new) = new {
+                        *b64 = engine.encode(new);
                         // The picture's effects stay as printed, not
-                        // worked out again from the colour original.
+                        // worked out again from the original.
                         m.remove("fx");
                     }
                 }
-                m.values_mut().for_each(walk);
+                m.values_mut().for_each(|x| walk(x, f));
             }
             _ => {}
         }
     }
-    fn gray<T: serde::Serialize + serde::de::DeserializeOwned>(x: &mut T) {
+    fn map<T: serde::Serialize + serde::de::DeserializeOwned>(x: &mut T, f: Maps) {
         let Ok(mut v) = serde_json::to_value(&*x) else {
             return;
         };
-        walk(&mut v);
+        walk(&mut v, f);
         match serde_json::from_value(v) {
             Ok(back) => *x = back,
-            Err(e) => log::warn!("grayscale print: {e}"),
+            Err(e) => log::warn!("print colours: {e}"),
         }
     }
     for page in doc.pages.iter_mut() {
-        gray(page);
+        map(page, (color, picture));
     }
-    gray(&mut doc.master);
+    map(&mut doc.master, (color, picture));
+}
+
+/// The colour profile of the printer the composite output is converted
+/// to (#3374): from the drawing's colours, as sRGB, to the device values
+/// of the RGB or CMYK profile at `path`. `None` when the file is not a
+/// profile that can be printed to.
+pub fn printer_transform(
+    path: &str,
+    intent: tracedraw_core::icc::Intent,
+) -> Option<tracedraw_core::icc::Transform> {
+    use tracedraw_core::icc::{ColorSpace, Profile, Transform};
+    let bytes = std::fs::read(path).ok()?;
+    let dst = Profile::parse(&bytes).ok()?;
+    if !matches!(dst.color_space(), ColorSpace::Rgb | ColorSpace::Cmyk) {
+        return None;
+    }
+    Transform::new(&Profile::srgb(), &dst, intent, true)
+}
+
+/// Every colour and picture of the sheets converted through the
+/// printer's profile `t` (#3374): a colour becomes the RGB or CMYK
+/// values the printer needs for it; pictures go through it pixel by
+/// pixel with an RGB profile (with a CMYK one they go as RGB, back from
+/// the printer's CMYK, so they print as the profile would have them).
+/// The registration colour stays: it prints on every plate.
+pub fn printer_profile_doc(doc: &mut Document, t: &tracedraw_core::icc::Transform) {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use tracedraw_core::icc::ColorSpace;
+    use tracedraw_core::Color;
+    let cmyk = t.output_space() == ColorSpace::Cmyk;
+    let device = |rgb: [u8; 3]| -> Vec<f32> {
+        t.transform(&rgb.map(|v| f32::from(v) / 255.0))
+            .into_iter()
+            .map(|v| v.clamp(0.0, 1.0))
+            .collect()
+    };
+    let color = |c: Color| -> Color {
+        if matches!(c, Color::Registration) {
+            return c;
+        }
+        let d = device(c.to_rgb8());
+        match (cmyk, d.as_slice()) {
+            (true, [c, m, y, k, ..]) => Color::Cmyk {
+                c: *c,
+                m: *m,
+                y: *y,
+                k: *k,
+            },
+            (false, [r, g, b, ..]) => {
+                let v = |x: f32| (x * 255.0).round() as u8;
+                Color::rgb8(v(*r), v(*g), v(*b))
+            }
+            _ => c,
+        }
+    };
+    // A picture's pixels, each colour worked out once.
+    let seen: RefCell<HashMap<[u8; 3], [u8; 3]>> = RefCell::new(HashMap::new());
+    let pixel = |rgb: [u8; 3]| -> [u8; 3] {
+        if let Some(out) = seen.borrow().get(&rgb) {
+            return *out;
+        }
+        let d = device(rgb);
+        let v = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let out = match (cmyk, d.as_slice()) {
+            (false, [r, g, b, ..]) => [v(*r), v(*g), v(*b)],
+            (true, [c, m, y, k, ..]) => {
+                let [r, g, b] = Color::Cmyk {
+                    c: *c,
+                    m: *m,
+                    y: *y,
+                    k: *k,
+                }
+                .to_rgb8();
+                [r, g, b]
+            }
+            _ => rgb,
+        };
+        seen.borrow_mut().insert(rgb, out);
+        out
+    };
+    let picture = |img: &image::RgbaImage| -> Option<Vec<u8>> {
+        let mut out = img.clone();
+        for p in out.pixels_mut() {
+            let [r, g, b] = pixel([p[0], p[1], p[2]]);
+            p.0 = [r, g, b, p[3]];
+        }
+        crate::bitmap_fx::encode(&out)
+    };
+    map_doc_colors(doc, &color, &picture);
 }
 
 /// A spot ink's colour as its CMYK mix at the tint.
@@ -4089,6 +4404,96 @@ mod tests {
         assert!(keeps_alpha("png") && !keeps_alpha("jpg"));
     }
 
+    /// #3039: a page drawn and written a strip at a time is the same
+    /// picture as the page drawn whole, as PNG (on white or transparent)
+    /// and TIFF, with the resolution recorded; blurred shadows that reach
+    /// across strips included.
+    #[test]
+    fn a_picture_written_a_strip_at_a_time_is_the_page_drawn_whole() {
+        use tracedraw_core::{Color, Fill};
+        let mut app = App::headless();
+        let circle = app
+            .new_shape(ShapeKind::Ellipse {
+                rect: Rect::new(20.0, 20.0, 120.0, 90.0),
+                arc: None,
+            })
+            .expect("circle");
+        app.run(Command::SetFill {
+            shapes: vec![circle],
+            fill: Fill::Solid(Color::rgb8(220, 0, 30)),
+        });
+        app.run(Command::SetShadow {
+            shapes: vec![circle],
+            shadow: Some(tracedraw_core::Shadow {
+                offset: tracedraw_core::geometry::Vec2::new(6.0, -6.0),
+                opacity: 0.8,
+                blur: 3.0,
+                ..Default::default()
+            }),
+        });
+        app.new_shape(ShapeKind::Rect {
+            rect: Rect::new(60.0, 100.0, 180.0, 160.0),
+            radius: 4.0,
+            corners: None,
+        });
+        let (doc, _) = export_document(&app, &ExportState::default());
+        let pid = doc.pages[0].id;
+        for (format, ext, transparent) in [(2, "png", false), (2, "png", true), (5, "tif", false)] {
+            let st = ExportState {
+                format,
+                dpi: 40.0,
+                transparent,
+                ..ExportState::default()
+            };
+            let whole = page_file(&doc, 0, ext, &st, None).expect(ext);
+            let p = doc.page(pid).unwrap();
+            let fit = tracedraw_render::ViewTransform::whole_page(
+                p.size.width,
+                p.size.height,
+                st.render_dpi() / 25.4,
+            );
+            // Strips of 16 rows: many of them, each blurred shadow drawn
+            // across several.
+            let strips = streamed_picture(&doc, pid, fit, ext, transparent, st.dpi, 16).expect(ext);
+            let a = image::load_from_memory(&whole).expect(ext).to_rgba8();
+            let b = image::load_from_memory(&strips).expect(ext).to_rgba8();
+            assert_eq!(a.dimensions(), (fit.0, fit.1), "{ext}");
+            assert_eq!(a.dimensions(), b.dimensions(), "{ext}");
+            // Only the smoothing of some edge pixels may differ a little,
+            // as between the bands the page is drawn in on several cores.
+            let diff = |x: &image::Rgba<u8>, y: &image::Rgba<u8>| {
+                x.0.iter()
+                    .zip(y.0)
+                    .map(|(u, v)| u.abs_diff(v))
+                    .max()
+                    .unwrap_or(0)
+            };
+            let worst = a.pixels().zip(b.pixels()).map(|(x, y)| diff(x, y)).max();
+            let off = a
+                .pixels()
+                .zip(b.pixels())
+                .filter(|(x, y)| diff(x, y) > 2)
+                .count();
+            assert!(
+                worst <= Some(32),
+                "{ext} transparent {transparent}: {worst:?}"
+            );
+            assert!(
+                off * 100 < a.pixels().len(),
+                "{ext} transparent {transparent}: {off} pixels differ"
+            );
+            assert!(
+                a.pixels().any(|q| q.0 == [220, 0, 30, 255]),
+                "{ext}: the circle"
+            );
+            if ext == "png" {
+                let (x, y) = crate::image_dpi::resolution(&strips).expect("dpi");
+                assert!((x - 40.0).abs() < 0.1 && (y - 40.0).abs() < 0.1, "{x} {y}");
+            }
+        }
+        assert!(too_large(1, 2).contains("PNG or TIFF"));
+    }
+
     /// A bitmap export records the resolution of the dialog, and the
     /// scale changes how many pixels it has but not that resolution, so it
     /// opens at the size chosen (#617).
@@ -4679,6 +5084,94 @@ mod tests {
         assert!(ps.starts_with("%!PS-Adobe-3.0\n%%LanguageLevel: 3\n"));
     }
 
+    /// #3374: with a printer's colour profile chosen, the composite
+    /// colours and the pictures print as that profile's device values
+    /// (here a linear RGB profile: sRGB 128 grey is about 55); none
+    /// leaves them, and grayscale or separations pass it over.
+    #[test]
+    fn a_printer_profile_converts_the_printed_colours() {
+        use tracedraw_core::icc::test_profiles::{curv_gamma, matrix_trc_profile};
+        use tracedraw_core::{Color, Fill};
+        let mut app = App::headless();
+        let grey = Color::rgb8(128, 128, 128);
+        app.new_shape_styled(
+            ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(10.0, 10.0, 60.0, 40.0),
+                radius: 0.0,
+                corners: None,
+            },
+            |s| {
+                s.name = Some("grey".into());
+                s.fill = Fill::Solid(grey);
+                s.stroke = None;
+            },
+        )
+        .expect("rect");
+        let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([128, 128, 128, 200]));
+        app.new_shape(ShapeKind::Bitmap {
+            rect: tracedraw_core::geometry::Rect::new(70.0, 10.0, 100.0, 30.0),
+            width_px: 3,
+            height_px: 2,
+            png: crate::bitmap_fx::encode(&img).expect("png").into(),
+            fx: None,
+        })
+        .expect("bitmap");
+        let dir = std::env::temp_dir().join(format!("td-print-icc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("linear.icc");
+        let g = || curv_gamma(1.0);
+        std::fs::write(&path, matrix_trc_profile(g(), g(), g())).expect("profile");
+        let printed = |st: &PrintState| {
+            let doc = print_sheets(&app, st);
+            fn all(shapes: &[tracedraw_core::Shape], out: &mut Vec<tracedraw_core::Shape>) {
+                for s in shapes {
+                    out.push(s.clone());
+                    match &s.kind {
+                        ShapeKind::Group { children } => all(children, out),
+                        ShapeKind::ClipFrame { frame, contents } => {
+                            all(std::slice::from_ref(&**frame), out);
+                            all(contents, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut shapes = Vec::new();
+            for l in doc.pages.iter().flat_map(|p| p.layers.iter()) {
+                all(&l.shapes, &mut shapes);
+            }
+            let rect = shapes
+                .iter()
+                .find(|s| s.name.as_deref() == Some("grey"))
+                .expect("rect printed");
+            let fill = match &rect.fill {
+                Fill::Solid(c) => c.to_rgb8(),
+                other => panic!("{other:?}"),
+            };
+            let px = shapes
+                .iter()
+                .find_map(|s| match &s.kind {
+                    ShapeKind::Bitmap { png, .. } => crate::bitmap_fx::decode(png),
+                    _ => None,
+                })
+                .expect("picture printed")
+                .get_pixel(0, 0)
+                .0;
+            (fill, px)
+        };
+        let mut st = PrintState::default();
+        assert_eq!(printed(&st), ([128, 128, 128], [128, 128, 128, 200]));
+        st.output_profile = Some(path.display().to_string());
+        let (fill, px) = printed(&st);
+        for v in fill.into_iter().chain(px[..3].iter().copied()) {
+            assert!((50..=60).contains(&v), "{fill:?} {px:?}");
+        }
+        assert_eq!(px[3], 200, "the alpha stays");
+        st.grayscale = true;
+        assert_eq!(printed(&st).0, [128, 128, 128]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Grayscale output (#1657): every colour on the sheets, an effect's
     /// too, prints as its grey and a picture as grey pixels; the drawing
     /// keeps its colours. Reverse order (#1394, #1571): the last sheet
@@ -5070,6 +5563,27 @@ mod tests {
         assert_eq!(back.get_pixel(200, 10).0[3], 255);
         // Nothing to encode: no lossy file.
         assert!(webp_lossy_pure(&image::RgbaImage::new(0, 0), 50).is_none());
+    }
+
+    /// #3063: JPEG XL is in the Export list, keeps transparency, and a
+    /// page written as JPEG XL reads back with the same pixels.
+    #[test]
+    fn a_page_exports_as_lossless_jpeg_xl() {
+        assert!(crate::ui::dialogs::EXPORT_FORMATS
+            .iter()
+            .any(|(_, e)| *e == "jxl"));
+        assert!(keeps_alpha("jxl"));
+        let mut pm = tiny_skia::Pixmap::new(40, 30).expect("pixmap");
+        for (i, p) in pm.pixels_mut().iter_mut().enumerate() {
+            let (x, y) = ((i % 40) as u8, (i / 40) as u8);
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(x * 6, y * 8, 200, 255).expect("px");
+        }
+        let bytes = encode_raster_with(&pm, "jxl", 80, false).expect("jxl");
+        let back = crate::files::decode_picture(&bytes)
+            .expect("reads")
+            .to_rgba8();
+        assert_eq!(back.dimensions(), (40, 30));
+        assert_eq!(back.get_pixel(39, 29).0, [39 * 6, 29 * 8, 200, 255]);
     }
 
     #[test]
@@ -5926,6 +6440,7 @@ mod tests {
             offset: 2.0,
             outside: true,
             to_center: false,
+            both: false,
             fill_to: c,
             outline_to: None,
             fill_end_to: None,

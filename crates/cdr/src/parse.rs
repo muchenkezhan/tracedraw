@@ -137,7 +137,7 @@ pub(crate) const ARG_CLIP_CONTENTS: u32 = 8005;
 const ARG_PAGE_SIZE: u32 = 19130;
 /// A symbol definition's record in its `sytr` group's `loda`: an
 /// identifier and the symbol's name (#2177, a version 15 file).
-const ARG_SYMBOL: u32 = 19201;
+pub(crate) const ARG_SYMBOL: u32 = 19201;
 /// Master page `loda` argument holding the document's page background.
 const ARG_PAGE_BACKGROUND: u32 = 17000;
 /// Object argument 16016: 1 hides the object (version 21).
@@ -439,6 +439,9 @@ struct BitmapDef {
     cmyk: bool,
     /// A CMYK image's ink bytes, which separations print (#1659).
     inks: Option<tracedraw_core::picture_inks::PictureInks>,
+    /// A black and white (1-bit) image: its two palette colours, which
+    /// the object's outline and fill colour replace (#3410).
+    mono: Option<[[u8; 3]; 2]>,
 }
 
 // One entry of a `loda` argument table (type, payload start and end) and
@@ -509,6 +512,8 @@ struct Ctx<'a> {
     pending_cmyk: bool,
     /// The ink channels of the CMYK image it shows.
     pending_inks: Option<tracedraw_core::picture_inks::PictureInks>,
+    /// The palette of the 1-bit picture of the bitmap object just read.
+    pending_mono: Option<[[u8; 3]; 2]>,
     /// Groups of `LIST clpt` by their `spnd` number: the contents of clip
     /// containers.
     clip_groups: HashMap<u32, &'a Chunk>,
@@ -619,6 +624,7 @@ impl<'a> Ctx<'a> {
             pending_crop: None,
             pending_cmyk: false,
             pending_inks: None,
+            pending_mono: None,
             clip_groups: HashMap::new(),
             pending_clip: None,
             symbol_defs: HashMap::new(),
@@ -1997,7 +2003,7 @@ impl<'a> Ctx<'a> {
             };
             pts.push(Point::new(f64::from(x), f64::from(y)));
         }
-        self.add_arrowhead(id, &pts, &types);
+        self.add_placed_arrowhead(id, &pts, &types);
     }
 
     /// `arrw` of versions 3 and 4: the id (u32; version 4 a u16 and the
@@ -2068,11 +2074,30 @@ impl<'a> Ctx<'a> {
             };
             pts.push(Point::new(f64::from(x), f64::from(y)));
         }
-        self.add_arrowhead(id, &pts, &types);
+        self.add_placed_arrowhead(id, &pts, &types);
     }
 
-    /// Classifies an arrowhead outline into a preset, or keeps it as a
-    /// custom head.
+    /// An arrowhead outline in head units (versions 5 and later, `arrw`
+    /// and `arrx`): 127 000 to one outline width, the line's end at the
+    /// origin, the line coming in from -x. Kept as the file draws it, its
+    /// shape, size and place, open parts stroked one outline width wide,
+    /// as the exchange format's heads are; it was sorted into one of our
+    /// presets, redrawn at our size (#3436).
+    fn add_placed_arrowhead(&mut self, id: u32, pts: &[Point], types: &[u8]) {
+        let units = crate::cmx::HEAD_UNITS_PER_WIDTH;
+        let (path, _) = build_path(pts, types);
+        let shape = crate::cmx::stroke_open_subpaths(&path, units);
+        let head = Arrowhead::from_placed_path(&shape, format!("Arrowhead {id}"), units);
+        if head == Arrowhead::None {
+            self.report.warn(format!(
+                "arrowhead {id}: unreadable outline; drawn without arrowhead"
+            ));
+        }
+        self.arrows.insert(id, head);
+    }
+
+    /// Classifies an arrowhead outline of versions 3 and 4 (whose head
+    /// units are not known) into a preset, or keeps it as a custom head.
     fn add_arrowhead(&mut self, id: u32, pts: &[Point], types: &[u8]) {
         let (path, _) = build_path(pts, types);
         let mut head = classify_arrowhead(&path, pts, types);
@@ -2451,6 +2476,31 @@ impl<'a> Ctx<'a> {
                         }
                         _ => spans.push(span),
                     }
+                }
+            }
+        }
+        // Artistic text whose first lines are empty shows its first line
+        // with letters at its origin, its box that line's alone (#3215: a
+        // version 14 title starting with a paragraph break, which the
+        // same drawing saved as version 13 holds as curves on that
+        // baseline): the empty lines are dropped rather than pushing the
+        // letters down a line each.
+        if frame.is_none() && kind_code == OBJ_ARTISTIC_TEXT {
+            let lead = text::leading_breaks(&spans);
+            if lead > 0 && lead < spans.iter().map(|s| s.text.chars().count()).sum::<usize>() {
+                text::drop_leading_chars(&mut spans, lead);
+                // Paragraphs that started among the dropped lines start at
+                // the text's start; the last of them is the one shown.
+                let first = own
+                    .iter()
+                    .rposition(|(start, _, _)| *start <= lead)
+                    .unwrap_or(0);
+                own.drain(..first);
+                for (start, _, _) in own.iter_mut() {
+                    *start = start.saturating_sub(lead);
+                }
+                if let Some((_, _, fmt)) = own.first() {
+                    para_fmt = fmt.clone();
                 }
             }
         }
@@ -4946,6 +4996,9 @@ impl<'a> Ctx<'a> {
                                 shape.picture_inks = Some(Box::new(inks));
                             }
                         }
+                        if let Some(palette) = self.pending_mono.take() {
+                            colour_mono_bitmap(&mut shape, palette);
+                        }
                         if let Some(crop) = self.pending_crop.take() {
                             shape = crop_to_clip_frame(shape, crop, ids);
                         }
@@ -5685,6 +5738,7 @@ impl<'a> Ctx<'a> {
                         start_deg: a1,
                         end_deg: a2,
                         pie,
+                        inner: 0.0,
                     })
                 } else {
                     None
@@ -5768,6 +5822,7 @@ impl<'a> Ctx<'a> {
                     sharpness,
                     complex: None,
                     twist: 0.0,
+                    bend: 0.0,
                 })
             }
             // Bitmap: two corners, 32 unknown bytes, image id, a version
@@ -5791,6 +5846,7 @@ impl<'a> Ctx<'a> {
                 };
                 self.pending_cmyk = bm.cmyk;
                 self.pending_inks = bm.inks.clone();
+                self.pending_mono = bm.mono;
                 Some(ShapeKind::Bitmap {
                     rect,
                     width_px: bm.width_px,
@@ -5845,6 +5901,7 @@ impl<'a> Ctx<'a> {
                 };
                 self.pending_cmyk = bm.cmyk;
                 self.pending_inks = bm.inks.clone();
+                self.pending_mono = bm.mono;
                 Some(ShapeKind::Bitmap {
                     rect,
                     width_px: bm.width_px,
@@ -6057,8 +6114,58 @@ fn decode_bitmap(
             png: png.into(),
             cmyk,
             inks,
+            mono: (bpp == 1).then(|| {
+                let at = |i: usize, dflt: u8| palette.get(i).copied().unwrap_or([dflt; 3]);
+                [at(0, 0), at(1, 255)]
+            }),
         },
     )))
+}
+
+/// A black and white (1-bit) picture takes the colours its object was
+/// given, as the other program colours such a picture: the outline
+/// colour for its dark pixels, the fill colour for its light ones, each
+/// kept from the picture when not set. Neither is drawn as an outline
+/// or a fill of its own: a coloured 1-bit picture opened black, framed
+/// by an outline of the colour it had (#3410).
+fn colour_mono_bitmap(shape: &mut Shape, palette: [[u8; 3]; 2]) {
+    let ShapeKind::Bitmap { png, .. } = &mut shape.kind else {
+        return;
+    };
+    let ink = shape.stroke.as_ref().map(|s| s.color.to_rgb8());
+    let paper = match &shape.fill {
+        Fill::Solid(c) => Some(c.to_rgb8()),
+        _ => None,
+    };
+    shape.stroke = None;
+    shape.fill = Fill::None;
+    if ink.is_none() && paper.is_none() {
+        return;
+    }
+    let luma = |c: [u8; 3]| 299 * c[0] as u32 + 587 * c[1] as u32 + 114 * c[2] as u32;
+    // The darker palette colour is the picture's ink.
+    let dark = usize::from(luma(palette[1]) < luma(palette[0]));
+    let mut to = palette;
+    if let Some(c) = ink {
+        to[dark] = c;
+    }
+    if let Some(c) = paper {
+        to[1 - dark] = c;
+    }
+    let Ok(pm) = tiny_skia::Pixmap::decode_png(png) else {
+        return;
+    };
+    let mut rgba = Vec::with_capacity(pm.data().len());
+    for p in pm.pixels() {
+        let c = p.demultiply();
+        let rgb = [c.red(), c.green(), c.blue()];
+        let near = |q: [u8; 3]| -> u32 {
+            (0..3).map(|i| (rgb[i] as i32 - q[i] as i32).unsigned_abs()).sum()
+        };
+        let i = usize::from(near(palette[1]) < near(palette[0]));
+        rgba.extend_from_slice(&[to[i][0], to[i][1], to[i][2], c.alpha()]);
+    }
+    *png = encode_png(pm.width(), pm.height(), &rgba).into();
 }
 
 /// `f` over `items` in order, on up to four threads where the platform
@@ -6760,6 +6867,7 @@ fn contour_effect(
         offset,
         outside,
         to_center: false,
+        both: false,
         fill_to,
         outline_to,
         fill_end_to: None,
@@ -7992,6 +8100,54 @@ fn grey_mask(f: &tracedraw_core::Fountain) -> Fill {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A black and white picture coloured in the other program (yellow
+    /// outline, blue fill) opens with those colours in its pixels and no
+    /// outline round it; one with neither keeps its black and white
+    /// (#3410).
+    #[test]
+    fn a_coloured_one_bit_picture_keeps_its_colours() {
+        let png = encode_png(2, 1, &[0, 0, 0, 255, 255, 255, 255, 255]);
+        let picture = |stroke: Option<Color>, fill: Fill| {
+            let mut s = Shape::new(
+                tracedraw_core::ShapeId(1),
+                ShapeKind::Bitmap {
+                    rect: Rect::new(0.0, 0.0, 2.0, 1.0),
+                    width_px: 2,
+                    height_px: 1,
+                    png: png.clone().into(),
+                    fx: None,
+                },
+            );
+            s.stroke = stroke.map(|c| tracedraw_core::Stroke {
+                color: c,
+                ..Default::default()
+            });
+            s.fill = fill;
+            colour_mono_bitmap(&mut s, [[0, 0, 0], [255, 255, 255]]);
+            let ShapeKind::Bitmap { png, .. } = &s.kind else {
+                panic!("not a picture")
+            };
+            let pm = tiny_skia::Pixmap::decode_png(png).expect("png");
+            let px: Vec<[u8; 3]> = pm
+                .pixels()
+                .iter()
+                .map(|p| [p.red(), p.green(), p.blue()])
+                .collect();
+            (s, px)
+        };
+        let yellow = Color::rgb8(255, 230, 0);
+        let blue = Color::rgb8(0, 0, 200);
+        let (s, px) = picture(Some(yellow), Fill::Solid(blue));
+        assert_eq!(px, vec![[255, 230, 0], [0, 0, 200]]);
+        assert!(s.stroke.is_none() && matches!(s.fill, Fill::None));
+        // The outline colour alone: the paper stays white.
+        let (_, px) = picture(Some(yellow), Fill::None);
+        assert_eq!(px, vec![[255, 230, 0], [255, 255, 255]]);
+        let (s, px) = picture(None, Fill::None);
+        assert_eq!(px, vec![[0, 0, 0], [255, 255, 255]]);
+        assert!(s.stroke.is_none());
+    }
 
     /// The indent record of #2669: left 1.5 mm, first line 1 mm from the
     /// frame, right 0. The first line starts at 1 mm (left + first-line
@@ -11717,6 +11873,7 @@ pub(crate) mod tests {
                 sharpness: 0.0,
                 complex: None,
                 twist: 0.0,
+                bend: 0.0,
             },
         );
         let [a, b] = blend_nodes(&poly).expect("nodes");
@@ -12482,6 +12639,63 @@ pub(crate) mod tests {
         match &first_shape(&doc).kind {
             ShapeKind::Text { origin, .. } => {
                 assert!(origin.x.abs() < 1e-9 && origin.y.abs() < 1e-9, "{origin:?}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Artistic text starting with a paragraph break shows its letters
+    /// on its origin, not a line below it (#3215).
+    #[test]
+    fn artistic_text_starting_with_a_break_keeps_its_letters_on_the_origin() {
+        let v = 18u16;
+        let mut t = u32s(&[0xffff_ffff]);
+        t.extend_from_slice(&[0; 32]);
+        t.extend_from_slice(&u16s(&[1700]));
+        t.extend_from_slice(&[0; 3]);
+        t.extend_from_slice(&u32s(&[1, 1]));
+        t.extend_from_slice(&[0; 48]);
+        t.extend_from_slice(&u32s(&[0]));
+        t.extend_from_slice(&[0; 8]);
+        t.extend_from_slice(&u32s(&[1]));
+        t.extend_from_slice(&u32s(&[0]));
+        t.push(0);
+        t.push(0);
+        t.extend_from_slice(&style_string(
+            v,
+            r#"{"character":{"latin":{"font":"Arial","size":"128819","weight":"400","italic":"0"}}}"#,
+        ));
+        t.extend_from_slice(&u32s(&[0]));
+        t.extend_from_slice(&u32s(&[3]));
+        for _ in 0..3 {
+            t.extend_from_slice(&u16s(&[0]));
+            t.push(0xfe);
+            t.extend_from_slice(&[0; 5]);
+        }
+        t.extend_from_slice(&u32s(&[3]));
+        t.extend_from_slice(b"\rHi");
+        t.push(0);
+        let obj = list(
+            b"obj ",
+            &[
+                chunk(b"bbox", &i32s(&[0, 100_000, 100_000, 0])),
+                chunk(b"loda", &loda(OBJ_ARTISTIC_TEXT, &[])),
+                chunk(b"trfd", &trfd(v, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0])),
+                chunk(b"txsm", &t),
+            ]
+            .concat(),
+        );
+        let body = [
+            chunk(b"mcfg", &mcfg(v, 2_540_000, 2_540_000)),
+            list(b"page", &list(b"layr", &obj)),
+        ]
+        .concat();
+        let (doc, rep) = parse(&riff(b"CDRI", &body), v);
+        assert_eq!(rep.shapes, 1, "{:?}", rep.warnings);
+        match &first_shape(&doc).kind {
+            ShapeKind::Text { spans, .. } => {
+                let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+                assert_eq!(text, "Hi");
             }
             other => panic!("{other:?}"),
         }
@@ -14575,7 +14789,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn arrowheads_are_classified_from_their_outline() {
+    fn arrowheads_keep_their_own_outline_size_and_place() {
         let triangle = arrw(
             5,
             &[(0, 0), (100, 50), (0, 100), (0, 0)],
@@ -14655,21 +14869,35 @@ pub(crate) mod tests {
             let s = ctx.outlines[&id].stroke.clone().expect("stroke");
             (s.start_arrow, s.end_arrow)
         };
-        assert_eq!(arrows(1), (Arrowhead::Arrow, Arrowhead::Diamond));
-        assert_eq!(arrows(2), (Arrowhead::Square, Arrowhead::Bar));
-        assert_eq!(arrows(3), (Arrowhead::Circle, Arrowhead::OpenArrow));
-        assert_eq!(arrows(4), (Arrowhead::None, Arrowhead::None));
-        match arrows(5).0 {
-            Arrowhead::Custom { path, name } => {
-                use tracedraw_core::geometry::Shape as _;
-                assert_eq!(name, "Arrowhead 11");
-                let b = path.bounding_box();
-                // Normalised: one unit tall, tip at x = 0, body towards -x.
-                assert!((b.height() - 1.0).abs() < 1e-9, "{b:?}");
-                assert!(b.x1.abs() < 1e-9 && (b.x0 + 1.0).abs() < 1e-9, "{b:?}");
-            }
+        // Each head is the file's own outline, at the file's size and
+        // place (#3436): head units over 127 000 per outline width, in
+        // head space of 4 outline widths a unit. They were sorted into
+        // presets drawn at our size.
+        use tracedraw_core::geometry::Shape as _;
+        let unit = 127_000.0 * tracedraw_core::style::HEAD_SIZE_PER_WIDTH;
+        let custom = |a: Arrowhead| match a {
+            Arrowhead::Custom { path, name } => (path.bounding_box(), name),
             other => panic!("{other:?}"),
-        }
+        };
+        let (b, name) = custom(arrows(1).0);
+        assert_eq!(name, "Arrowhead 5");
+        assert!(
+            b.x0.abs() < 1e-12 && (b.x1 - 100.0 / unit).abs() < 1e-12,
+            "{b:?}"
+        );
+        assert!(
+            b.y0.abs() < 1e-12 && (b.y1 - 100.0 / unit).abs() < 1e-12,
+            "{b:?}"
+        );
+        assert_eq!(custom(arrows(1).1).1, "Arrowhead 6");
+        assert_eq!(custom(arrows(2).0).1, "Arrowhead 7");
+        assert_eq!(custom(arrows(2).1).1, "Arrowhead 8");
+        assert_eq!(custom(arrows(3).0).1, "Arrowhead 9");
+        // An open head is stroked one outline width wide.
+        let (b, _) = custom(arrows(3).1);
+        assert!((b.x1 - (100.0 + 63_500.0) / unit).abs() < 1e-3, "{b:?}");
+        assert_eq!(arrows(4), (Arrowhead::None, Arrowhead::None));
+        assert_eq!(custom(arrows(5).0).1, "Arrowhead 11");
         assert!(ctx
             .report
             .warnings
@@ -14721,7 +14949,7 @@ pub(crate) mod tests {
         for c in tree.root.find_all(b"arrx") {
             ctx.read_arrowhead_x(c);
         }
-        assert_eq!(ctx.arrows.get(&1), Some(&Arrowhead::Arrow));
+        assert!(ctx.arrows.get(&1).is_some_and(Arrowhead::is_custom));
         assert!(!ctx.arrows.contains_key(&2));
         assert!(ctx
             .report
@@ -15300,8 +15528,8 @@ pub(crate) mod tests {
             let s = ctx.outlines[&id].stroke.clone().expect("stroke");
             (s.start_arrow, s.end_arrow)
         };
-        assert_eq!(arrows(1), (Arrowhead::Arrow, Arrowhead::None));
-        assert_eq!(arrows(2), (Arrowhead::None, Arrowhead::Arrow));
+        assert!(arrows(1).0.is_custom() && arrows(1).1 == Arrowhead::None);
+        assert!(arrows(2).0 == Arrowhead::None && arrows(2).1.is_custom());
         assert!(ctx.report.warnings.is_empty(), "{:?}", ctx.report.warnings);
     }
 

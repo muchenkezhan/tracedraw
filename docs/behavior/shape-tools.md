@@ -26,13 +26,16 @@ whatever tool is active.
 
 With the Rectangle, Ellipse, Polygon, Star (and Complex star), Graph
 paper, Action Lines, 3-point rectangle, 3-point ellipse, Spiral and
-Common shapes tools still chosen, the pointer over one of those handles
+Common shapes tools (and the Text tool) still chosen, the pointer over one of those handles
 shows the resize arrows and a drag from it resizes the selection as the
 Pick tool's handles do (Shift from the centre, Ctrl in steps, Alt
 freely, a right click for a copy), the tool staying chosen. A click on
 a handle leaves the selection as it is; a press anywhere else draws a
 new object as before
-(`pick_drag_tests::a_drawing_tool_resizes_by_the_handles`).
+(`pick_drag_tests::a_drawing_tool_resizes_by_the_handles`). The Text
+tool does the same with the handles of a text just typed (or a frame
+just drawn), the text staying open for typing (#3258,
+`pick_drag_tests::a_text_just_typed_resizes_by_its_handles_with_the_text_tool`).
 
 ## Drag modifiers (every box tool)
 
@@ -197,6 +200,14 @@ new object as before
 
 - Rows x columns: default 4 x 3. The result is a group of rows x columns
   rectangles that fill the box exactly.
+- Radial (Cells or Radial on the bar, also on the tool's options page,
+  kept in the preferences): Rings (5) ellipses about the box's middle,
+  ring `i` of `n` (outermost first) `(n - i) / n` of the box across,
+  then Spokes (8, 0 to 360) open lines from the middle to the outer
+  ring at `90° + 360° k / spokes`; one group, filled and outlined as the
+  cells are (the spokes unfilled), one undo step "Graph Paper". The
+  preview shows the rings and spokes (`tools2::radial_grid_path`,
+  `tools2::tests::graph_paper_draws_a_radial_grid`).
 
 ## Common shapes
 

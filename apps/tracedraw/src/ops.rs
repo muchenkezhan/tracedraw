@@ -277,10 +277,12 @@ impl App {
     pub(crate) fn duplicate_in_place(&mut self) {
         let saved = self.duplicate_offset;
         self.duplicate_offset = Vec2::ZERO;
-        // Copies in place are not a Duplicate the next one repeats (#559).
+        // Copies in place start a Duplicate of their own (#559): left as
+        // they are, the next Duplicate uses the offset; moved, turned or
+        // scaled, it repeats that step from them, as after Ctrl+D (#3520).
         self.last_duplicate.clear();
         self.duplicate();
-        self.last_duplicate.clear();
+        self.last_duplicate_in_place = true;
         self.duplicate_offset = saved;
     }
 
@@ -387,9 +389,16 @@ impl App {
         }
         // Make everything a curve first so Combine has paths to merge.
         self.convert_to_curves();
-        let keep = shapes.last().copied();
-        self.run(Command::Combine { shapes });
-        self.selection = keep.into_iter().collect();
+        self.run(Command::Combine {
+            shapes: shapes.clone(),
+        });
+        // The result keeps the id of the part on top, which is not the
+        // last one picked when they were picked from the top down: select
+        // the one that is left. The selection named a part combined away,
+        // so nothing was selected after Combine.
+        let mut kept = shapes.clone();
+        self.doc().retain_existing(&mut kept);
+        self.selection = kept;
     }
 
     /// [`Self::combine`] on objects of one group: made curves, then one
@@ -876,7 +885,8 @@ impl App {
             }
         }
         // Remember where it came from: Image > Update from Link re-reads it.
-        if !dropped {
+        // Options > Global > File Formats can embed it only (#3089).
+        if !dropped && self.settings.formats.import_link_pictures {
             self.run(Command::SetObjectData {
                 shape: id,
                 data: vec![("bitmap.link".into(), path.display().to_string())],
@@ -1696,7 +1706,13 @@ impl App {
         };
         let id = self.engine.new_shape_id();
         let leaves = group_leaves(&attrs);
-        let pictures = picture_contents(&attrs);
+        // Create Boundary only draws an outline round the selection: a
+        // picture as target gave the picture cropped to it (#3253).
+        let pictures = if op == Shaping::Boundary {
+            None
+        } else {
+            picture_contents(&attrs)
+        };
         // A clip frame keeps what it holds: the result is a clip frame
         // whose frame takes the result's shape with the frame's own fill
         // and outline; a Weld also gathers what every clip frame welded
@@ -3271,6 +3287,30 @@ mod curves_and_target_tests {
         let (path, closed) = result(&app);
         assert_eq!(moves(&path), 2);
         assert!(!closed, "combined open curves stay open");
+    }
+
+    /// Combine of objects picked from the top down (Shift+click on the
+    /// top one first): the result is selected. The selection named the
+    /// last one picked, which Combine took away, so nothing was selected.
+    #[test]
+    fn combine_selects_the_result_whatever_the_picking_order() {
+        let mut app = App::headless();
+        let rect = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: Rect::new(x, 10.0, x + 20.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect")
+        };
+        let bottom = rect(&mut app, 10.0);
+        let middle = rect(&mut app, 40.0);
+        let top = rect(&mut app, 70.0);
+        app.select(vec![top, middle, bottom]);
+        app.combine();
+        assert_eq!(app.selection, vec![top], "the result, on top");
+        assert!(app.doc().find_shape(top).is_some());
+        assert_eq!(app.selected_shapes().len(), 1);
     }
 
     /// #1324, discussion #2415: Convert to Curves on a group (menu, right

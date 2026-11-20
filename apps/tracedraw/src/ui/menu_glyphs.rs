@@ -191,7 +191,7 @@ pub fn for_key(key: &str) -> Option<Glyph> {
         "menu.layout.switch_orientation" => PageOrientation,
         "menu.layout.page_number_settings" | "menu.object.insert_page_number" => PageNumber,
         "menu.layout.document_options" | "menu.layout.page_layout" => DocOptions,
-        "menu.layout.page_background" => PageBackground,
+        "menu.layout.page_background" | "menu.effects.frame_generator" => PageBackground,
         "menu.layout.page_size" => PageSize,
         "menu.object.align_left" | "menu.object.align_distribute" => AlignLeft,
         "menu.object.align_right" => AlignRight,
@@ -242,7 +242,9 @@ pub fn for_key(key: &str) -> Option<Glyph> {
         "menu.effects.lens" => Lens,
         "menu.effects.bevel" => Bevel,
         "menu.effects.brush_strokes" => BrushStrokes,
-        "menu.effects.picture_mosaic" | "menu.effects.vector_mosaic" => Mosaic,
+        "menu.effects.picture_mosaic"
+        | "menu.effects.vector_mosaic"
+        | "menu.effects.symbol_scatter" => Mosaic,
         "menu.effects.flatten" => Flatten,
         "menu.table.create_new_table" | "menu.object.create_table" => TableNew,
         "menu.table.convert_text_to_table" => TextToTable,

@@ -166,6 +166,9 @@ Or click the outline of a path with the [[tool.text]] tool and type. Text on a
 closed shape stands on its outside, centered on its top; clicked on the bottom
 of an ellipse, it starts there.
 
+A text you made narrower or wider with a side handle keeps its letters'
+shape on the path: the change goes into the character width.
+
 With text on a path selected (also with the [[tool.pick]] tool), the property
 bar shows the path's fields first, then the usual text fields:
 
@@ -192,7 +195,9 @@ from it.
 - [[menu.text > menu.text.insert_formatting_code]]: special characters such as
   [[menu.text.code_em_space]], [[menu.text.code_nonbreaking_space]],
   [[menu.text.code_optional_hyphen]] and [[menu.text.code_column_break]].
-- [[menu.text.show_non_printing]] shows spaces, tabs and breaks.
+- [[menu.text.show_non_printing]] shows spaces (dots), tabs (arrows),
+  paragraph ends (pilcrows) and line breaks in the text you are editing.
+  The marks never print.
 - [[menu.text.make_web_compatible]] prepares text for web pages.
 - [[menu.text > menu.text.convert]] switches between artistic and paragraph
   text.

@@ -98,6 +98,40 @@ fn rgb_array(c: Color) -> String {
     )
 }
 
+/// The Document Structuring Conventions comments that name the drawing's
+/// spot inks (`%%DocumentCustomColors`, each ink's process stand-in in
+/// `%%CMYKCustomColor`) with the process inks used: a RIP that builds its
+/// list of spot channels from the header found none, and printed a spot
+/// ink as its stand-in in process inks (#3458).
+fn custom_color_comments(out: &mut String, inks: &[tracedraw_core::document::Ink]) {
+    let inks: Vec<_> = inks.iter().filter(|i| !i.name.is_empty()).collect();
+    let _ = writeln!(out, "%%DocumentProcessColors: Cyan Magenta Yellow Black");
+    if inks.is_empty() {
+        return;
+    }
+    for (n, i) in inks.iter().enumerate() {
+        let key = if n == 0 {
+            "%%DocumentCustomColors:"
+        } else {
+            "%%+"
+        };
+        let _ = writeln!(out, "{key} {}", ps_string(&i.name));
+    }
+    for (n, i) in inks.iter().enumerate() {
+        let key = if n == 0 { "%%CMYKCustomColor:" } else { "%%+" };
+        let [c, m, y, k] = i.cmyk;
+        let _ = writeln!(
+            out,
+            "{key} {} {} {} {} {}",
+            f(c as f64),
+            f(m as f64),
+            f(y as f64),
+            f(k as f64),
+            ps_string(&i.name)
+        );
+    }
+}
+
 /// The short path operators the page bodies use.
 const PROCS: &str = "/m {moveto} def /l {lineto} def /c {curveto} def /h {closepath} def";
 
@@ -123,6 +157,7 @@ pub fn page_to_eps(doc: &Document, page_index: usize) -> String {
     );
     let _ = writeln!(out, "%%HiResBoundingBox: 0 0 {} {}", f(w), f(h));
     let _ = writeln!(out, "%%LanguageLevel: 3");
+    custom_color_comments(&mut out, &doc.inks);
     let _ = writeln!(out, "%%EndComments");
     let _ = writeln!(out, "{PROCS}");
     let _ = writeln!(out, "gsave");
@@ -157,6 +192,7 @@ pub fn document_to_ps(doc: &Document) -> String {
     );
     let _ = writeln!(out, "%%HiResBoundingBox: 0 0 {} {}", f(mw), f(mh));
     let _ = writeln!(out, "%%LanguageLevel: 3");
+    custom_color_comments(&mut out, &doc.inks);
     let _ = writeln!(out, "%%EndComments");
     let _ = writeln!(out, "%%BeginProlog");
     let _ = writeln!(out, "{PROCS}");
@@ -377,6 +413,14 @@ impl Writer<'_> {
                 return;
             }
             ShapeKind::ClipFrame { frame, contents } => {
+                // An outline behind the frame's fill goes beneath the fill
+                // and the contents (#3110).
+                let behind = frame.stroke.as_ref().is_some_and(|st| st.behind_fill);
+                let mut outline = (**frame).clone();
+                outline.fill = Fill::None;
+                if behind {
+                    self.shape(&outline, transform);
+                }
                 let mut fill_only = (**frame).clone();
                 fill_only.stroke = None;
                 self.shape(&fill_only, transform);
@@ -387,9 +431,9 @@ impl Writer<'_> {
                     self.shape(c, transform);
                 }
                 let _ = writeln!(self.out, "grestore");
-                let mut outline = (**frame).clone();
-                outline.fill = Fill::None;
-                self.shape(&outline, transform);
+                if !behind {
+                    self.shape(&outline, transform);
+                }
                 return;
             }
             ShapeKind::Bitmap { rect, png, .. } => {
@@ -409,7 +453,8 @@ impl Writer<'_> {
             return;
         }
         let bounds = path.bounding_box();
-        let even_odd = !matches!(shape.kind, ShapeKind::Text { .. });
+        let even_odd = !matches!(shape.kind, ShapeKind::Text { .. })
+            && shape.fill_rule != tracedraw_core::shaping::FillRule::NonZero;
         match &shape.fill {
             Fill::None => {}
             Fill::Solid(c) => {
@@ -574,7 +619,11 @@ impl Writer<'_> {
                 let _ = writeln!(self.out, "[] 0 setdash");
             }
             let _ = writeln!(self.out, "{} setmiterlimit", f(s.miter_ratio()));
-            self.path_ops(&path);
+            // A line with arrowheads ends under them, as drawn (#2981).
+            match tracedraw_core::arrowhead_stroke_path(&shape.page_path(), s) {
+                Some(cut) => self.path_ops(&(parent * cut)),
+                None => self.path_ops(&path),
+            }
             let _ = writeln!(self.out, "stroke");
             // Arrowheads (presets and custom): the page-space path already
             // carries the shape's own transform, so only the parent applies.
@@ -632,6 +681,20 @@ mod tests {
             k: 0.0,
         };
         assert!(!color_op_with(lost, &doc.inks).contains("Separation"));
+        // The header names the ink and its stand-in, in EPS and in
+        // PostScript, before the comments end (#3458).
+        for out in [eps.clone(), document_to_ps(&doc)] {
+            let head = &out[..out.find("%%EndComments").expect("comments end")];
+            assert!(head.contains("%%DocumentProcessColors: Cyan Magenta Yellow Black"));
+            assert!(
+                head.contains("%%DocumentCustomColors: (CutContour)\n"),
+                "{head}"
+            );
+            assert!(
+                head.contains("%%CMYKCustomColor: 0 1 0 0 (CutContour)\n"),
+                "{head}"
+            );
+        }
     }
 
     #[test]
