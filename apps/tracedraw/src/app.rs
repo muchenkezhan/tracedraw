@@ -466,6 +466,9 @@ pub enum Drag {
     /// Dragging a corner widget (Shape tool): the corners round as it
     /// moves (#635).
     CornerWidget(Box<crate::corner_widgets::CornerDrag>),
+    /// Dragging a handle of a live Fit Objects to Path (Pick tool): the
+    /// spacing or the turn of all the objects.
+    FitPathHandle(Box<crate::fit_live::HandleDrag>),
     /// Dragging a control handle (Shape tool).
     Handle {
         shape: ShapeId,
@@ -648,6 +651,14 @@ pub enum Drag {
     /// The mirror lines of the symmetry being edited, dragged with the
     /// Pick tool: moved (the centre follows the pointer) or, from a
     /// turning handle, turned about the centre.
+    /// A handle of the selected object's Grid effect dragged with the
+    /// Pick tool, from `from` (page space), the grid as it was.
+    GridHandle {
+        id: ShapeId,
+        handle: crate::grid_handles::GridHandle,
+        from: Point,
+        start: tracedraw_core::live::Effect,
+    },
     SymmetryLines {
         id: ShapeId,
         turn: bool,
@@ -1267,6 +1278,11 @@ pub struct App {
     /// them since (moved, scaled, turned), as the reference program's
     /// smart duplicate does (#559). Deselecting them ends it (#1494).
     pub last_duplicate: Vec<(ShapeId, ShapeId)>,
+    /// [`last_duplicate`](Self::last_duplicate) was made in place (the
+    /// + key): until the copies are moved, turned or scaled, the next
+    /// Duplicate uses the duplicate offset; after, it repeats that step
+    /// (#3520).
+    pub last_duplicate_in_place: bool,
     /// [`last_duplicate`](Self::last_duplicate) as it was when its copies
     /// were deselected, with the drawing's revision and the selection
     /// then: Undo with nothing changed since selects the copies again and
@@ -1307,6 +1323,12 @@ pub struct App {
     /// `object_clone.rs`).
     pub clone_sync_revision: u64,
     pub ellipse_arc: Option<tracedraw_core::EllipseArc>,
+    /// The 2-Point Line tool draws quarter arcs (`drag_copies.rs`), bowed
+    /// the other way with `line_arc_flip`.
+    pub line_arc: bool,
+    pub line_arc_flip: bool,
+    /// The copies a shape drag left with C held, until it ends.
+    pub drag_copies: Option<crate::drag_copies::DragCopies>,
     /// The Contour tool's and panel's values and the tool's drag.
     pub contour: crate::contour_tool::ContourSettings,
     pub contour_drag: Option<crate::contour_tool::ContourDrag>,
@@ -1344,6 +1366,10 @@ pub struct App {
     pub table_border: Option<Stroke>,
     pub graph_rows: u32,
     pub graph_cols: u32,
+    /// Graph Paper as a radial grid: rings and spokes.
+    pub graph_radial: bool,
+    pub graph_rings: u32,
+    pub graph_spokes: u32,
     /// The Action Lines tool's settings (#1617).
     pub action_lines: crate::action_lines::ActionLines,
     /// The Shape Generator panel's settings (#3412, #3413).
@@ -1393,6 +1419,11 @@ pub struct App {
     /// Eraser nib: thickness in mm and shape.
     pub eraser_width: f64,
     pub eraser_square: bool,
+    /// The Eraser on pictures (#3043): hardness, the share of the nib's
+    /// radius erased fully before the edge fades out (0 to 1), and
+    /// strength, how much of a pixel it erases at most (0 to 1).
+    pub eraser_hardness: f64,
+    pub eraser_strength: f64,
     pub shadow_default: tracedraw_core::Shadow,
     pub text_font: String,
     pub text_size_pt: f64,
@@ -1652,12 +1683,22 @@ pub struct App {
     /// The symmetry whose last change made the undo step "Edit Symmetry",
     /// so the next change joins it.
     pub symmetry_step: Option<ShapeId>,
+    /// The grid whose last change made the undo step "Edit Grid", so the
+    /// rest of the drag joins it.
+    pub grid_step: Option<ShapeId>,
+    /// The box of the selected Grid's cells (`grid_handles.rs`).
+    pub grid_cell: crate::grid_handles::GridCellCache,
     /// A click on a mirror line shows round handles that turn the lines.
     pub symmetry_turning: bool,
     /// The drawing without the edited symmetry's copies (Show full
     /// preview off), kept for the revision it was made at.
     pub symmetry_doc:
         std::cell::RefCell<Option<(u64, ShapeId, std::rc::Rc<tracedraw_core::Document>)>>,
+    /// Bitmaps > Edit Inside: the picture whose pixels are being edited
+    /// in place (see pixel_edit_app.rs).
+    pub pixel_edit: Option<Box<crate::pixel_edit_app::PixelEdit>>,
+    /// The brush settings of picture editing, kept between pictures.
+    pub pixel_opts: crate::pixel_edit::BrushOpts,
     pub show_guides: bool,
     /// Selected guidelines of the active page (indices).
     pub selected_guides: Vec<usize>,
@@ -1797,6 +1838,10 @@ pub struct App {
     /// modification time of each, and when they were last looked at.
     pub linked_mtimes: std::collections::HashMap<ShapeId, std::time::SystemTime>,
     pub linked_checked: Option<web_time::Instant>,
+    /// Insert Object > Insert What It Saves (#3391): the blank pictures
+    /// handed to programs, with their time stamps when handed over; one
+    /// that is saved comes into the drawing.
+    pub object_files: Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
     /// Session recovery: this session's marker in the auto-backup folder
     /// (made on the first frame; in a browser once its storage is read).
     pub session: Option<crate::recovery::Session>,
@@ -1848,6 +1893,11 @@ pub struct App {
     /// and the selection before the latest one, so all of them end up
     /// selected together.
     pub import_batch: Option<crate::import_place::ImportBatch>,
+    /// Columns and rows the drag placing several files lays them out in
+    /// (the arrow keys change them while it lasts).
+    pub import_grid: (u32, u32),
+    /// The grid cells the files still to come in go to, in order.
+    pub import_cells: std::collections::VecDeque<tracedraw_core::geometry::Rect>,
     /// Weld, Trim or Intersect waiting for a click on the target, with
     /// what it leaves of the source and the target (#562).
     pub pending_shaping: Option<(crate::ops::Shaping, bool, bool)>,
@@ -2098,6 +2148,9 @@ pub struct App {
     pub pending_blend_path: bool,
     /// Text > Fit Text to Path waits for a click on the path.
     pub pending_text_path: bool,
+    /// Rotate by Two Lines waits for its clicks: the points given so far,
+    /// the base line's two ends then the target line's (#2870).
+    pub pending_rotate_lines: Option<Vec<Point>>,
     /// The document palette's eyedropper waits for a click on the drawing.
     pub pending_palette_sample: bool,
     pub envelope_keep_lines: bool,
@@ -2195,6 +2248,14 @@ pub struct App {
     /// The document revision blends were last brought up to date with
     /// their end objects (see [`App::refresh_blends`]).
     pub blends_checked: u64,
+    /// The drawing's revision when the live fits last followed their
+    /// paths and objects (see [`App::refresh_live_fits`]).
+    pub live_fits_checked: u64,
+    /// The selected live fit's handles, for the revision and selection
+    /// they were worked out for.
+    #[allow(clippy::type_complexity)]
+    pub live_handle_cache:
+        std::cell::RefCell<Option<((u64, Vec<ShapeId>), Option<crate::fit_live::LiveHandles>)>>,
     /// Rounded connectors' corner radius, mm.
     pub connector_radius: f64,
     /// The document revision connectors were last checked at (see
@@ -2279,6 +2340,8 @@ pub struct App {
     pub vector_mosaic: crate::vector_mosaic::VectorMosaicSettings,
     /// The Symbol Scatter docker's settings (and picked symbols).
     pub symbol_scatter: crate::symbol_scatter::ScatterSettings,
+    /// The Frame Generator docker's settings.
+    pub frame_gen: crate::frame_gen::FrameSettings,
     /// The Picture Mosaic docker's settings and indexed library.
     pub picture_mosaic: crate::picture_mosaic::PictureMosaicSettings,
     /// A Picture Mosaic library being indexed in the background.
@@ -2477,6 +2540,7 @@ pub enum DockerTab {
     PictureMosaic,
     ShapeGenerator,
     SymbolScatter,
+    FrameGenerator,
     Shelf,
     Export,
     Comments,
@@ -2487,7 +2551,7 @@ pub enum DockerTab {
 }
 
 impl DockerTab {
-    pub const ALL: [DockerTab; 47] = [
+    pub const ALL: [DockerTab; 48] = [
         DockerTab::Properties,
         DockerTab::Objects,
         DockerTab::Hints,
@@ -2531,6 +2595,7 @@ impl DockerTab {
         DockerTab::PictureMosaic,
         DockerTab::ShapeGenerator,
         DockerTab::SymbolScatter,
+        DockerTab::FrameGenerator,
         DockerTab::Shelf,
         DockerTab::Effects,
         DockerTab::Macros,
@@ -2589,7 +2654,7 @@ impl DockerTab {
     ];
 
     /// Window > Panels > Effects.
-    pub const EFFECTS_MENU: [DockerTab; 12] = [
+    pub const EFFECTS_MENU: [DockerTab; 13] = [
         DockerTab::Effects,
         DockerTab::Blend,
         DockerTab::Contour,
@@ -2602,6 +2667,7 @@ impl DockerTab {
         DockerTab::VectorMosaic,
         DockerTab::PictureMosaic,
         DockerTab::SymbolScatter,
+        DockerTab::FrameGenerator,
     ];
 
     /// i18n key of the docker's title.
@@ -2647,6 +2713,7 @@ impl DockerTab {
             DockerTab::PictureMosaic => "docker.picture_mosaic",
             DockerTab::ShapeGenerator => "docker.shape_generator",
             DockerTab::SymbolScatter => "docker.symbol_scatter",
+            DockerTab::FrameGenerator => "docker.frame_generator",
             DockerTab::Shelf => "docker.shelf",
             DockerTab::Export => "docker.export",
             DockerTab::Comments => "docker.comments",
@@ -3127,6 +3194,7 @@ impl App {
             // scaled or turned; the next one repeats that (#1494).
             duplicate_offset: Vec2::ZERO,
             last_duplicate: Vec::new(),
+            last_duplicate_in_place: false,
             snap_held_off: false,
             forgotten_duplicate: None,
             selection_steps: Default::default(),
@@ -3143,6 +3211,9 @@ impl App {
             marquee_selection: None,
             clone_sync_revision: 0,
             ellipse_arc: None,
+            line_arc: false,
+            line_arc_flip: false,
+            drag_copies: None,
             contour: Default::default(),
             contour_drag: None,
             contour_handle_drag: None,
@@ -3164,6 +3235,9 @@ impl App {
             table_border: Some(Stroke::hairline(Color::BLACK)),
             graph_rows: 4,
             graph_cols: 3,
+            graph_radial: false,
+            graph_rings: 5,
+            graph_spokes: 8,
             action_lines: Default::default(),
             shape_gen: Default::default(),
             balloon_style: Default::default(),
@@ -3189,6 +3263,8 @@ impl App {
             brush_radius: 10.0,
             eraser_width: 6.35,
             eraser_square: false,
+            eraser_hardness: 0.5,
+            eraser_strength: 1.0,
             shadow_default: tracedraw_core::Shadow::default(),
             text_font: "Arial".into(),
             text_size_pt: 24.0,
@@ -3298,8 +3374,12 @@ impl App {
             clip_edit_marks: Vec::new(),
             symmetry_edit: None,
             symmetry_step: None,
+            grid_step: None,
+            grid_cell: Default::default(),
             symmetry_turning: false,
             symmetry_doc: Default::default(),
+            pixel_edit: None,
+            pixel_opts: Default::default(),
             show_guides: true,
             selected_guides: Vec::new(),
             edit_master_guides: true,
@@ -3362,6 +3442,7 @@ impl App {
             backed_up: Default::default(),
             linked_mtimes: Default::default(),
             linked_checked: None,
+            object_files: Vec::new(),
             session: None,
             recovery_offer: Vec::new(),
             highlight_whats_new: false,
@@ -3391,6 +3472,8 @@ impl App {
             import_place_waiting: None,
             import_queue: Default::default(),
             import_batch: None,
+            import_grid: (1, 1),
+            import_cells: Default::default(),
             autofit_preview: None,
             last_export: None,
             last_bg_remove: None,
@@ -3504,6 +3587,7 @@ impl App {
             bevel_synced_to: None,
             pending_blend_path: false,
             pending_text_path: false,
+            pending_rotate_lines: None,
             pending_palette_sample: false,
             envelope_keep_lines: false,
             media_mode: crate::media::MediaMode::Calligraphic,
@@ -3546,6 +3630,8 @@ impl App {
             callout_style: Default::default(),
             callouts_checked: 0,
             blends_checked: 0,
+            live_fits_checked: 0,
+            live_handle_cache: Default::default(),
             connector_radius: 3.0,
             connectors_checked: u64::MAX,
             connector_radius_step: None,
@@ -3582,6 +3668,7 @@ impl App {
             coords: Default::default(),
             vector_mosaic: Default::default(),
             symbol_scatter: Default::default(),
+            frame_gen: Default::default(),
             picture_mosaic: Default::default(),
             picture_mosaic_job: None,
             coord_pick: None,
@@ -4178,10 +4265,15 @@ impl App {
             table_cols: self.table_cols,
             graph_rows: self.graph_rows,
             graph_cols: self.graph_cols,
+            graph_radial: self.graph_radial,
+            graph_rings: self.graph_rings,
+            graph_spokes: self.graph_spokes,
             blend_steps: self.blend_steps,
             contour: self.contour,
             eraser_width: self.eraser_width,
             eraser_square: self.eraser_square,
+            eraser_hardness: self.eraser_hardness,
+            eraser_strength: self.eraser_strength,
             text_font: self.text_default_font.clone(),
             text_size_pt: self.text_default_size,
             text_hyphenation: self.text_hyphenation,
@@ -4268,17 +4360,25 @@ impl App {
             .clamp(1, complex_star_max_sharpness(self.complex_points));
         self.rect_corners = t.rect_corners;
         self.corners_together = t.corners_together;
-        self.ellipse_arc = t.ellipse_arc.filter(|a| !is_whole_turn(a));
+        // A ring keeps its whole turn.
+        self.ellipse_arc = t
+            .ellipse_arc
+            .filter(|a| !is_whole_turn(a) || (a.pie && a.inner > 0.0));
         self.spiral_revolutions = t.spiral_revolutions.clamp(1, 100);
         self.spiral_logarithmic = t.spiral_logarithmic;
         self.table_rows = t.table_rows.clamp(1, 1000);
         self.table_cols = t.table_cols.clamp(1, 1000);
         self.graph_rows = t.graph_rows.clamp(1, 1000);
         self.graph_cols = t.graph_cols.clamp(1, 1000);
+        self.graph_radial = t.graph_radial;
+        self.graph_rings = t.graph_rings.clamp(1, 1000);
+        self.graph_spokes = t.graph_spokes.clamp(0, 1000);
         self.blend_steps = t.blend_steps.clamp(1, 999);
         self.contour = t.contour.clamped();
         self.eraser_width = finite(t.eraser_width, 0.025, 2540.0, 6.35);
         self.eraser_square = t.eraser_square;
+        self.eraser_hardness = finite(t.eraser_hardness, 0.0, 1.0, 0.5);
+        self.eraser_strength = finite(t.eraser_strength, 0.0, 1.0, 1.0);
         if !t.text_font.trim().is_empty() {
             self.text_font = t.text_font.clone();
         }
@@ -6405,8 +6505,13 @@ impl App {
         }
     }
 
-    /// Graph Paper: a grid of `graph_rows` x `graph_cols` rectangles, grouped.
+    /// Graph Paper: a grid of `graph_rows` x `graph_cols` rectangles, grouped;
+    /// or, set to radial, `graph_rings` rings and `graph_spokes` spokes.
     pub fn create_graph_paper(&mut self, rect: Rect) {
+        if self.graph_radial {
+            self.create_radial_grid(rect);
+            return;
+        }
         let (rows, cols) = (self.graph_rows.max(1), self.graph_cols.max(1));
         let Some(layer) = self.active_layer() else {
             return;
@@ -6439,6 +6544,62 @@ impl App {
                 ids.push(id);
                 cmds.push(Command::AddShape { layer, shape: s });
             }
+        }
+        cmds.push(Command::Group { shapes: ids });
+        let _ = self.engine.run_batch("Graph Paper", &cmds);
+        if let Some(id) = self
+            .doc()
+            .page(self.page)
+            .ok()
+            .and_then(|p| p.layers.iter().find(|l| l.id == layer))
+            .and_then(|l| l.shapes.last())
+            .map(|s| s.id)
+        {
+            self.select(vec![id]);
+        }
+    }
+
+    /// Graph Paper set to radial: `graph_rings` ellipses evenly spaced from
+    /// the middle of `rect` to its edge, the outer one at the back, and
+    /// `graph_spokes` lines from the middle to the outer ring, the first
+    /// pointing up; grouped, one undo step.
+    pub fn create_radial_grid(&mut self, rect: Rect) {
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        let stroke = self
+            .default_stroke()
+            .or_else(|| Some(Stroke::hairline(Color::BLACK)));
+        let mut cmds = Vec::new();
+        let mut ids = Vec::new();
+        let mut add = |app: &mut Self, kind: ShapeKind, fill: Fill| {
+            let id = app.engine.new_shape_id();
+            let mut s = Shape::new(id, kind);
+            s.fill = fill;
+            s.stroke = stroke.clone();
+            ids.push(id);
+            cmds.push(Command::AddShape { layer, shape: s });
+        };
+        let fill = self.default_fill();
+        for r in crate::tools2::radial_rings(rect, self.graph_rings) {
+            add(
+                self,
+                ShapeKind::Ellipse { rect: r, arc: None },
+                fill.clone(),
+            );
+        }
+        for (a, b) in crate::tools2::radial_spokes(rect, self.graph_spokes) {
+            let mut path = tracedraw_core::geometry::BezPath::new();
+            path.move_to(a);
+            path.line_to(b);
+            add(
+                self,
+                ShapeKind::Path {
+                    path,
+                    closed: false,
+                },
+                Fill::None,
+            );
         }
         cmds.push(Command::Group { shapes: ids });
         let _ = self.engine.run_batch("Graph Paper", &cmds);
@@ -7324,9 +7485,19 @@ impl App {
             (o.transform.determinant().abs() > 1e-12).then(|| c.transform * o.transform.inverse())
         };
         let steps: Vec<Option<Affine>> = shapes.iter().map(|s| step_of(s.id)).collect();
+        // Copies made in place and not changed since: the offset (#3520).
+        let untouched = |m: &Option<Affine>| {
+            m.is_some_and(|m| {
+                m.as_coeffs()
+                    .iter()
+                    .zip(Affine::IDENTITY.as_coeffs())
+                    .all(|(a, b)| (a - b).abs() < 1e-9)
+            })
+        };
         let smart = !self.last_duplicate.is_empty()
             && self.selection.len() == self.last_duplicate.len()
-            && steps.iter().all(Option::is_some);
+            && steps.iter().all(Option::is_some)
+            && !(self.last_duplicate_in_place && steps.iter().all(untouched));
         let mut ids = Vec::new();
         let mut copies = Vec::new();
         let mut pairs = Vec::new();
@@ -7360,6 +7531,7 @@ impl App {
         self.carry_pivots(&pairs);
         self.select(ids.clone());
         self.last_duplicate = pairs;
+        self.last_duplicate_in_place = false;
         self.forgotten_duplicate = None;
         if self.symmetry_edit.is_some() {
             self.join_symmetry(&ids);
@@ -10057,7 +10229,12 @@ impl App {
             st.looking_for_printers = true;
             self.fetch_printers(crate::printers::system_printers);
         }
-        self.print_preview = Some(crate::ui::print_preview::PrintPreview::new(st));
+        let mut pv = crate::ui::print_preview::PrintPreview::new(st);
+        // The View button's choices as they were last left (#3603).
+        pv.rulers = self.settings.print_preview_rulers;
+        pv.strip = self.settings.print_preview_strip;
+        pv.options = self.settings.print_preview_options;
+        self.print_preview = Some(pv);
     }
 
     pub fn import(&mut self) {
@@ -11773,6 +11950,7 @@ pub const DEFAULT_ELLIPSE_ARC: tracedraw_core::EllipseArc = tracedraw_core::Elli
     start_deg: 0.0,
     end_deg: 270.0,
     pie: true,
+    inner: 0.0,
 };
 
 /// A pie or arc whose ends meet: a whole turn, the plain ellipse with a
@@ -11987,6 +12165,44 @@ mod tests {
         app.duplicate();
         let g = app.selection[0];
         assert!((x0(&app, g) - app.duplicate_offset.x).abs() < 1e-9);
+    }
+
+    /// A copy made in place (+) and turned: the next Duplicate turns a
+    /// new copy as much again, as after Ctrl+D; left as it is, the next
+    /// Duplicate uses the offset (#3520).
+    #[test]
+    fn a_copy_in_place_turned_repeats_its_turn() {
+        let mut app = App::headless();
+        let a = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.duplicate_offset = Vec2::new(5.0, 5.0);
+        app.select(vec![a]);
+        app.duplicate_in_place();
+        let b = app.selection[0];
+        let pivot = Point::new(30.0, 5.0);
+        let turn = Affine::translate(pivot.to_vec2())
+            * Affine::rotate(30f64.to_radians())
+            * Affine::translate(-pivot.to_vec2());
+        app.transform_selection(turn);
+        app.duplicate();
+        let c = app.selection[0];
+        let t = |app: &App, id: ShapeId| app.doc().find_shape(id).expect("shape").transform;
+        let want = turn * turn * t(&app, a);
+        for (x, y) in t(&app, c).as_coeffs().iter().zip(want.as_coeffs()) {
+            assert!((x - y).abs() < 1e-6, "{:?} {:?}", t(&app, c), want);
+        }
+        // In place and untouched: the offset.
+        app.select(vec![a]);
+        app.duplicate_in_place();
+        app.duplicate();
+        let d = app.selection[0];
+        let off = t(&app, d) * t(&app, a).inverse();
+        assert!((off.translation() - Vec2::new(5.0, 5.0)).hypot() < 1e-9, "{off:?}");
     }
 
     /// The reporter's steps (#1494): Duplicate leaves the copy on the
@@ -13288,6 +13504,7 @@ mod tests {
             start_deg: 90.0,
             end_deg: 90.0,
             pie: true,
+            inner: 0.0,
         };
         app.ellipse_arc = Some(old);
         let prefs = app.tool_prefs();
@@ -13299,6 +13516,7 @@ mod tests {
                 start_deg: whole.0,
                 end_deg: whole.1,
                 pie: false,
+                inner: 0.0,
             }));
         }
         app.ellipse_arc = Some(DEFAULT_ELLIPSE_ARC);
