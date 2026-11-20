@@ -58,6 +58,9 @@ pub fn show(app: &mut App, ui: &mut Ui, tab: DockerTab) {
         DockerTab::Coordinates => crate::ui::coords_docker::coordinates(app, ui),
         DockerTab::VectorMosaic => crate::ui::vector_mosaic_docker::vector_mosaic(app, ui),
         DockerTab::PictureMosaic => crate::ui::picture_mosaic_docker::picture_mosaic(app, ui),
+        DockerTab::ShapeGenerator => crate::ui::shape_gen_docker::shape_generator(app, ui),
+        DockerTab::SymbolScatter => crate::ui::symbol_scatter_docker::symbol_scatter(app, ui),
+        DockerTab::FrameGenerator => crate::ui::frame_gen_docker::frame_generator(app, ui),
         DockerTab::Shelf => crate::ui::shelf_docker::shelf(app, ui),
         DockerTab::Export => crate::ui::export_docker::export_docker(app, ui),
         DockerTab::Comments => crate::ui::comments_docker::comments_docker(app, ui),
@@ -1419,6 +1422,11 @@ fn lens(app: &mut App, ui: &mut Ui) {
                     if i == 9 && app.lens.color == tracedraw_core::Color::WHITE {
                         app.lens.color = tracedraw_core::Color::BLACK;
                     }
+                    // Cut starts with a black shadow at 60 %.
+                    if i == 13 && app.lens.color == tracedraw_core::Color::WHITE {
+                        app.lens.color = tracedraw_core::Color::BLACK;
+                        app.lens.rate = 60.0;
+                    }
                 }
             }
         })
@@ -1486,6 +1494,54 @@ fn lens(app: &mut App, ui: &mut Ui) {
                 color_button(ui, &mut l.color_to);
                 ui.label(tr("docker.fill"));
                 color_button(ui, &mut l.color);
+            });
+        }
+        13 => {
+            // Cut: the spurs where the lens's middle line crosses the
+            // objects beneath, the cut itself and the shadow under it.
+            ui.add(
+                crate::ui::Slider::new(&mut l.spur_length, 0.0..=50.0)
+                    .text(tr("lens.cut_spur_length"))
+                    .suffix(" mm"),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "lens.cut_spur_length",
+                "lens.cut_spur_length_desc",
+            ));
+            ui.add(
+                crate::ui::Slider::new(&mut l.spur_width, 0.0..=50.0)
+                    .text(tr("lens.cut_spur_width"))
+                    .suffix(" mm"),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "lens.cut_spur_width",
+                "lens.cut_spur_width_desc",
+            ));
+            ui.add(
+                crate::ui::Slider::new(&mut l.curve, 0.5..=6.0).text(tr("lens.cut_curve")),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "lens.cut_curve",
+                "lens.cut_curve_desc",
+            ));
+            ui.add(crate::ui::Slider::new(&mut l.gap, 0.0..=10.0).text(tr("lens.cut_gap")).suffix(" mm"))
+                .rich_tip(crate::ui::tips::pair("lens.cut_gap", "lens.cut_gap_desc"));
+            ui.add(
+                crate::ui::Slider::new(&mut l.rate, 0.0..=100.0).text(tr("lens.cut_shadow"))
+                    .suffix(" %"),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "lens.cut_shadow",
+                "lens.cut_shadow_desc",
+            ));
+            ui.horizontal(|ui| {
+                ui.label(tr("docker.color"));
+                color_button(ui, &mut l.color);
+                ui.checkbox(&mut l.shadow_up, tr("lens.cut_shadow_up"))
+                    .rich_tip(crate::ui::tips::pair(
+                        "lens.cut_shadow_up",
+                        "lens.cut_shadow_up_desc",
+                    ));
             });
         }
         12 => {
@@ -1609,6 +1665,35 @@ fn blend_pic(
 }
 
 use egui::Color32;
+
+/// Where the blend's start and end objects sit along its path, in % of
+/// its length: changing either moves the object there (#2946).
+pub(crate) fn blend_path_ends(app: &mut App, ui: &mut Ui, opt: &tracedraw_core::live::BlendOptions) {
+    let (a, b) = opt.path_ends();
+    let (mut from, mut to) = (a * 100.0, b * 100.0);
+    let mut moved = false;
+    for (key, v) in [
+        ("docker.blend_path_start", &mut from),
+        ("docker.blend_path_end", &mut to),
+    ] {
+        ui.horizontal(|ui| {
+            ui.label(tr(key));
+            moved |= ui
+                .add(
+                    crate::ui::field::NumField::new(v)
+                        .range(0.0..=100.0)
+                        .speed(0.5)
+                        .max_decimals(1)
+                        .suffix(" %"),
+                )
+                .rich_tip(crate::ui::tips::keyed(key))
+                .changed();
+        });
+    }
+    if moved {
+        app.set_blend_path_ends(from / 100.0, to / 100.0);
+    }
+}
 
 /// The Blend docker: steps or spacing, rotation with Loop, the path
 /// options, the acceleration of objects and colours (with Apply to
@@ -1769,6 +1854,9 @@ fn blend(app: &mut App, ui: &mut Ui) {
         .rich_tip(crate::ui::tips::keyed("docker.rotate_all_objects"))
         .rich_disabled_tip(crate::ui::tips::keyed("docker.rotate_all_objects"))
         .changed();
+    if has_path {
+        blend_path_ends(app, ui, &opt);
+    }
     section(ui, Some(&tr("docker.blend_acceleration")));
     ui.spacing_mut().slider_width = (ui.available_width() - 80.0).clamp(80.0, 200.0);
     ui.horizontal(|ui| {
@@ -1955,6 +2043,14 @@ fn blend(app: &mut App, ui: &mut Ui) {
             {
                 app.pending_blend_path = true;
                 app.status = tr("status.click_blend_path");
+            }
+            if has_path
+                && ui
+                    .button(tr("docker.detach_path"))
+                    .rich_tip(crate::ui::tips::keyed("docker.detach_path"))
+                    .clicked()
+            {
+                app.detach_blend_path();
             }
             if ui
                 .button(tr("docker.clear_blend"))
@@ -2240,6 +2336,20 @@ fn brush_strokes(app: &mut App, ui: &mut Ui) {
                 "docker.spray_spacing_desc",
             ));
         }
+        crate::media::MediaMode::Tiles => {
+            ui.horizontal_wrapped(|ui| {
+                for (i, k) in crate::media::TILE_KEYS.iter().enumerate() {
+                    if ui
+                        .selectable_label(app.media_preset == i, tr(k))
+                        .rich_tip_with(|| format!("{}\n{}", tr(k), tr("docker.media_preset_desc")))
+                        .clicked()
+                    {
+                        app.media_preset = i;
+                    }
+                }
+            });
+        }
+        crate::media::MediaMode::Merge => {}
         crate::media::MediaMode::Expression => {
             ui.add(
                 crate::ui::Slider::new(&mut app.media_pressure, 0.0..=1.0)
@@ -2893,6 +3003,9 @@ fn symbol_picture(
     }
 }
 
+/// The side of a page's miniature in the Pages docker, points (#2932).
+const PAGE_THUMB: f32 = 44.0;
+
 fn pages(app: &mut App, ui: &mut Ui) {
     let pages: Vec<(tracedraw_core::PageId, String, tracedraw_core::Size)> = app
         .doc()
@@ -2932,9 +3045,26 @@ fn pages(app: &mut App, ui: &mut Ui) {
             app.page_sorter = !app.page_sorter;
         }
     });
+    let revision = app.engine.revision();
     for (i, (id, name, size)) in pages.iter().enumerate() {
         ui.horizontal(|ui| {
             let active = *id == app.page;
+            // The page's miniature, so a page is found by what it shows,
+            // not by its number alone (#2932).
+            let (r, resp) =
+                ui.allocate_exact_size(egui::vec2(PAGE_THUMB, PAGE_THUMB), egui::Sense::click());
+            if active {
+                ui.painter()
+                    .rect_filled(r.expand(2.0), 2.0, crate::theme::Tokens::tool_active());
+            }
+            let thumb = crate::ui::preview::page_thumb(ui, app.doc(), revision, *id, PAGE_THUMB);
+            crate::ui::preview::paint_page_thumb(ui, r.shrink(2.0), thumb, *size);
+            if resp
+                .rich_tip_with(|| format!("{name}\n{}", tr("docker.page_list_desc")))
+                .clicked()
+            {
+                app.goto_page(i);
+            }
             if ui
                 .selectable_label(active, format!("{}. {name}", i + 1))
                 .rich_tip_with(|| format!("{name}\n{}", tr("docker.page_list_desc")))
@@ -3247,7 +3377,10 @@ fn fit_to_path(app: &mut App, ui: &mut Ui) {
     };
     let u = app.units;
     app.fit_path_follow_selection();
-    let mut f = app.fit_path;
+    // A live fit selected (its path, an object or a copy): the panel
+    // shows its settings and a change refits at once.
+    let live = app.live_fit_for_selection();
+    let mut f = live.as_ref().map_or(app.fit_path, |(_, l)| l.settings);
     let field = |ui: &mut Ui, key: &str, mm: &mut f64, min: f64| {
         ui.horizontal(|ui| {
             ui.label(tr(key));
@@ -3308,7 +3441,11 @@ fn fit_to_path(app: &mut App, ui: &mut Ui) {
 
     // What is fitted: the objects (all but the last selected) and the path.
     ui.strong(tr("docker.fit_to_path_objects"));
-    let objects = app.selection.len().saturating_sub(1);
+    let objects = live
+        .as_ref()
+        .map_or(app.selection.len().saturating_sub(1), |(_, l)| {
+            l.members.len()
+        });
     dim(
         ui,
         trf(
@@ -3321,7 +3458,13 @@ fn fit_to_path(app: &mut App, ui: &mut Ui) {
         &mut f.keep_originals,
         "docker.fit_to_path_keep_originals",
     );
-    check(ui, &mut f.group, "docker.fit_to_path_group");
+    // Live sits beside Group all objects, so the panel keeps its height.
+    ui.horizontal(|ui| {
+        if live.is_none() {
+            check(ui, &mut f.group, "docker.fit_to_path_group");
+        }
+        check(ui, &mut f.live, "docker.fit_to_path_live");
+    });
     ui.add_space(4.0);
     ui.strong(tr("docker.fit_to_path_path"));
     if app.selection.len() >= 2 {
@@ -3649,6 +3792,17 @@ fn fit_to_path(app: &mut App, ui: &mut Ui) {
     }
     ui.checkbox(&mut f.reverse, tr("docker.fit_to_path_reverse"))
         .rich_tip(crate::ui::tips::keyed("docker.fit_to_path_reverse"));
+    if let Some((path, l)) = live {
+        // Live off lets the objects go where they are.
+        if f != l.settings {
+            if f.live {
+                app.set_live_fit_settings(path, f);
+            } else {
+                app.release_live_fit(path);
+            }
+        }
+        return;
+    }
     if f != app.fit_path {
         app.fit_path_edited = true;
     }

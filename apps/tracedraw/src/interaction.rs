@@ -56,6 +56,9 @@ use tracedraw_core::{
 /// How far out of the selection box the rotate and skew arrows' centres
 /// stand (rotate mode), interface points.
 pub(crate) const ROTATE_HANDLE_OFFSET: f32 = 9.0;
+/// The least room between two handles of one side of the selection box,
+/// interface points (#3523).
+pub(crate) const HANDLE_GAP: f32 = 3.0;
 /// How many groups, clip frames and symbols deep a click looks for the
 /// object under it; deeper containers count anywhere in their box.
 const MAX_HIT_DEPTH: usize = 64;
@@ -1295,13 +1298,26 @@ impl App {
     }
 
     /// Screen-space handle positions for the selection box.
+    ///
+    /// The handles of one side stand at least [`HANDLE_GAP`] points
+    /// apart, however thin the box is on screen.
     pub fn handle_positions(&self, b: Rect) -> [(Handle, egui::Pos2); 8] {
         let off = if self.rotate_mode {
             ROTATE_HANDLE_OFFSET
         } else {
             self.handle_offset()
         };
-        let r = self.view.rect_to_screen(b).expand(off);
+        let mut r = self.view.rect_to_screen(b).expand(off);
+        // A straight line, or anything as thin on screen: the three
+        // handles of a side stay apart, a gap between each, instead of
+        // lying on top of each other (#3523).
+        let min = 2.0 * (self.handle_size() + HANDLE_GAP);
+        if r.width() < min {
+            r = r.expand2(egui::vec2((min - r.width()) / 2.0, 0.0));
+        }
+        if r.height() < min {
+            r = r.expand2(egui::vec2(0.0, (min - r.height()) / 2.0));
+        }
         [
             (Handle::NW, r.left_top()),
             (Handle::N, r.center_top()),
@@ -1786,6 +1802,7 @@ impl App {
             grab,
             mods: crate::app::HandleMods::of(mods),
             snapped: (false, false),
+            start_geometry: None,
         };
     }
 
@@ -1856,6 +1873,11 @@ impl App {
                     .unwrap_or(tracedraw_core::Color::WHITE);
                 crate::ui::color_picker::finish_pick(&response.ctx, Some(c));
             }
+            return;
+        }
+        // A picture edited in place takes the pointer.
+        if self.pixel_edit.is_some() {
+            self.pixel_edit_input(response, pointer, mods);
             return;
         }
         if self.selecting() {
@@ -2131,6 +2153,10 @@ impl App {
                 }
             }
             t if t.is_box_tool() => self.box_input(response, p, mods),
+            // The 2-Point Line tool drawing arcs drags them out as a box.
+            Tool::TwoPointLine if self.line_arc && self.curve.is_none() => {
+                self.box_input(response, p, mods)
+            }
             Tool::ThreePointRectangle | Tool::ThreePointEllipse | Tool::ThreePointCurve => {
                 self.three_point_input(response, p, mods)
             }
@@ -2146,8 +2172,15 @@ impl App {
                 // a click sampled or applied nothing (#2897).
                 if response.clicked() || response.drag_stopped_by(PointerButton::Primary) {
                     let attrs = self.tool == Tool::AttributesEyedropper;
-                    // Ctrl samples again in Apply mode (#1302).
-                    self.eyedropper_click(p, attrs, mods.shift, mods.ctrl);
+                    if !attrs && self.eyedropper_wants_screen(p, mods.shift, mods.ctrl) {
+                        // No object gives a colour here (the desk, the
+                        // empty page): the colour shown there (#3040).
+                        let at = response.interact_pointer_pos().unwrap_or(screen);
+                        self.ask_screen_sample(at, mods.shift);
+                    } else {
+                        // Ctrl samples again in Apply mode (#1302).
+                        self.eyedropper_click(p, attrs, mods.shift, mods.ctrl);
+                    }
                 }
             }
             Tool::InteractiveFill => self.fill_input(response, p, mods),
@@ -2416,6 +2449,14 @@ impl App {
             self.drag_copy = false;
             // Editing a symmetry: its mirror lines move or turn.
             if self.symmetry_edit.is_some() && self.symmetry_press(p) {
+                return;
+            }
+            // A live fit's spacing or turn handle.
+            if self.begin_live_fit_handle(p) {
+                return;
+            }
+            // A Grid effect's handles: its gaps and how many cells.
+            if self.grid_press(p) {
                 return;
             }
             // Rotate mode: the centre of rotation moves.
@@ -2708,6 +2749,16 @@ impl App {
                     self.edit_symbol_instance(id);
                     return;
                 }
+                // A picture: editing its pixels in place.
+                if self.clip_frame_edit.is_none()
+                    && self
+                        .doc()
+                        .find_shape(id)
+                        .is_some_and(|s| matches!(s.kind, ShapeKind::Bitmap { .. }))
+                    && self.edit_bitmap_inside(id)
+                {
+                    return;
+                }
                 // A group or clip frame: into focus mode.
                 if self.focus_on_double_click(id) {
                     self.focus_on(id);
@@ -2779,6 +2830,14 @@ impl App {
             self.symmetry_drag_to(p, mods.ctrl || mods.command);
             return;
         }
+        if matches!(self.drag, Drag::FitPathHandle(_)) {
+            self.live_fit_handle_drag_to(p, mods.ctrl || mods.command);
+            return;
+        }
+        if matches!(self.drag, Drag::GridHandle { .. }) {
+            self.grid_drag_to(p);
+            return;
+        }
         if matches!(
             self.drag,
             Drag::MoveGuide { .. } | Drag::RotateGuide { .. } | Drag::GuidePivot
@@ -2799,11 +2858,27 @@ impl App {
                     && self.snap.objects
                     && (p - *start).hypot() > self.snap_tolerance()
             }
+            // A scale handle likewise, once the point it stands for has
+            // left where it started (#3074).
+            Drag::Scale {
+                handle,
+                start_bounds,
+                grab,
+                start_geometry: None,
+                ..
+            } => {
+                self.snap_enabled()
+                    && self.snap.objects
+                    && (p - *grab - handle_point(*start_bounds, *handle)).hypot()
+                        > self.snap_tolerance()
+            }
             _ => false,
         };
         if away {
             let g = std::rc::Rc::new(self.selection_start_geometry());
-            if let Drag::Move { start_geometry, .. } = &mut self.drag {
+            if let Drag::Move { start_geometry, .. } | Drag::Scale { start_geometry, .. } =
+                &mut self.drag
+            {
                 *start_geometry = Some(g);
             }
         }
@@ -2925,7 +3000,9 @@ impl App {
                 ..
             } => {
                 // The handle snaps to other objects, guidelines, the grid
-                // and the page, never to the selection's own points.
+                // and the page, and to where the selection stood once away
+                // from its start (#3074), never to the selection as it
+                // changes.
                 *current = snapped_handle;
                 *snapped = scale_snapped;
                 *m = crate::app::HandleMods::of(mods);
@@ -3190,6 +3267,7 @@ impl App {
             boxing = true;
         }
         if !boxing {
+            self.end_drag_copies();
             return;
         }
         // The shape follows the pointer while the left button is down and
@@ -3205,6 +3283,8 @@ impl App {
                 .map(|s| self.snap_point(self.view.to_page(s)))
                 .unwrap_or(p);
             self.box_follow(now, mods);
+            // C held: a copy of the shape at each move.
+            self.leave_drag_copy(&response.ctx);
         } else if !response.drag_stopped_by(PointerButton::Primary) {
             // (A drag egui still counts ends below, as every tool's does.)
             self.end_drag();
@@ -3292,6 +3372,26 @@ impl App {
                     p
                 };
                 self.three_point_circle = circle;
+            }
+        }
+    }
+
+    /// A last node of the Freehand line of clicks where the pointer is
+    /// (snapped and constrained as a click there would be), for Space to
+    /// end the line there (#3192). Nothing when no line has begun, the
+    /// pointer is off the drawing or on the last node already.
+    pub(crate) fn freehand_node_at_pointer(&mut self, mods: Modifiers) {
+        let Some(at) = self.pointer_page else {
+            return;
+        };
+        if self.curve.as_ref().is_none_or(|c| c.nodes.is_empty() || c.bspline) {
+            return;
+        }
+        let q = self.curve_point(self.snap_point(at), self.constrain_held(&mods));
+        let zoom = self.view.zoom as f64;
+        if let Some(c) = self.curve.as_mut() {
+            if c.nodes.last().is_some_and(|n| (n.0 - q).hypot() * zoom > 2.0) {
+                c.nodes.push((q, None));
             }
         }
     }
@@ -3872,13 +3972,14 @@ impl App {
             }
         }
         if response.drag_started_by(PointerButton::Primary) {
-            // A node, a slider, or the line (the whole fill moves).
+            // A node, a slider, or the line (the whole fill moves); Alt
+            // copies the node pressed and drags the copy.
             let press = response
                 .ctx
                 .input(|i| i.pointer.press_origin())
                 .map(|o| self.view.to_page(o))
                 .unwrap_or(p);
-            if self.begin_fountain_drag(p, press) {
+            if self.begin_fountain_drag_with(p, press, mods.alt) {
                 return;
             }
             if let Some(id) = self.hit_test_inside(p) {
@@ -3971,6 +4072,9 @@ impl App {
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         // The page shows the drawing as it is now (#1259).
         self.node_drag_shown = None;
+        if !matches!(drag, Drag::Box { .. }) {
+            self.end_drag_copies();
+        }
         if !matches!(drag, Drag::Move { .. }) {
             self.drop_frame = None;
         }
@@ -3990,9 +4094,12 @@ impl App {
                 } else {
                     (Point::new(r.x0, r.y0), Point::new(r.x1, r.y1))
                 };
-                if !self.finish_tools2_box(a, b) {
+                if self.draws_arcs() {
+                    self.create_arc(start, current);
+                } else if !self.finish_tools2_box(a, b) {
                     self.create_box_shape(a, b);
                 }
+                self.end_drag_copies();
             }
             Drag::Connector { from, current, .. } if self.tool == Tool::Blend => {
                 if let Some(to) = self.hit_test_inside(current).filter(|id| *id != from) {
@@ -4192,6 +4299,8 @@ impl App {
             } => {
                 let r = Rect::from_points(start, current);
                 if r.width() > 0.1 || r.height() > 0.1 {
+                    // The facing page's objects in it too (#3488).
+                    self.adopt_spread_objects_in(r, touching);
                     self.select_in_region(crate::select_region::Region::Rect(r), touching, toggle);
                 }
             }
@@ -4210,6 +4319,12 @@ impl App {
             }
             Drag::Freehand { points } if self.tool == Tool::PainterlyBrush => {
                 self.add_painterly_stroke(&points);
+            }
+            Drag::Freehand { points }
+                if self.tool == Tool::BrushStrokes
+                    && self.media_mode == crate::media::MediaMode::Merge =>
+            {
+                self.merge_brush_stroke(&points);
             }
             Drag::Freehand { points } if self.tool == Tool::BrushStrokes => {
                 // A pen's pressure along the drag sets the width (#850).
@@ -4308,6 +4423,7 @@ impl App {
             Drag::FountainHandle { .. }
             | Drag::PatternHandle { .. }
             | Drag::SymmetryLines { .. }
+            | Drag::GridHandle { .. }
             | Drag::ContourDrag { .. }
             | Drag::OffsetShadow { .. }
             | Drag::Shadow { .. }
@@ -4318,6 +4434,7 @@ impl App {
             | Drag::Node { .. }
             | Drag::KindNode { .. }
             | Drag::CornerWidget(_)
+            | Drag::FitPathHandle(_)
             | Drag::Handle { .. }
             | Drag::None => {}
         }
@@ -4710,6 +4827,11 @@ impl App {
         {
             return;
         }
+        // A picture edited in place has the keys while no field has them.
+        if !dialog_open && !ctx.egui_wants_keyboard_input() && self.pixel_edit.is_some() {
+            self.pixel_edit_keys(ctx);
+            return;
+        }
         // Command shortcuts the field gave up last frame run now, on
         // what the field applied.
         if !self.deferred_keys.is_empty() {
@@ -5013,7 +5135,7 @@ impl App {
         if pressed(Key::S, cmd | Modifiers::SHIFT) {
             self.save(true);
         }
-        if pressed(Key::S, Modifiers::ALT) && !self.selection.is_empty() {
+        if pressed(Key::S, Modifiers::ALT) && self.symmetry_edit.is_none() {
             self.create_symmetry();
         }
         if pressed(Key::E, Modifiers::ALT) {
@@ -5482,6 +5604,12 @@ impl App {
         if pressed(Key::Space, Modifiers::NONE)
             && matches!(self.tool, Tool::Bezier | Tool::Freehand)
         {
+            // A Freehand line of clicks ends where the pointer is: a last
+            // node there, unless the pointer is on the last node or off
+            // the drawing (#3192).
+            if self.tool == Tool::Freehand {
+                self.freehand_node_at_pointer(ctx.input(|i| i.modifiers));
+            }
             self.finish_curve();
         }
         // Esc with a menu or a list open only closes it.
@@ -5686,6 +5814,11 @@ impl App {
                             || (self.curve.as_ref().is_some_and(|c| c.bspline)
                                 && mods.is_none()
                                 && matches!(k, Key::C | Key::V));
+                        // C while a shape is dragged leaves copies of it.
+                        let drop_key = drop_key
+                            || (self.trail_key_busy()
+                                && mods.is_none()
+                                && k == crate::drag_copies::TRAIL_KEY);
                         // A key held picks its tool once: the presses it
                         // repeats would send Space back and forth between
                         // the Pick tool and the tool before it (#1502).

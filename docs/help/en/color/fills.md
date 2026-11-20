@@ -62,7 +62,9 @@ selection (or of new objects, with nothing selected).
   with the built-in gradients on the left. On the right: the type, how it
   repeats, and the band of colors with its nodes. Click a node to pick it and
   drag it to move it; double-click the band to add a node and a node to
-  remove it. The picked node's color, transparency, position and
+  remove it. <kbd>Alt</kbd> and a drag on a node copies it and moves the
+  copy: two nodes of one color make a solid band, and two nodes of different
+  colors side by side make a hard edge. The picked node's color, transparency, position and
   [[edit_fill.midpoint]] are under the band, with [[edit_fill.reverse]].
   [[edit_fill.transform]] has the rotation, the center (for radial, conical
   and square gradients), the edge pad, mirror and inversion. The preview has
@@ -89,7 +91,8 @@ The [[tool.interactive_fill]] tool (<kbd>G</kbd>) edits fills on the object.
 3. Double-click the line between the nodes to add a color node there;
    double-click a color node to remove it. Drag a color node along the line,
    or the short bar between two nodes to move the point where their colors
-   meet half way.
+   meet half way. Hold <kbd>Alt</kbd> as you start to drag a node to copy it
+   and drag the copy, for bands of solid color with hard edges.
 4. Click a node to pick it: a small bar opens under it with the node's color
    (click the swatch for the color picker) and its transparency. A palette
    color clicked while a node is picked goes to that node, and the property
@@ -121,6 +124,9 @@ With **Up to outline edges** on the property bar, outlines count as wide as
 they are drawn: the area stops at their inner edges, and lines that only touch
 through their width still close it.
 
+Inside a [symmetry](../objects/symmetry.md), a click in one copy fills the same
+area in every copy: the new object becomes part of the symmetry.
+
 ## Mesh fills {#mesh-fill}
 
 A mesh fill is a grid of nodes over an object, each node with its own color
@@ -140,6 +146,12 @@ The property bar also has **Smooth color**, which blends the colors more
 softly, the **transparency** of the selected node, and **Clear mesh**, which
 removes the mesh fill. Changing the rows and columns of a mesh keeps its
 colors.
+
+For a quick colorful background, choose a color set in the **Colors** list
+(Aurora, Sunset, Ocean, Candy, Forest, Neon or the document palette) and
+click **Shuffle**: every selected object gets a random mesh of those colors,
+with its nodes nudged off the grid. Click again for another mix, or undo to
+go back.
 
 ## Pattern and texture fills {#pattern-texture}
 

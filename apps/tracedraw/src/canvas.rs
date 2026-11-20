@@ -146,6 +146,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     // objects stay where they are and their outline shows where they
     // would go; the handles wait for the release.
     draw_page(app, painter, rect, None);
+    crate::pixel_edit_app::draw(app, painter);
     let doc: &Document = app.doc();
     draw_text_frames(app, painter, preview);
 
@@ -171,6 +172,7 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     draw_drop_frame(app, painter);
     draw_drop_colour(app, painter);
     draw_symmetry_lines(app, painter, rect);
+    draw_grid_handles(app, painter);
     draw_anchors(app, painter);
     draw_fountain_handles(app, painter);
     draw_pattern_handles(app, painter);
@@ -179,7 +181,25 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     draw_contour_handles(app, painter);
     draw_offset_shadow_handle(app, painter);
     draw_blend_controls(app, painter);
+    draw_live_fit_handles(app, painter);
 
+    // Rotate by Two Lines: the lines clicked so far, the last to the
+    // pointer (#2870).
+    if let Some(pts) = &app.pending_rotate_lines {
+        let mut pts = pts.clone();
+        if let Some(p) = app.pointer_page {
+            pts.push(app.snap_point(p));
+        }
+        for line in pts.chunks(2) {
+            let screen: Vec<Pos2> = line.iter().map(|q| view.to_screen(*q)).collect();
+            if screen.len() == 2 {
+                haloed_polyline(painter, &screen, false, Tokens::SELECTION);
+            }
+            for q in &screen {
+                painter.circle_filled(*q, 3.0, Tokens::SELECTION);
+            }
+        }
+    }
     // Fit Text to Path waiting for its path: the text on the one near.
     if app.pending_text_path {
         if let Some(p) = app.pointer_page {
@@ -215,6 +235,18 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     // The box a drag sizes File > Import's file to (#1936).
     if let Some(r) = app.import_placement_box() {
         haloed_rect(painter, view.rect_to_screen(r), Tokens::SELECTION);
+        // Several files: the cells they go to.
+        let cells = app.import_placement_cells();
+        if cells.len() > 1 {
+            for c in cells {
+                painter.rect_stroke(
+                    view.rect_to_screen(c),
+                    0.0,
+                    EStroke::new(1.0, Tokens::SELECTION),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
     }
     draw_import_tag(app, painter);
     // Rubber bands and in-progress tools.
@@ -671,7 +703,13 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     // copies (the canvas outlines them in red); a revision of its own so
     // the picture is not taken for the full one.
     let without_copies = app.symmetry_without_copies();
-    let doc: &Document = without_copies.as_deref().unwrap_or(app.doc());
+    // A picture edited in place: the page without it, its pixels drawn
+    // over the page as they are edited.
+    let without_picture = app.pixel_edit_doc();
+    let doc: &Document = without_picture
+        .as_deref()
+        .or(without_copies.as_deref())
+        .unwrap_or(app.doc());
     // Nodes being dragged: the drawing as it was before the drag, its
     // picture already made, until the button is released (#1259).
     let revision = app
@@ -679,6 +717,11 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         .unwrap_or_else(|| app.engine.revision())
         ^ if without_copies.is_some() {
             1u64 << 62
+        } else {
+            0
+        }
+        ^ if without_picture.is_some() {
+            1u64 << 61
         } else {
             0
         };
@@ -1777,9 +1820,83 @@ fn draw_contour_handles(app: &App, painter: &Painter) {
     );
 }
 
+/// Pick tool, a live Fit Objects to Path selected: a diamond on the
+/// second object's point on the path (the spacing) and, under the path's
+/// middle, a ring joined to a dot there (the turn of all the objects);
+/// while one is dragged, its value in a tag beside the pointer.
+fn draw_live_fit_handles(app: &App, painter: &Painter) {
+    let Some(h) = app.live_fit_handles() else {
+        return;
+    };
+    let view = &app.view;
+    let dragged = match &app.drag {
+        Drag::FitPathHandle(d) => Some(d),
+        _ => None,
+    };
+    let stroke = EStroke::new(1.0, Tokens::SELECTION);
+    let fill = |on: bool| {
+        if on {
+            Tokens::SELECTION
+        } else {
+            Color32::WHITE
+        }
+    };
+    if let Some(p) = h.spacing {
+        let c = view.to_screen(p);
+        let r = 5.0;
+        let on =
+            dragged.is_some_and(|d| matches!(d.kind, crate::fit_live::HandleKind::Spacing { .. }));
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                c + egui::vec2(0.0, -r),
+                c + egui::vec2(r, 0.0),
+                c + egui::vec2(0.0, r),
+                c + egui::vec2(-r, 0.0),
+            ],
+            fill(on),
+            stroke,
+        ));
+    }
+    let mid = view.to_screen(h.centre);
+    let turn = view.to_screen(app.live_turn_handle(&h));
+    painter.line_segment([mid, turn], stroke);
+    painter.circle_filled(mid, 2.0, Tokens::SELECTION);
+    let on = dragged.is_some_and(|d| matches!(d.kind, crate::fit_live::HandleKind::Turn { .. }));
+    painter.circle(turn, 4.5, fill(on), stroke);
+    if let Some(d) = dragged.filter(|d| !d.shown.is_empty()) {
+        if let Some(at) = painter.ctx().pointer_latest_pos() {
+            crate::corner_widgets::tag(painter, at + egui::vec2(14.0, 14.0), &d.shown);
+        }
+    }
+}
+
 /// Block Shadow and Inner Shadow tools: the selected shadow's line from
 /// the object's middle and the square at its end (#1280), filled while it
 /// is dragged.
+/// The handles of the selected object's Grid effect: round ones for the
+/// gaps, a square one for how many cells.
+fn draw_grid_handles(app: &App, painter: &Painter) {
+    use crate::grid_handles::GridHandle;
+    let view = &app.view;
+    let line = EStroke::new(1.5, Tokens::SELECTION);
+    for (h, at) in app.grid_handles() {
+        let q = view.to_screen(at);
+        let held = matches!(&app.drag, Drag::GridHandle { handle, .. } if *handle == h);
+        let fill = if held { Tokens::SELECTION } else { Color32::WHITE };
+        match h {
+            GridHandle::GapX | GridHandle::GapY => {
+                painter.circle_filled(q, 4.5, fill);
+                painter.circle_stroke(q, 4.5, line);
+            }
+            GridHandle::Count => {
+                let r = ERect::from_center_size(q, egui::vec2(8.0, 8.0));
+                painter.rect_filled(r, 0.0, fill);
+                painter.rect_stroke(r, 0.0, line, egui::StrokeKind::Outside);
+            }
+        }
+    }
+}
+
 fn draw_offset_shadow_handle(app: &App, painter: &Painter) {
     let Some(h) = app.offset_shadow_handle() else {
         return;
@@ -2239,7 +2356,7 @@ fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
         return;
     }
     // The Mesh Fill tool's box or freehand loop over mesh nodes.
-    if app.tool == Tool::MeshFill {
+    if matches!(app.tool, Tool::MeshFill | Tool::Envelope) {
         draw_node_marquees(app, painter);
     }
     // While text is typed or edited only the text and its cursor show;
@@ -3046,6 +3163,33 @@ pub(crate) fn node_type_color(
     Some(Color32::from_rgb(r, g, b))
 }
 
+/// A first or last node showing the curve's direction: a triangle
+/// `size` across pointing along `d` (a unit vector on the screen), its
+/// middle on the node (#3038).
+fn direction_node_marker(
+    painter: &Painter,
+    p: Pos2,
+    size: f32,
+    d: egui::Vec2,
+    fill: Option<Color32>,
+    outline: Color32,
+) {
+    let pts = direction_triangle(p, size, d);
+    painter.add(epaint::PathShape::convex_polygon(
+        pts.to_vec(),
+        fill.unwrap_or(Color32::TRANSPARENT),
+        EStroke::new(1.0, outline),
+    ));
+}
+
+/// The corners of a direction node's triangle: the tip ahead along `d`,
+/// the base behind, `size` across.
+pub(crate) fn direction_triangle(p: Pos2, size: f32, d: egui::Vec2) -> [Pos2; 3] {
+    let h = size / 2.0;
+    let n = egui::vec2(-d.y, d.x);
+    [p + d * h * 1.1, p - d * h * 0.8 + n * h, p - d * h * 0.8 - n * h]
+}
+
 /// The first node of a subpath: a triangle standing on its base, `size`
 /// across.
 fn start_node_marker(
@@ -3191,8 +3335,8 @@ fn draw_node_marquees(app: &App, painter: &Painter) {
 /// Shape tool overlay, as Options > Nodes and Handles sets it: nodes
 /// shaped by type (cusp, smooth, symmetrical), the selected ones filled
 /// with the main colour, the others white or hollow, the first node of a
-/// curve larger, handles of the selected nodes, and an arrow in the
-/// secondary colour showing the curve's direction.
+/// curve larger, handles of the selected nodes, and the first and last
+/// nodes turned along the curve to show its direction (#3038).
 fn draw_nodes(app: &App, painter: &Painter) {
     use tracedraw_core::nodes;
     let view = &app.view;
@@ -3423,33 +3567,29 @@ fn draw_nodes(app: &App, painter: &Painter) {
             painter.add(egui::Shape::line(pts, EStroke::new(1.0, outline)));
         }
         let all = nodes::nodes(path);
-        if prefs.show_direction {
-            // A small arrow head just after the first node of every
-            // subpath, along the way the curve leaves it, and one just
-            // past the last node of an open subpath, along the way it
-            // arrives: after Break Curve each part shows its direction at
-            // both ends, as the reference program does (#2578).
-            for (at, dir, start) in nodes::direction_marks(path) {
-                let a = view.to_screen(s.transform * at);
-                let ahead = view.to_screen(s.transform * (at + dir));
-                let d = ahead - a;
-                if d.length() <= 1e-6 {
-                    continue;
-                }
-                let d = d.normalized();
-                let n = egui::vec2(-d.y, d.x);
-                let (tip, base) = if start {
-                    (a + d * (size + 9.0), a + d * (size + 3.0))
-                } else {
-                    (a + d * (size + 7.0), a + d * (size + 1.0))
-                };
-                painter.add(epaint::PathShape::convex_polygon(
-                    vec![tip, base + n * 3.5, base - n * 3.5],
-                    secondary,
-                    EStroke::NONE,
-                ));
-            }
-        }
+        // The direction (#3038, #2578): the first node of every subpath is
+        // a triangle pointing the way the curve leaves it, and the last
+        // node of an open subpath one pointing the way it arrives, so
+        // after Break Curve each part shows its direction at both ends.
+        // Small arrow heads beside the end nodes showed it before.
+        let marks: Vec<(Point, egui::Vec2, bool)> = if prefs.show_direction {
+            nodes::direction_marks(path)
+                .into_iter()
+                .filter_map(|(at, dir, start)| {
+                    let a = view.to_screen(s.transform * at);
+                    let d = view.to_screen(s.transform * (at + dir)) - a;
+                    (d.length() > 1e-6).then(|| (at, d.normalized(), start))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mark_of = |at: Point, start: bool| {
+            marks
+                .iter()
+                .find(|(q, _, st)| *st == start && (*q - at).hypot() < 1e-9)
+                .map(|(_, d, _)| *d)
+        };
         for n in all {
             // A chosen segment shows as the segment, not as its end node.
             let selected = app.node_selection.contains(&(s.id, n.index))
@@ -3476,7 +3616,11 @@ fn draw_nodes(app: &App, painter: &Painter) {
             } else {
                 None
             };
-            if n.is_start {
+            if let Some(d) = mark_of(n.pos, n.is_start) {
+                // A first or last node turned along the curve (#3038).
+                let across = if n.is_start { size + 3.0 } else { size + 2.0 };
+                direction_node_marker(painter, p, across, d, fill, outline);
+            } else if n.is_start {
                 // The first node of a subpath: a triangle a little larger
                 // than the other nodes.
                 start_node_marker(painter, p, size + 3.0, fill, outline);
@@ -4319,6 +4463,48 @@ mod node_look_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The direction shows on the end nodes themselves (#3038): each
+    /// first node and each last node of an open part has a direction
+    /// mark at its own place, and its triangle points that way, its tip
+    /// ahead of the node and its base behind.
+    #[test]
+    fn the_end_nodes_point_along_the_curve() {
+        use tracedraw_core::nodes;
+        let mut path = tracedraw_core::geometry::BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.line_to((10.0, 0.0));
+        path.curve_to((15.0, 0.0), (20.0, 5.0), (20.0, 10.0));
+        path.move_to((40.0, 0.0));
+        path.line_to((40.0, 10.0));
+        path.line_to((50.0, 10.0));
+        path.close_path();
+        let marks = nodes::direction_marks(&path);
+        let all = nodes::nodes(&path);
+        let starts: Vec<_> = all.iter().filter(|n| n.is_start).collect();
+        assert_eq!(starts.len(), 2);
+        for n in &starts {
+            assert!(
+                marks.iter().any(|(q, _, st)| *st && (*q - n.pos).hypot() < 1e-9),
+                "a start mark on {:?}",
+                n.pos
+            );
+        }
+        // The open part's last node, arriving straight down (y grows).
+        let end = marks
+            .iter()
+            .find(|(_, _, st)| !st)
+            .expect("an end mark");
+        assert!((end.0 - tracedraw_core::geometry::Point::new(20.0, 10.0)).hypot() < 1e-9);
+        assert!(all.iter().any(|n| (n.pos - end.0).hypot() < 1e-9));
+        // The triangle: its tip ahead along the way, its base behind.
+        let p = egui::pos2(100.0, 100.0);
+        let d = egui::vec2(0.0, 1.0);
+        let [tip, b1, b2] = direction_triangle(p, 10.0, d);
+        assert!(tip.y > p.y + 4.0 && (tip.x - p.x).abs() < 1e-4, "{tip:?}");
+        assert!(b1.y < p.y && b2.y < p.y);
+        assert!((b1.x - b2.x).abs() > 9.0, "the base is across the way");
+    }
 
     /// A slanted guideline crossing the window is drawn at any zoom, far
     /// from the point it was made at too (#3337, #3342).

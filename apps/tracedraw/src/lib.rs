@@ -18,6 +18,7 @@
 mod action_lines;
 mod ai;
 mod ai_image;
+mod ai_photo;
 mod ai_retry;
 mod ai_vectorize;
 mod anchors;
@@ -49,6 +50,7 @@ mod clipboard;
 mod clone_effect;
 mod color_drop;
 mod color_policy;
+mod combine_files;
 mod color_styles;
 mod comments;
 mod common_shapes;
@@ -73,6 +75,10 @@ mod doc_stats;
 mod documents;
 mod drawing_scale;
 mod drop_files;
+mod draw_inside;
+mod rotate_lines;
+mod grid_handles;
+mod drag_copies;
 mod drop_menu;
 mod effect_line;
 #[cfg(test)]
@@ -85,12 +91,19 @@ mod export;
 mod export_assets;
 mod extrude_tool;
 mod eyedropper;
+mod screen_sample;
 mod file_hold;
 mod file_presence;
 mod files;
 mod fill_page;
+mod shape_gen;
+mod shape_gen_cells;
+mod shape_gen_curves;
+mod shape_gen_fill;
+mod shape_gen_slice;
 mod fill_tool;
 mod pattern_fill_tool;
+mod fit_live;
 mod fit_path;
 mod focus;
 mod formula;
@@ -98,6 +111,7 @@ mod formula;
 mod font_folder;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_stats;
+mod frame_gen;
 mod frame_type;
 mod fx;
 mod gather_pages;
@@ -168,6 +182,8 @@ mod perspective_draw;
 mod pick_drag_tests;
 mod picture_mosaic;
 mod picture_plates;
+mod pixel_edit;
+mod pixel_edit_app;
 mod placeholder;
 mod plugins;
 mod pmd_open;
@@ -212,6 +228,7 @@ mod step_merge;
 mod step_repeat;
 mod storage_full;
 mod straighten;
+mod builtin_looks;
 mod style_presets;
 mod styles;
 mod symbol_paste;
@@ -249,6 +266,8 @@ mod touch_modifiers;
 mod touch_taps;
 mod trace;
 mod trace_blend;
+#[cfg(test)]
+mod trace_bench;
 mod trace_fine;
 mod trace_fit;
 mod trace_fonts;
@@ -268,6 +287,7 @@ mod upscale;
 #[cfg(not(target_arch = "wasm32"))]
 mod upscale_net;
 mod variable_outline;
+mod symbol_scatter;
 mod vector_mosaic;
 mod view;
 mod view_motion;
@@ -1178,6 +1198,8 @@ impl eframe::App for Shell {
         app.refresh_callouts();
         // Blends follow their end objects.
         app.refresh_blends();
+        // Live fits follow their paths and objects.
+        app.refresh_live_fits();
         // The window's state is kept once it has settled; until then it
         // is maximized when it should start so, and checked (#787).
         #[cfg(not(target_arch = "wasm32"))]

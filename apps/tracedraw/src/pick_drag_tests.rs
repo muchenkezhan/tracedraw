@@ -1003,6 +1003,7 @@ fn handle_modifiers_shape_the_scale() {
             grab: tracedraw_core::geometry::Vec2::ZERO,
             mods,
             snapped: (false, false),
+            start_geometry: None,
         })
         .expect("transform")
     };
@@ -1323,6 +1324,7 @@ fn the_status_bar_tells_how_far_how_much_and_what_angle() {
         grab: tracedraw_core::geometry::Vec2::ZERO,
         mods: HandleMods::default(),
         snapped: (false, false),
+        start_geometry: None,
     };
     let text = info(&app);
     assert!(text.contains("150.0") && text.contains("100.0"), "{text}");
@@ -7887,6 +7889,50 @@ fn space_ends_the_curve_of_every_line_tool() {
         assert!(app.curve.is_none(), "{tool:?}: the curve ended");
         assert!(shape_count(&app) > before, "{tool:?}: a line was made");
     }
+}
+
+/// Space ends a Freehand line of clicks where the pointer is, with a last
+/// node there (#3192): it ended at the last node clicked, leaving out the
+/// segment to the pointer.
+#[test]
+fn space_ends_a_freehand_line_at_the_pointer() {
+    let (ctx, mut app, _id) = setup();
+    app.snap.off = true;
+    app.set_tool(Tool::Freehand);
+    let view = app.view.clone();
+    let at = |x: f64, y: f64| view.to_screen(Point::new(x, y));
+    let before = shape_count(&app);
+    for p in [at(100.0, 100.0), at(160.0, 100.0)] {
+        click_at(&ctx, &mut app, p, Modifiers::NONE);
+        for _ in 0..20 {
+            frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+        }
+    }
+    let end = at(200.0, 140.0);
+    frame(&ctx, &mut app, vec![Event::PointerMoved(end)], Modifiers::NONE);
+    frame(
+        &ctx,
+        &mut app,
+        vec![key(egui::Key::Space, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert!(app.curve.is_none(), "the line ended");
+    assert_eq!(shape_count(&app), before + 1);
+    let s = app
+        .doc()
+        .find_shape(app.selection[0])
+        .expect("the line")
+        .clone();
+    let ShapeKind::Path { path, closed } = &s.kind else {
+        panic!("a curve: {:?}", s.kind);
+    };
+    assert!(!*closed, "an open line");
+    let page = s.transform * path.clone();
+    let nodes = tracedraw_core::nodes::nodes(&page);
+    assert_eq!(nodes.len(), 3, "a node at the pointer: {page:?}");
+    let last = nodes.last().expect("last").pos;
+    let want = view.to_page(end);
+    assert!((last - want).hypot() < 0.05, "{last:?} vs {want:?}");
 }
 
 #[test]
@@ -18102,6 +18148,58 @@ fn a_right_click_on_any_toolbar_keeps_the_bar_menu_open() {
         !bar_menu_shown(&ctx, &mut app, Vec::new()),
         "and the menu closed"
     );
+}
+
+/// A right click on a toolbox button opens the toolbox's menu with the
+/// tool's Properties first: it opens Options > Customization > Commands
+/// at that tool, on its Shortcut Keys tab, where a key is given to it
+/// (#3326).
+#[test]
+fn a_right_click_on_a_tool_button_opens_its_properties() {
+    use crate::ui::bars::Bar;
+    let (ctx, mut app, _) = setup();
+    let toolbox = ctx
+        .read_response(egui::Id::new(("bar_background", Bar::Toolbox.salt())))
+        .map(|r| r.rect)
+        .expect("the toolbox");
+    let props = crate::i18n::tr("bars.button_properties");
+    let find = |shapes: &[egui::Shape]| {
+        shapes.iter().find_map(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == props => Some(t.pos + egui::vec2(4.0, 4.0)),
+            _ => None,
+        })
+    };
+    let at = egui::pos2(toolbox.center().x, toolbox.top() + 30.0);
+    assert!(right_click_menu(&ctx, &mut app, at, false)
+        .iter()
+        .all(|s| *s));
+    let entry = find(&frame_shapes(&ctx, &mut app, Vec::new())).expect("the tool's Properties");
+    let none = Modifiers::NONE;
+    frame(&ctx, &mut app, vec![Event::PointerMoved(entry)], none);
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(entry, true, PointerButton::Primary, none)],
+        none,
+    );
+    frame(
+        &ctx,
+        &mut app,
+        vec![button(entry, false, PointerButton::Primary, none)],
+        none,
+    );
+    assert!(matches!(app.dialog, crate::ui::dialogs::Dialog::Options));
+    assert_eq!(app.options_page, crate::ui::options::OptionsPage::Commands);
+    let picked = app
+        .shortcut_editor
+        .selected
+        .clone()
+        .expect("a command picked");
+    assert!(
+        crate::tools::Tool::ALL.iter().any(|t| t.id() == picked),
+        "{picked} is a tool"
+    );
+    assert!(app.shortcut_editor.keys_tab);
 }
 
 /// A dimension without arrowheads drawn across the page with its tool
@@ -29164,6 +29262,57 @@ fn several_imported_files_are_placed_one_after_another() {
     assert_eq!(app.selection.len(), 1);
 }
 
+/// Several files picked at once, placed with a drag: the arrow keys
+/// pressed during it lay them out in columns and rows, each file fitted
+/// in its own cell; a drag without them still sizes only the first.
+#[test]
+fn a_drag_with_the_arrows_lays_several_imported_files_out_in_a_grid() {
+    let (ctx, mut app, _id) = setup();
+    let files: Vec<_> = ["grid-a", "grid-b", "grid-c", "grid-d"]
+        .iter()
+        .map(|t| import_square_svg(t))
+        .collect();
+    let n = shape_count(&app);
+    app.import_picked_many(files.clone());
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert!(app.import_placing.is_some());
+    let from = app.view.to_screen(Point::new(20.0, 220.0));
+    let to = app.view.to_screen(Point::new(120.0, 120.0));
+    let arrows = vec![
+        key(egui::Key::ArrowRight, Modifiers::NONE),
+        key_up(egui::Key::ArrowRight, Modifiers::NONE),
+        key(egui::Key::ArrowUp, Modifiers::NONE),
+        key_up(egui::Key::ArrowUp, Modifiers::NONE),
+    ];
+    drag(&ctx, &mut app, from, to, Modifiers::NONE, arrows);
+    for _ in 0..6 {
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    }
+    assert!(app.import_placing.is_none(), "no file waits");
+    assert!(app.import_cells.is_empty());
+    assert_eq!(shape_count(&app), n + 4, "all four came in");
+    assert_eq!(app.selection.len(), 4, "selected together");
+    // Each 50 x 50 cell holds one file, in its middle.
+    let doc = app.doc();
+    let mut centres: Vec<Point> = app
+        .selection
+        .iter()
+        .filter_map(|id| doc.find_shape(*id).map(|s| s.bounds().center()))
+        .collect();
+    centres.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    let want = [
+        Point::new(45.0, 195.0),
+        Point::new(95.0, 195.0),
+        Point::new(45.0, 145.0),
+        Point::new(95.0, 145.0),
+    ];
+    for (c, w) in centres.iter().zip(want) {
+        assert!((*c - w).hypot() < 1.0, "{centres:?}");
+    }
+    let b = app.selection_bounds().expect("bounds");
+    assert!(b.width() > 90.0 && b.height() > 90.0, "{b:?}");
+}
+
 /// Without the placement cursor, several files picked at once all come
 /// in, selected together (discussion #2695).
 #[test]
@@ -30007,4 +30156,91 @@ fn a_double_click_on_a_guideline_opens_the_guidelines_panel() {
     assert!(app.show_dockers);
     assert_eq!(app.docker_tab, crate::app::DockerTab::Guidelines);
     assert_eq!(app.guide_form_for, Some(0));
+}
+
+/// The Guidelines panel from the keyboard (#2883): after a double click
+/// on a guideline its position field has the focus with the value
+/// selected, so typing a number and Enter moves it; Alt+A adds a
+/// guideline at the fields' values and Alt+M modifies the selected one.
+#[test]
+fn the_guidelines_panel_works_from_the_keyboard() {
+    use tracedraw_core::document::Guide;
+    let (ctx, mut app, _id) = setup();
+    app.add_guide(Guide::horizontal(150.0));
+    app.show_dockers = false;
+    let on_h = app.view.to_screen(Point::new(100.0, 150.0));
+    double_click_at(&ctx, &mut app, on_h);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    assert!(!app.guide_focus_field, "the field took the focus");
+    frame(
+        &ctx,
+        &mut app,
+        vec![Event::Text("40".into()), key(egui::Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    frame(&ctx, &mut app, vec![key_up(egui::Key::Enter, Modifiers::NONE)], Modifiers::NONE);
+    let want = {
+        let mut f = app.guide_form;
+        f.y = 40.0 * app.units.world_mm();
+        f.line(&app)
+    };
+    assert_eq!(app.page_guides().len(), 1);
+    assert_eq!(app.page_guides()[0].line, want, "typed over, not added to");
+    // Alt+A: another guideline at the fields' values.
+    frame(&ctx, &mut app, vec![key(egui::Key::A, Modifiers::ALT)], Modifiers::ALT);
+    frame(&ctx, &mut app, vec![key_up(egui::Key::A, Modifiers::ALT)], Modifiers::NONE);
+    assert_eq!(app.page_guides().len(), 2, "Alt+A adds");
+}
+
+/// A straight vertical or horizontal line (#3523): the three handles of
+/// each side stand apart with a gap between them, and dragging the
+/// middle handle along the line still stretches it by the drag.
+#[test]
+fn the_handles_of_a_straight_line_do_not_overlap() {
+    let (ctx, mut app, rect) = setup();
+    app.select(Vec::new());
+    let mut ids = Vec::new();
+    for (a, b) in [((40.0, 20.0), (40.0, 120.0)), ((20.0, 150.0), (120.0, 150.0))] {
+        let mut p = tracedraw_core::geometry::BezPath::new();
+        p.move_to(a);
+        p.line_to(b);
+        let id = app
+            .new_shape(ShapeKind::Path {
+                path: p,
+                closed: false,
+            })
+            .expect("line");
+        ids.push(id);
+    }
+    let _ = rect;
+    let size = app.handle_size();
+    for id in ids.clone() {
+        app.select(vec![id]);
+        frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+        let hs: Vec<Pos2> = app
+            .handle_positions(app.selection_bounds().expect("bounds"))
+            .iter()
+            .map(|(_, p)| *p)
+            .collect();
+        for (i, a) in hs.iter().enumerate() {
+            for b in &hs[i + 1..] {
+                let apart = (a.x - b.x).abs().max((a.y - b.y).abs());
+                assert!(
+                    apart >= size + crate::interaction::HANDLE_GAP - 1e-3,
+                    "{a:?} {b:?} {hs:?}"
+                );
+            }
+        }
+    }
+    // The vertical line: its bottom handle drags it 30 points longer.
+    app.select(vec![ids[0]]);
+    frame(&ctx, &mut app, Vec::new(), Modifiers::NONE);
+    let before = bounds(&app, ids[0]);
+    let s = handle(&app, Handle::S);
+    drag(&ctx, &mut app, s, s + egui::vec2(0.0, 30.0), Modifiers::NONE, Vec::new());
+    let after = bounds(&app, ids[0]);
+    let grown = 30.0 / app.view.zoom as f64;
+    assert!(close(after.height(), before.height() + grown), "{before:?} {after:?}");
+    assert!(close(after.width(), before.width()), "{before:?} {after:?}");
 }

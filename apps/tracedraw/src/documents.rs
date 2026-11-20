@@ -260,6 +260,10 @@ impl App {
         if self.symmetry_edit.is_some() {
             self.finish_symmetry_edit();
         }
+        // A picture being edited keeps what was done to it.
+        if self.pixel_edit.is_some() {
+            self.finish_pixel_edit();
+        }
         self.drag = Drag::None;
         self.curve = None;
         self.curve_steps.clear();
@@ -289,6 +293,7 @@ impl App {
         self.effect_node_drag = None;
         self.selected_effect_node = None;
         self.mesh_more_nodes = None;
+        self.envelope_more_nodes = None;
         self.mesh_eyedropper = false;
         self.lens_synced_to = None;
         self.bevel_synced_to = None;
