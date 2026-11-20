@@ -310,6 +310,9 @@ pub struct OptionsSnapshot {
     spiral_logarithmic: bool,
     graph_rows: u32,
     graph_cols: u32,
+    graph_radial: bool,
+    graph_rings: u32,
+    graph_spokes: u32,
     table_rows: u32,
     table_cols: u32,
     eraser_width: f64,
@@ -365,6 +368,9 @@ impl OptionsSnapshot {
             spiral_logarithmic: app.spiral_logarithmic,
             graph_rows: app.graph_rows,
             graph_cols: app.graph_cols,
+            graph_radial: app.graph_radial,
+            graph_rings: app.graph_rings,
+            graph_spokes: app.graph_spokes,
             table_rows: app.table_rows,
             table_cols: app.table_cols,
             eraser_width: app.eraser_width,
@@ -431,6 +437,9 @@ impl OptionsSnapshot {
         app.spiral_logarithmic = self.spiral_logarithmic;
         app.graph_rows = self.graph_rows;
         app.graph_cols = self.graph_cols;
+        app.graph_radial = self.graph_radial;
+        app.graph_rings = self.graph_rings;
+        app.graph_spokes = self.graph_spokes;
         app.table_rows = self.table_rows;
         app.table_cols = self.table_cols;
         app.eraser_width = self.eraser_width;
@@ -1290,6 +1299,17 @@ fn display_page(app: &mut App, ui: &mut Ui) {
             "options.touch_selection_bar",
             "options.touch_selection_bar_tip",
         ));
+        // Android has no mouse of its own: the bars show there already.
+        if !crate::files::ANDROID {
+            ui.checkbox(
+                &mut app.settings.selection_bar_mouse,
+                tr("options.selection_bar_mouse"),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "options.selection_bar_mouse",
+                "options.selection_bar_mouse_tip",
+            ));
+        }
     });
     chrome::section(ui, &tr("options.full_screen_preview"));
     ui.indent("fsp", |ui| {
@@ -3186,6 +3206,32 @@ fn appearance_page(app: &mut App, ui: &mut Ui) {
     ));
     ui.checkbox(&mut app.settings.ui_shadows, tr("options.ui_shadows"))
         .rich_tip(tr("options.ui_shadows_tip"));
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut app.settings.translucent_menus,
+            tr("options.translucent_menus"),
+        )
+        .rich_tip(crate::ui::tips::pair(
+            "options.translucent_menus",
+            "options.translucent_menus_tip",
+        ));
+        let mut pct = app.settings.menu_opacity * 100.0;
+        let tip = crate::ui::tips::pair("options.menu_opacity", "options.menu_opacity_tip");
+        let field = ui
+            .add_enabled(
+                app.settings.translucent_menus,
+                crate::ui::field::NumField::new(&mut pct)
+                    .range(crate::theme::MENU_OPACITY_MIN * 100.0..=100.0)
+                    .speed(1.0)
+                    .max_decimals(0)
+                    .suffix(" %"),
+            )
+            .rich_tip(tip.clone())
+            .rich_disabled_tip(tip);
+        if field.changed() {
+            app.settings.menu_opacity = (pct / 100.0).clamp(crate::theme::MENU_OPACITY_MIN, 1.0);
+        }
+    });
     ui.checkbox(&mut app.settings.colored_icons, tr("options.colored_icons"))
         .rich_tip(tr("options.colored_icons_tip"));
     ui.checkbox(
@@ -5102,6 +5148,19 @@ fn graph_paper_page(app: &mut App, ui: &mut Ui) {
             },
         );
 
+        ui.end_row();
+        // The radial grid (rings and spokes).
+        row_label(ui, "");
+        ui.checkbox(&mut app.graph_radial, tr("toolbar.graph_radial"))
+            .rich_tip(crate::ui::tips::keyed("toolbar.graph_radial"));
+        ui.end_row();
+        row_label(ui, &format!("{}:", tr("toolbar.rings")));
+        ui.add(crate::ui::field::NumField::new(&mut app.graph_rings).range(1..=99))
+            .rich_tip(crate::ui::tips::keyed("toolbar.rings"));
+        ui.end_row();
+        row_label(ui, &format!("{}:", tr("toolbar.spokes")));
+        ui.add(crate::ui::field::NumField::new(&mut app.graph_spokes).range(0..=360))
+            .rich_tip(crate::ui::tips::keyed("toolbar.spokes"));
         ui.end_row();
     });
 }

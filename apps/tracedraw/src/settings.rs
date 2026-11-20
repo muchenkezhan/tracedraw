@@ -315,6 +315,9 @@ impl ContextMenuPreferences {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Edit > Select Similar > Close Look: how far apart colours, outline
+    /// widths and opacity may be, 0 to 100 %.
+    pub similar_tolerance: u32,
     pub language: String,
     pub recent_files: Vec<PathBuf>,
     pub workspace: String,
@@ -371,6 +374,14 @@ pub struct Settings {
     /// Default action of the mouse wheel: zoom (the default) or scroll.
     #[serde(default = "default_true")]
     pub wheel_zooms: bool,
+    /// What Print Preview's View button shows, as it was last left: the
+    /// rulers, the strip of sheets and the options panel (#3603).
+    #[serde(default = "default_true")]
+    pub print_preview_rulers: bool,
+    #[serde(default = "default_true")]
+    pub print_preview_strip: bool,
+    #[serde(default = "default_true")]
+    pub print_preview_options: bool,
     /// The view a drawing opens in (#1134).
     #[serde(default)]
     pub open_view: OpenView,
@@ -503,6 +514,13 @@ pub struct Settings {
     /// draws less, for slower graphics).
     #[serde(default = "default_true")]
     pub ui_shadows: bool,
+    /// Customization > Appearance: open menus let the window show
+    /// through, at `menu_opacity` (off by default).
+    #[serde(default)]
+    pub translucent_menus: bool,
+    /// How solid translucent menus are, 0.5 to 1.
+    #[serde(default = "default_menu_opacity")]
+    pub menu_opacity: f32,
     /// Appearance: tool icons in a colour per group instead of the
     /// theme's icon colour.
     #[serde(default)]
@@ -564,6 +582,10 @@ pub struct Settings {
     /// there is a touch screen (#1691).
     #[serde(default = "default_true")]
     pub touch_selection_bar: bool,
+    /// Options > Display: the same bars with a mouse too, where no finger
+    /// touched the screen (#3456). Off at first.
+    #[serde(default)]
+    pub selection_bar_mouse: bool,
     #[serde(default = "default_true")]
     pub preview_page_border: bool,
     /// Options > Document > Page size: how the page's shadow and border
@@ -655,6 +677,9 @@ pub struct Settings {
     /// Options > Tools > Angular Dimension: the decimals, degree sign,
     /// prefix and suffix new angular dimensions take (#1436).
     pub angular_dimension: crate::dimensions::AngularDefaults,
+    /// How far Object > Insert > Add Dimensions puts its dimension lines
+    /// from the measured box, mm (#3530).
+    pub add_dimensions_gap: f64,
     /// Options > Tools > Connector: an object's own nodes are anchors
     /// too, besides its side midpoints and custom anchors (#1436).
     pub connector_geometric_anchors: bool,
@@ -796,6 +821,14 @@ pub struct Settings {
     /// The Properties docker's sections closed ("outline", "fill" ...).
     #[serde(default)]
     pub properties_closed: Vec<String>,
+    /// The Properties docker marks a section whose values come from the
+    /// object's linked object style (#1439).
+    #[serde(default = "default_true")]
+    pub style_indicators: bool,
+    /// Transparencies saved with Save as New in the Properties docker's
+    /// transparency picker (#1439), newest last.
+    #[serde(default)]
+    pub saved_transparencies: Vec<tracedraw_core::Fill>,
     /// The Text docker's sections closed ("character", "paragraph",
     /// "frame").
     #[serde(default)]
@@ -962,6 +995,11 @@ pub struct Settings {
     /// The programs of Object > Insert > Insert Object, each opened with
     /// one click (#1025).
     pub object_apps: Vec<crate::insert_object::ObjectApp>,
+    /// Insert Object > Insert What It Saves: a program opened from the
+    /// list gets a blank picture to work on, and the picture comes into
+    /// the drawing when the program saves it (#3391). Off by default.
+    #[serde(default)]
+    pub object_apps_insert_saved: bool,
     /// Bitmaps > Picture Captions, as last used (#2180).
     #[serde(default)]
     pub picture_captions: crate::captions::Captions,
@@ -1078,6 +1116,11 @@ fn default_spiral_expansion() -> u32 {
 /// it (#2965).
 fn default_system_save_dialog() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// Translucent menus start at 85 % opacity.
+fn default_menu_opacity() -> f32 {
+    0.85
 }
 
 fn default_true() -> bool {
@@ -1781,6 +1824,9 @@ pub struct TimeTrackerPrefs {
     pub show_bar: bool,
     /// The clock stops counting this many minutes after the last input.
     pub idle_minutes: u32,
+    /// The toolbar in its mini form: the stopwatch, the task's time, the
+    /// record button and its light only, to sit beside other bars (#3261).
+    pub mini: bool,
 }
 
 impl Default for TimeTrackerPrefs {
@@ -1788,6 +1834,7 @@ impl Default for TimeTrackerPrefs {
         TimeTrackerPrefs {
             show_bar: false,
             idle_minutes: 5,
+            mini: false,
         }
     }
 }
@@ -1982,11 +2029,19 @@ pub struct ToolPrefs {
     pub table_cols: u32,
     pub graph_rows: u32,
     pub graph_cols: u32,
+    /// Graph Paper as a radial grid, its rings and spokes.
+    pub graph_radial: bool,
+    pub graph_rings: u32,
+    pub graph_spokes: u32,
     pub blend_steps: u32,
     /// The Contour tool's and panel's values.
     pub contour: crate::contour_tool::ContourSettings,
     pub eraser_width: f64,
     pub eraser_square: bool,
+    /// On pictures (#3043): the share of the nib erased fully, and how
+    /// much it erases at most.
+    pub eraser_hardness: f64,
+    pub eraser_strength: f64,
     pub text_font: String,
     pub text_size_pt: f64,
     pub text_hyphenation: bool,
@@ -2122,10 +2177,15 @@ impl Default for ToolPrefs {
             table_cols: 4,
             graph_rows: 4,
             graph_cols: 3,
+            graph_radial: false,
+            graph_rings: 5,
+            graph_spokes: 8,
             blend_steps: 20,
             contour: Default::default(),
             eraser_width: 6.35,
             eraser_square: false,
+            eraser_hardness: 0.5,
+            eraser_strength: 1.0,
             text_font: "Arial".into(),
             text_size_pt: 24.0,
             text_hyphenation: false,
@@ -2444,6 +2504,7 @@ impl PageLook {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            similar_tolerance: 10,
             language: String::new(),
             recent_files: Vec::new(),
             workspace: "default".into(),
@@ -2470,6 +2531,9 @@ impl Default for Settings {
             color: ColorPrefs::default(),
             show_outline_flyout: false,
             wheel_zooms: true,
+            print_preview_rulers: true,
+            print_preview_strip: true,
+            print_preview_options: true,
             open_view: OpenView::default(),
             open_zoom_percent: default_open_zoom_percent(),
             toolbox: Vec::new(),
@@ -2488,6 +2552,7 @@ impl Default for Settings {
             node_tracking: false,
             touch_keys: true,
             touch_selection_bar: true,
+            selection_bar_mouse: false,
             preview_page_border: true,
             page_look: PageLook::default(),
             constrain_angle: default_constrain_angle(),
@@ -2512,6 +2577,7 @@ impl Default for Settings {
             ellipse_clockwise: false,
             spiral_expansion: 100,
             angular_dimension: Default::default(),
+            add_dimensions_gap: crate::dimensions::ADD_DIMENSIONS_GAP,
             connector_geometric_anchors: false,
             connector_gap: 0.0,
             upgrades: UPGRADES,
@@ -2561,6 +2627,8 @@ impl Default for Settings {
             system_save_dialog: default_system_save_dialog(),
             center_dialogs: true,
             ui_shadows: true,
+            translucent_menus: false,
+            menu_opacity: default_menu_opacity(),
             colored_icons: false,
             docker_tabs_icons_only: false,
             theme: String::new(),
@@ -2581,6 +2649,8 @@ impl Default for Settings {
             show_recent_fonts: true,
             recent_font_count: default_recent_font_count(),
             properties_closed: Vec::new(),
+            style_indicators: true,
+            saved_transparencies: Vec::new(),
             text_sections_closed: Vec::new(),
             text_docker_from: 0,
             text_docker_checks: false,
@@ -2625,6 +2695,7 @@ impl Default for Settings {
             fx_presets: Vec::new(),
             fx_settings_only: false,
             object_apps: Vec::new(),
+            object_apps_insert_saved: false,
             picture_captions: Default::default(),
         }
     }
@@ -3545,6 +3616,12 @@ mod tests {
         assert!(
             partial.wheel_zooms,
             "old settings files keep the zoom default"
+        );
+        // Print Preview shows everything, as before (#3603).
+        assert!(
+            partial.print_preview_rulers
+                && partial.print_preview_strip
+                && partial.print_preview_options
         );
         assert!(partial.zoom_relative_1to1 && !partial.wheel_zoom_centers);
         // Smooth zoom on, 15 % a notch, for settings from before (#1648).

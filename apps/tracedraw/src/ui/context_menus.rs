@@ -124,6 +124,7 @@ pub(crate) struct MenuDefinition {
 macro_rules! object_items {
     ($($extra:literal),* $(,)?) => {
         &[
+            "menu.table",
             "menu.text.edit_text",
             "menu.text.convert",
             "menu.text.insert_placeholder_text",
@@ -319,6 +320,7 @@ pub(crate) const CATALOG: &[MenuDefinition] = &[
             "menu.edit.paste",
             "menu.edit.delete",
             "menu.edit.select_all",
+            "menu.table",
             "menu.text.insert_placeholder_text",
             "menu.object.properties",
         ],
@@ -364,6 +366,7 @@ pub(crate) const CATALOG: &[MenuDefinition] = &[
         id: "toolbar",
         key: "context_menu.toolbar",
         items: &[
+            "bars.button_properties",
             "bars.top",
             "bars.palette_top_edge",
             "bars.bottom",

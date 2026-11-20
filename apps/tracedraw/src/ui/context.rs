@@ -264,6 +264,13 @@ pub(crate) fn text_edit_menu(app: &mut App, ui: &mut Ui, close: &mut bool) {
                 app.text_select_all();
             }
         }
+        "menu.table" => {
+            // The table commands act on the cells being edited (#2976).
+            if app.table_edit.is_some() && app.selected_table().is_some() {
+                sep(ui);
+                table_items(app, ui, close);
+            }
+        }
         "menu.text.insert_placeholder_text" => {
             // A paragraph frame being edited: filler text in place of its own.
             if app.placeholder_text_offered()
@@ -280,6 +287,71 @@ pub(crate) fn text_edit_menu(app: &mut App, ui: &mut Ui, close: &mut bool) {
             }
         }
     }
+}
+
+/// The Table submenu of Text > Table, for the context menu (#2976): add,
+/// select and delete rows and columns, delete the table, merge, unmerge
+/// and split the cells. They act on the chosen cells, as from the menu.
+fn table_items(app: &mut App, ui: &mut Ui, close: &mut bool) {
+    use crate::table::TableOp;
+    use crate::ui::table_bar::TableCountKind;
+    sub(ui, "menu.table", |ui| {
+        sub(ui, "menu.table.insert", |ui| {
+            for (key, op) in [
+                ("menu.table.insert_row_above", TableOp::RowAbove),
+                ("menu.table.insert_row_below", TableOp::RowBelow),
+                ("menu.table.insert_column_left", TableOp::ColLeft),
+                ("menu.table.insert_column_right", TableOp::ColRight),
+            ] {
+                if ci(ui, close, key, "", true) {
+                    app.table_op(op);
+                }
+            }
+            sep(ui);
+            if ci(ui, close, "menu.table.insert_rows", "", true) {
+                app.open_table_count(TableCountKind::InsertRows);
+            }
+            if ci(ui, close, "menu.table.insert_columns", "", true) {
+                app.open_table_count(TableCountKind::InsertCols);
+            }
+        });
+        sub(ui, "menu.table.select", |ui| {
+            for (key, op) in [
+                ("menu.table.select_cell", TableOp::SelectCell),
+                ("menu.table.select_row", TableOp::SelectRow),
+                ("menu.table.select_column", TableOp::SelectCol),
+                ("menu.table.select_table", TableOp::SelectTable),
+            ] {
+                if ci(ui, close, key, "", true) {
+                    app.table_op(op);
+                }
+            }
+        });
+        sub(ui, "menu.table.delete", |ui| {
+            for (key, op) in [
+                ("menu.table.delete_row", TableOp::DeleteRow),
+                ("menu.table.delete_column", TableOp::DeleteCol),
+                ("menu.table.delete_table", TableOp::DeleteTable),
+            ] {
+                if ci(ui, close, key, "", true) {
+                    app.table_op(op);
+                }
+            }
+        });
+        sep(ui);
+        if ci(ui, close, "menu.table.merge_cells", "Ctrl+M", true) {
+            app.table_op(TableOp::Merge);
+        }
+        if ci(ui, close, "menu.table.unmerge_cells", "", true) {
+            app.table_op(TableOp::Unmerge);
+        }
+        if ci(ui, close, "menu.table.split_into_rows", "", true) {
+            app.open_table_count(TableCountKind::SplitRows);
+        }
+        if ci(ui, close, "menu.table.split_into_columns", "", true) {
+            app.open_table_count(TableCountKind::SplitCols);
+        }
+    });
 }
 
 /// Right-click on a locked object: only unlocking it (it is selected
@@ -374,6 +446,13 @@ fn object_menu_for(app: &mut App, ui: &mut Ui, close: &mut bool, source: Option<
         "docker.copy_to_layer" => {
             if let Some(id) = source {
                 crate::ui::objects_docker::row_menu_item(app, ui, id, close, "docker.copy_to_layer");
+                sep(ui);
+            }
+        }
+        "menu.table" => {
+            // Table commands are available for imported spreadsheets too (#2976).
+            if app.selected_table().is_some() {
+                table_items(app, ui, close);
                 sep(ui);
             }
         }
@@ -494,6 +573,11 @@ fn object_menu_for(app: &mut App, ui: &mut Ui, close: &mut bool, source: Option<
                 )
             {
                 app.ai_vectorize();
+            }
+            if is_bitmap {
+                crate::ai_photo::menu_items(app, ui, |ui, key, on, tip| {
+                    ci_tip(ui, close, key, on, tip)
+                });
             }
         }
         "menu.bitmaps.save_bitmap_as" => {
@@ -700,6 +784,7 @@ fn object_menu_for(app: &mut App, ui: &mut Ui, close: &mut bool, source: Option<
                         }
                     }
                 }
+                crate::select_similar::tolerance_row(ui, &mut app.settings.similar_tolerance);
             });
         }
         "menu.object.order" => {

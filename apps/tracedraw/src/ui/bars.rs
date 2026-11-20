@@ -302,6 +302,9 @@ impl Bar {
             Bar::Text => vec2(760.0, 36.0 + TITLE_H + 4.0),
             Bar::Zoom => vec2(420.0, 36.0 + TITLE_H + 4.0),
             Bar::Transform => vec2(820.0, 36.0 + TITLE_H + 4.0),
+            Bar::TimeTracker if app.settings.time_tracker.mini => {
+                vec2(190.0, 36.0 + TITLE_H + 4.0)
+            }
             Bar::TimeTracker => vec2(520.0, 36.0 + TITLE_H + 4.0),
             // Room for its buttons (a few more for those named in words),
             // and for its name.
@@ -960,6 +963,14 @@ fn anywhere_menu_id(bar: Bar) -> egui::Id {
 /// bar's background, a floating title) keeps its own popup, so one menu
 /// never shows twice in a frame.
 pub fn bar_menu(app: &mut App, resp: &egui::Response, bar: Bar) {
+    bar_menu_of(app, resp, bar, None);
+}
+
+/// The bar's menu for a right click on one of its buttons, the command
+/// `id` (a tool's id or a menu key): it starts with Properties, which
+/// opens Options > Customization > Commands at that command, on its
+/// Shortcut Keys tab, as a right click on a menu row does (#3326, #2504).
+pub fn bar_menu_of(app: &mut App, resp: &egui::Response, bar: Bar, id: Option<&str>) {
     crate::ui::context_menus::filter_popup(
         egui::Popup::context_menu(resp)
             .id(resp.id.with("bar_menu"))
@@ -969,7 +980,15 @@ pub fn bar_menu(app: &mut App, resp: &egui::Response, bar: Bar) {
     )
     .show(|ui| {
         let _scope = crate::ui::context_menus::Scope::new(&app.settings.context_menus, "toolbar");
-        crate::ui::menus::body(ui, |ui| menu_body(app, ui, bar))
+        crate::ui::menus::body(ui, |ui| {
+            if let Some(id) = id {
+                if crate::ui::menus::item(ui, "bars.button_properties", "", true) {
+                    crate::ui::menus::open_command_properties(app, id);
+                }
+                crate::ui::menus::sep(ui);
+            }
+            menu_body(app, ui, bar)
+        })
     });
 }
 
