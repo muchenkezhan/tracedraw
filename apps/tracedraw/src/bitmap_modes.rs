@@ -1167,6 +1167,13 @@ impl crate::app::App {
             else {
                 return false;
             };
+            if s.bitmap_alpha_fill {
+                cmds.push(tracedraw_core::Command::SetFill {
+                    shapes: vec![s.id],
+                    fill: tracedraw_core::Fill::Solid(c),
+                });
+                continue;
+            }
             // A bitmap of one colour (a drop shadow broken apart) takes
             // the colour whichever button picks it (#2677).
             let Some(out) = crate::bitmap_fx::decode(png).and_then(|img| {
