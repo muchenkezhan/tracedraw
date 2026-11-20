@@ -1257,6 +1257,10 @@ pub struct EllipseArc {
     pub end_deg: f64,
     /// Pie (wedge closed through the centre) or open arc.
     pub pie: bool,
+    /// A pie's thickness as a ring: the inner edge at this share of the
+    /// radii, 0 to 0.99 (0 a plain pie, through the centre).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub inner: f64,
 }
 
 /// Drop shadow attached to an object (the Drop Shadow tool).
@@ -4086,6 +4090,9 @@ impl Shape {
             },
             ShapeKind::Ellipse { rect, arc } => match arc {
                 None => geometry::ellipse_path(*rect),
+                Some(a) if a.pie && a.inner > 0.0 => {
+                    geometry::ellipse_ring_path(*rect, a.start_deg, a.end_deg, a.inner)
+                }
                 Some(a) => geometry::ellipse_arc_path(*rect, a.start_deg, a.end_deg, a.pie),
             },
             ShapeKind::Polygon {
@@ -4688,6 +4695,11 @@ impl Shape {
                     .unwrap_or_else(|| (outer * self.page_path()).bounding_box())
             }
             _ if outer == Affine::IDENTITY => self.own_bounds(),
+            // A curve's box from its own segments, each placed as it is
+            // measured: the whole curve was copied (and copied again with
+            // its transformation) for every box asked for, a cost on long
+            // curves many times a frame (#3559).
+            ShapeKind::Path { path, .. } => path_bounds_under(path, outer * self.transform),
             _ => {
                 let mut c = self.clone();
                 c.transform = outer * c.transform;
@@ -4725,6 +4737,7 @@ impl Shape {
             ShapeKind::Text { .. } => self
                 .text_bounds()
                 .unwrap_or_else(|| self.page_path().bounding_box()),
+            ShapeKind::Path { path, .. } => path_bounds_under(path, self.transform),
             _ => self.page_path().bounding_box(),
         }
     }
@@ -4756,6 +4769,16 @@ impl Shape {
             _ => None,
         }
     }
+}
+
+/// The box of `path` placed by `t`, the same as
+/// `(t * path).bounding_box()` without copying the curve: each segment is
+/// placed and measured on its own (#3559).
+fn path_bounds_under(path: &BezPath, t: Affine) -> Rect {
+    path.segments()
+        .map(|seg| (t * seg).bounding_box())
+        .reduce(|a, b| a.union(b))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -7602,6 +7625,55 @@ mod index_keys {
 
 #[cfg(test)]
 mod tests {
+    /// #3559: a curve's box is measured from its own segments, without
+    /// copying the curve; it is the box of the placed curve, turned,
+    /// slanted and inside a turned group too, and empty for no segments.
+    #[test]
+    fn a_curves_box_is_the_box_of_the_placed_curve() {
+        use super::{Shape, ShapeKind};
+        use crate::geometry::{Affine, BezPath, Rect, Shape as _};
+        let mut p = BezPath::new();
+        p.move_to((0.0, 0.0));
+        p.curve_to((10.0, 30.0), (40.0, -20.0), (50.0, 5.0));
+        p.quad_to((60.0, 40.0), (20.0, 30.0));
+        p.line_to((5.0, 12.0));
+        p.close_path();
+        p.move_to((70.0, 70.0));
+        p.line_to((80.0, 75.0));
+        let mut s = Shape::new(
+            crate::id::IdSource::default().shape(),
+            ShapeKind::Path {
+                path: p.clone(),
+                closed: false,
+            },
+        );
+        s.transform = Affine::translate((3.0, -7.0))
+            * Affine::rotate(0.7)
+            * Affine::new([1.0, 0.0, 0.4, 1.3, 0.0, 0.0]);
+        let close = |a: Rect, b: Rect| {
+            (a.x0 - b.x0).abs() < 1e-9
+                && (a.y0 - b.y0).abs() < 1e-9
+                && (a.x1 - b.x1).abs() < 1e-9
+                && (a.y1 - b.y1).abs() < 1e-9
+        };
+        let want = (s.transform * p.clone()).bounding_box();
+        assert!(close(s.bounds(), want), "{:?} {want:?}", s.bounds());
+        let mut g = Shape::new(
+            crate::id::IdSource::default().shape(),
+            ShapeKind::Group {
+                children: vec![s.clone()],
+            },
+        );
+        g.transform = Affine::rotate(-1.1) * Affine::scale(2.0);
+        let want = (g.transform * s.transform * p).bounding_box();
+        assert!(close(g.bounds(), want), "{:?} {want:?}", g.bounds());
+        s.kind = ShapeKind::Path {
+            path: BezPath::new(),
+            closed: false,
+        };
+        assert_eq!(s.bounds(), Rect::ZERO);
+    }
+
     /// Objects are found by id from where the last one was found (a
     /// selection of thousands was looked up one after the other, walking
     /// the whole drawing for each): whatever the hint, including one left
@@ -8271,6 +8343,7 @@ mod tests {
                     start_deg: 0.0,
                     end_deg: 200.0,
                     pie: false,
+                    inner: 0.0,
                 }),
             },
         );

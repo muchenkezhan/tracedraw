@@ -1390,7 +1390,8 @@ fn brush_strokes_bar(app: &mut App, ui: &mut Ui) {
     let shapes: &[&str] = match app.media_mode {
         MediaMode::Preset | MediaMode::Brush => &crate::media::BRUSH_KEYS,
         MediaMode::Sprayer => &crate::media::SPRAY_KEYS,
-        MediaMode::Calligraphic | MediaMode::Expression => &[],
+        MediaMode::Tiles => &crate::media::TILE_KEYS,
+        MediaMode::Calligraphic | MediaMode::Expression | MediaMode::Merge => &[],
     };
     if !shapes.is_empty() {
         dim_labelled_as(
@@ -1447,7 +1448,7 @@ fn brush_strokes_bar(app: &mut App, ui: &mut Ui) {
                 )
             });
         }
-        MediaMode::Preset | MediaMode::Brush => {}
+        MediaMode::Preset | MediaMode::Brush | MediaMode::Tiles | MediaMode::Merge => {}
     }
 }
 
@@ -1690,6 +1691,26 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
                 {
                     app.eraser_square = true;
                 }
+                // On pictures: a soft edge and how much it takes (#3043).
+                for (key, v) in [
+                    ("toolbar.eraser_hardness", &mut app.eraser_hardness),
+                    ("toolbar.eraser_strength", &mut app.eraser_strength),
+                ] {
+                    let mut pct = (*v * 100.0).round();
+                    if dim_labelled(ui, key, |ui| {
+                        ui.add(
+                            crate::ui::field::NumField::new(&mut pct)
+                                .speed(1.0)
+                                .range(0.0..=100.0)
+                                .max_decimals(0)
+                                .suffix(" %"),
+                        )
+                    })
+                    .changed()
+                    {
+                        *v = (pct / 100.0).clamp(0.0, 1.0);
+                    }
+                }
                 ui.label(
                     egui::RichText::new(tr("hint.bar_eraser"))
                         .color(Tokens::text_dim())
@@ -1770,12 +1791,37 @@ pub fn property_bar(app: &mut App, ui: &mut Ui) {
                 }
             }
             Tool::GraphPaper => {
-                dim_labelled(ui, "toolbar.rows", |ui| {
-                    ui.add(crate::ui::field::NumField::new(&mut app.graph_rows).range(1..=99))
-                });
-                dim_labelled(ui, "toolbar.columns", |ui| {
-                    ui.add(crate::ui::field::NumField::new(&mut app.graph_cols).range(1..=99))
-                });
+                if ui
+                    .selectable_label(!app.graph_radial, tr("toolbar.graph_cells"))
+                    .rich_tip(crate::ui::tips::keyed("toolbar.graph_cells"))
+                    .clicked()
+                {
+                    app.graph_radial = false;
+                }
+                if ui
+                    .selectable_label(app.graph_radial, tr("toolbar.graph_radial"))
+                    .rich_tip(crate::ui::tips::keyed("toolbar.graph_radial"))
+                    .clicked()
+                {
+                    app.graph_radial = true;
+                }
+                if app.graph_radial {
+                    dim_labelled(ui, "toolbar.rings", |ui| {
+                        ui.add(crate::ui::field::NumField::new(&mut app.graph_rings).range(1..=99))
+                    });
+                    dim_labelled(ui, "toolbar.spokes", |ui| {
+                        ui.add(
+                            crate::ui::field::NumField::new(&mut app.graph_spokes).range(0..=360),
+                        )
+                    });
+                } else {
+                    dim_labelled(ui, "toolbar.rows", |ui| {
+                        ui.add(crate::ui::field::NumField::new(&mut app.graph_rows).range(1..=99))
+                    });
+                    dim_labelled(ui, "toolbar.columns", |ui| {
+                        ui.add(crate::ui::field::NumField::new(&mut app.graph_cols).range(1..=99))
+                    });
+                }
             }
             Tool::ActionLines => action_lines_bar(app, ui),
             Tool::CommonShapes => common_shapes_bar(app, ui),
@@ -2137,6 +2183,17 @@ fn curve_tool_properties(app: &mut App, ui: &mut Ui) {
         if pic_button(ui, Pic::CloseCurve, &tr("toolbar.close_tip"), open, false).clicked() {
             app.close_selected_curves();
         }
+    }
+    if app.tool == Tool::TwoPointLine {
+        // Arcs instead of straight lines, bowed one way or the other.
+        sep(ui);
+        ui.toggle_value(&mut app.line_arc, tr("toolbar.line_arc"))
+            .rich_tip(crate::ui::tips::pair("toolbar.line_arc", "toolbar.line_arc_desc"));
+        ui.add_enabled_ui(app.line_arc, |ui| {
+            ui.toggle_value(&mut app.line_arc_flip, tr("toolbar.line_arc_flip"))
+                .rich_tip(tr("toolbar.line_arc_flip_desc"))
+                .rich_disabled_tip(tr("toolbar.line_arc_flip_desc"));
+        });
     }
     if app.tool == Tool::Freehand {
         sep(ui);

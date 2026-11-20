@@ -21,10 +21,11 @@ const FONT: f32 = 13.0;
 const SEPARATOR_HEIGHT: f32 = 7.0;
 
 /// The style of menu pop-ups: white, a one-pixel grey frame, square
-/// corners, rows touching.
+/// corners, rows touching. With Translucent menus on (Customization >
+/// Appearance) the body lets the window show through.
 pub(crate) fn menu_popup_style(style: &mut egui::Style) {
     egui::containers::menu::menu_style(style);
-    style.visuals.window_fill = crate::theme::Tokens::menu();
+    style.visuals.window_fill = crate::theme::menu_fill(crate::theme::Tokens::menu());
     style.visuals.window_stroke = egui::Stroke::new(1.0, crate::theme::Tokens::window_border());
     style.visuals.menu_corner_radius = egui::CornerRadius::ZERO;
     style.visuals.popup_shadow = crate::theme::shadow(egui::epaint::Shadow {
@@ -115,7 +116,11 @@ fn body_rows<R>(ui: &mut Ui, width_id: egui::Id, add: impl FnOnce(&mut Ui) -> R)
     );
     ui.painter().set(
         slot,
-        egui::Shape::rect_filled(gutter, 0.0, crate::theme::Tokens::menu_gutter()),
+        egui::Shape::rect_filled(
+            gutter,
+            0.0,
+            crate::theme::menu_fill(crate::theme::Tokens::menu_gutter()),
+        ),
     );
     r
 }
@@ -486,7 +491,7 @@ fn paint_new_mark(ui: &Ui, row: egui::Rect) {
     ui.painter().circle_filled(c, 3.5, Tokens::ACCENT);
 }
 
-fn item_text(
+pub(crate) fn item_text(
     ui: &mut Ui,
     label: &str,
     shortcut: &str,
@@ -762,7 +767,7 @@ fn menu_pic(key: &str) -> Option<crate::ui::propbar::Pic> {
         "menu.object.shaping" => Pic::Weld,
         "menu.object.transformations" => Pic::Position,
         "menu.object.tf_position" => Pic::Position,
-        "menu.object.tf_rotate" => Pic::Rotate,
+        "menu.object.tf_rotate" | "menu.object.rotate_by_lines" => Pic::Rotate,
         "menu.object.tf_scale" => Pic::ScaleMirror,
         "menu.object.tf_size" => Pic::SizeBox,
         "menu.object.tf_skew" => Pic::SkewBox,
@@ -1953,6 +1958,53 @@ mod tests {
         assert!((coeffs(&app)[0] - c0[0]).abs() < 1e-9);
     }
 
+    /// A plugin's commands are commands like the menus' own: listed for
+    /// Options > Customization under their names, and run by a shortcut
+    /// of the user's (#3519).
+    #[test]
+    fn plugin_commands_take_shortcuts() {
+        use egui::{Key, Modifiers};
+        let ctx = crate::theme::ui_context();
+        let mut app = mixed_app();
+        app.show_welcome = false;
+        assert!(
+            app.install_plugin(crate::plugins::TEMPLATE),
+            "{}",
+            app.status
+        );
+        let mut entries = Vec::new();
+        run_frame(&ctx, |ui| entries = commands(&mut app, ui.ctx()));
+        let id = crate::plugins::command_key("My Plugin", "Box with a lid");
+        let e = entries
+            .iter()
+            .find(|e| e.key == id)
+            .expect("the plugin's command is listed");
+        assert_eq!(e.path.first().map(String::as_str), Some("menu.tools"));
+        assert_eq!(
+            crate::macros::command_name(&id),
+            Some(("Box with a lid".to_string(), "My Plugin".to_string()))
+        );
+        let count = |app: &App| {
+            app.doc().pages[0]
+                .layers
+                .iter()
+                .map(|l| l.shapes.len())
+                .sum::<usize>()
+        };
+        let before = count(&app);
+        app.settings
+            .shortcuts
+            .push((id.clone(), "Ctrl+Alt+D".into()));
+        root_frame(
+            &ctx,
+            &mut app,
+            vec![key(Key::D, Modifiers::COMMAND | Modifiers::ALT)],
+        );
+        root_frame(&ctx, &mut app, vec![]);
+        assert_eq!(count(&app), before + 2, "{}", app.status);
+        assert_eq!(invoke::shown_shortcut(&id, ""), "Ctrl+Alt+D");
+    }
+
     /// A shortcut of the user's runs its menu command, takes over a
     /// built-in shortcut and shows in the menu row.
     #[test]
@@ -3013,6 +3065,7 @@ fn edit_menu(app: &mut App, ui: &mut Ui) {
                 app.select_similar(how);
             }
         }
+        crate::select_similar::tolerance_row(ui, &mut app.settings.similar_tolerance);
     });
     sep(ui);
     if item(ui, "menu.edit.find_and_replace", "Ctrl+F", true) {
@@ -3506,6 +3559,11 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
                 if item(ui, "menu.object.insert_object_add", "", true) {
                     app.add_object_app();
                 }
+                let on = app.settings.object_apps_insert_saved;
+                if check(ui, "menu.object.insert_object_saved", "", on) {
+                    app.settings.object_apps_insert_saved = !on;
+                    app.settings.save();
+                }
                 let apps = app.settings.object_apps.clone();
                 sub_if(
                     ui,
@@ -3607,7 +3665,7 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
             ui,
             "menu.object.symmetry_create",
             "Alt+S",
-            has && !has_sym && !editing,
+            !has_sym && !editing,
         ) {
             app.create_symmetry();
         }
@@ -3694,6 +3752,11 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         }
         if item(ui, "menu.object.mirror_v", "", has) {
             app.mirror(false);
+        }
+        // A base line on the selection turned to a target line's angle
+        // (#2870).
+        if item(ui, "menu.object.rotate_by_lines", "", has) {
+            app.start_rotate_by_lines();
         }
     });
     if item(ui, "menu.object.clear_transformations", "", has) {
@@ -4014,6 +4077,15 @@ fn effects_menu(app: &mut App, ui: &mut Ui) {
     ) {
         app.apply_effects_to_all_pages();
     }
+    // Shapes joined live into one outline with rounded necks.
+    let can_merge = app.selection.len() >= 2
+        || app
+            .selected_shapes()
+            .first()
+            .is_some_and(|s| app.selection.len() == 1 && matches!(s.kind, ShapeKind::Group { .. }));
+    if item(ui, "menu.effects.merge_shapes", "", can_merge) {
+        app.merge_shapes();
+    }
     sep(ui);
     // Bitmap effect groups.
     for (key, group) in crate::fx::groups() {
@@ -4062,6 +4134,7 @@ fn effects_menu(app: &mut App, ui: &mut Ui) {
         ("menu.effects.picture_mosaic", "", DockerTab::PictureMosaic),
         ("menu.effects.vector_mosaic", "", DockerTab::VectorMosaic),
         ("menu.effects.symbol_scatter", "", DockerTab::SymbolScatter),
+        ("menu.effects.frame_generator", "", DockerTab::FrameGenerator),
     ] {
         if check(ui, key, shortcut, effect_docker_open(app, tab)) {
             app.open_docker(tab);
@@ -4102,6 +4175,17 @@ fn bitmaps_menu(app: &mut App, ui: &mut Ui) {
         app.selected_bitmap().is_some(),
     ) {
         app.edit_bitmap_externally();
+    }
+    // The picture's pixels edited in place, in the drawing window.
+    if item(
+        ui,
+        "menu.bitmaps.edit_inside",
+        "",
+        app.selected_bitmap().is_some() && app.pixel_edit.is_none(),
+    ) {
+        if let Some(id) = app.selected_bitmap() {
+            app.edit_bitmap_inside(id);
+        }
     }
     // Another picture in its place (#2598).
     if item(
@@ -4154,6 +4238,8 @@ fn bitmaps_menu(app: &mut App, ui: &mut Ui) {
     ) {
         app.ai_vectorize();
     }
+    // Shown only while AI features are on (`ai_photo.rs`).
+    crate::ai_photo::menu_items(app, ui, |ui, key, on, tip| item_tip(ui, key, "", on, tip));
     let styled = app.ai_image_ready() && !app.selection.is_empty() && !app.ai_image.busy();
     sub(ui, "menu.bitmaps.ai_art_styles", |ui| {
         for (i, (key, _)) in crate::ai_image::ART_STYLES.iter().enumerate() {
