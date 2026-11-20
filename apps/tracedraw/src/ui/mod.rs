@@ -114,6 +114,7 @@ pub mod sizes;
 pub mod slider;
 pub mod status;
 pub mod straighten_dialog;
+pub mod pixel_bar;
 pub mod symmetry_bar;
 pub mod tab_focus;
 pub mod table_bar;
@@ -141,6 +142,7 @@ pub mod transform_docker;
 pub mod transparency_docker;
 pub mod shape_gen_docker;
 pub mod symbol_scatter_docker;
+pub mod frame_gen_docker;
 pub mod vector_mosaic_docker;
 pub mod welcome;
 pub mod window_bars;
@@ -415,6 +417,12 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     crate::theme::set_button_sizes(app.settings.button_size, app.settings.toolbox_button_size);
     apply_theme(&ctx, &crate::settings::effective_theme(&app.settings));
     apply_shadows(&ctx, app.settings.ui_shadows && !software_renderer());
+    // Customization > Appearance > Translucent menus.
+    crate::theme::set_menu_opacity(
+        app.settings
+            .translucent_menus
+            .then_some(app.settings.menu_opacity),
+    );
     // Said once in the status bar: a software adapter draws the window.
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(name) = crate::gpu::take_software_note() {
@@ -500,6 +508,12 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
     };
     if ctx.global_style().interaction.tooltip_delay != delay {
         ctx.all_styles_mut(|s| s.interaction.tooltip_delay = delay);
+    }
+    // Combo box lists as tall as the window allows before they scroll
+    // (#3492).
+    let room = crate::ui::keynav::list_height(ctx.content_rect().height());
+    if ctx.global_style().spacing.combo_height != room {
+        ctx.all_styles_mut(|s| s.spacing.combo_height = room);
     }
     // Session recovery: this session's marker, and what one that ended
     // without closing left. An idle window still checks in, with a frame
@@ -901,6 +915,7 @@ fn root_frame(app: &mut App, ui: &mut Ui) {
 
     if app.has_document() && !app.show_welcome {
         symmetry_bar::show(app, &ctx);
+        pixel_bar::show(app, &ctx);
         clip_bar::show(app, &ctx);
         focus_bar::show(app, &ctx);
         effect_picker::show(app, &ctx);
@@ -1312,7 +1327,14 @@ pub(crate) fn drawing_window(app: &mut App, ui: &mut Ui, full: egui::Rect) {
                 .flatten()
         });
         if let Some(s) = press.filter(|s| canvas_rect.contains(*s)) {
-            app.multipage_press(s);
+            // Shift+click on the facing page's object adds it to the
+            // selection (#3488).
+            let adopted = mods.shift
+                && app.tool == crate::tools::Tool::Pick
+                && app.spread_shift_press(s);
+            if !adopted {
+                app.multipage_press(s);
+            }
         }
     }
     if two_fingers.is_none()
@@ -2279,6 +2301,17 @@ mod tests {
         timed(&mut app, Vec::new());
         // No finger yet: no bars.
         app.select(vec![a]);
+        timed(&mut app, Vec::new());
+        assert!(app.touch_bar_shown.is_empty() || crate::files::ANDROID);
+        // With a mouse too, when asked (#3456): the column shows with no
+        // finger, and goes when the option is off again.
+        app.settings.selection_bar_mouse = true;
+        timed(&mut app, Vec::new());
+        assert!(app
+            .touch_bar_shown
+            .iter()
+            .any(|(c, _)| *c == BarCommand::Duplicate));
+        app.settings.selection_bar_mouse = false;
         timed(&mut app, Vec::new());
         assert!(app.touch_bar_shown.is_empty() || crate::files::ANDROID);
         let on_a = app.view.to_screen(Point::new(35.0, 25.0));
