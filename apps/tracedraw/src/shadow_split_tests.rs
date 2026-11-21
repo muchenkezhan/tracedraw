@@ -232,7 +232,14 @@ fn detached_shadow_gradients_remain_independent_and_editable() {
         assert!(app.recolor_mono_bitmaps(true, Color::BLACK));
         let recolored = app.doc().find_shape(shadow).expect("shadow");
         assert_eq!(recolored.fill, Fill::Solid(Color::BLACK));
-        assert_eq!(recolored.kind, original.kind);
+        let ShapeKind::Bitmap { png, .. } = &recolored.kind else {
+            panic!("detached shadow bitmap");
+        };
+        let pixels = crate::bitmap_fx::decode(png).expect("recoloured bitmap");
+        assert_eq!(
+            crate::bitmap_modes::single_color(&pixels),
+            Some(Color::BLACK.to_rgb8())
+        );
         assert_eq!(recolored.effects, edited.effects);
     }
 }
