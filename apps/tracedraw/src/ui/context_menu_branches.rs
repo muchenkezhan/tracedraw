@@ -32,6 +32,7 @@ pub(crate) fn children(scene: &str, parent: &str) -> &'static [&'static str] {
             "menu.edit.similar_outline",
             "menu.edit.similar_text_format",
             "menu.edit.similar_kind",
+            "menu.edit.similar_look",
         ],
         ("canvas_object" | "objects_object", "menu.object.order") => &[
             "menu.object.to_front_of_page",
@@ -215,11 +216,13 @@ fn order_roots(scene: &str, items: &mut [&'static str]) {
         },
         "palette.palette",
         "palette.show_document",
+        "palette.show_names",
         "palette.size",
         "palette.rows",
         "palette.position",
         "palette.open_bar",
         "palette.new",
+        if document { "" } else { "palette.fit_selection" },
         "palette.add_selection_to_palette",
         if !document {
             "palette.add_from_bitmap"

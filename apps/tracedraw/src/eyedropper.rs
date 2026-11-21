@@ -482,6 +482,17 @@ impl App {
         }) {
             return Some(c);
         }
+        // On the outline of a filled object: the outline's colour, as
+        // it shows there (#3784: the fill's colour was read).
+        if let Some(st) = s.stroke.as_ref().filter(|_| !matches!(s.fill, Fill::None)) {
+            let reach = crate::interaction::outline_reach(s, s.transform);
+            let tol = self.object_pick_tol();
+            if reach > 0.0
+                && crate::canvas::distance_to_path(&s.page_path(), p) <= reach.max(tol * 0.5)
+            {
+                return Some(st.color);
+            }
+        }
         match &s.fill {
             Fill::Solid(c) => Some(*c),
             Fill::Fountain(f) => f.stops.first().map(|st| st.color),
@@ -721,6 +732,7 @@ impl App {
     pub fn took_sampled_color(&mut self, c: Color, shift: bool) {
         self.eyedropper_color = Some(c);
         self.eyedropper_apply = true;
+        crate::ui::color_docker::take_sampled_color(self, c);
         self.status = crate::i18n::trf(
             "status.sampled_color",
             &[("c", &crate::app::color_description(c))],
@@ -766,7 +778,7 @@ impl App {
     /// A click of the Color Mask's eyedropper (#2479): the colour under
     /// `p` (a picture's pixel) goes into the chosen slot, which is turned
     /// on, and the tool used before comes back, the picture still
-    /// selected for Apply, as CorelDRAW's Bitmap Color Mask does. Each
+    /// selected for Apply. Each
     /// pick samples: the second one applied the first colour to the
     /// picture as a fill instead, the Colour Eyedropper being in its
     /// Apply mode, so only one colour of an imported picture could be
@@ -837,6 +849,23 @@ mod tests {
         assert_eq!(sb.fill, Fill::Solid(Color::rgb8(r, g, b8)));
     }
 
+    /// A colour the Color Eyedropper samples shows in the Colour panel
+    /// as its new colour too, ready to apply or tweak; the panel kept
+    /// the colour it had before.
+    #[test]
+    fn a_sampled_colour_becomes_the_colour_panels_new_colour() {
+        let mut app = App::headless();
+        let a = rect(&mut app, Rect::new(0.0, 0.0, 20.0, 20.0));
+        app.run(Command::SetFill {
+            shapes: vec![a],
+            fill: Fill::Solid(Color::rgb8(30, 120, 210)),
+        });
+        app.select(Vec::new());
+        app.color_model = 0;
+        app.eyedropper_click(Point::new(10.0, 10.0), false, false, false);
+        assert_eq!(app.mixer_color.to_rgb8(), [30, 120, 210]);
+    }
+
     /// #3499: with Treat All Objects as Filled, a click inside an
     /// unfilled rectangle with a green outline read the green as its
     /// fill. Inside, nothing of it shows: nothing is read from it (the
@@ -868,6 +897,41 @@ mod tests {
             Some(green)
         );
         assert_eq!(app.sample_color_at(inside, true), Some(green));
+    }
+
+    /// #3784: pointing at the outline of a filled object reads the
+    /// outline's colour; it read the fill's. Inside, the fill is read.
+    #[test]
+    fn a_filled_object_gives_its_outline_colour_on_the_outline() {
+        let mut app = App::headless();
+        let a = rect(&mut app, Rect::new(0.0, 0.0, 40.0, 40.0));
+        let red = Color::rgb8(220, 0, 0);
+        let blue = Color::rgb8(0, 0, 200);
+        app.run(Command::SetFill {
+            shapes: vec![a],
+            fill: Fill::Solid(red),
+        });
+        app.run(Command::SetStroke {
+            shapes: vec![a],
+            stroke: Some(tracedraw_core::Stroke {
+                color: blue,
+                width: 4.0,
+                ..Default::default()
+            }),
+        });
+        assert_eq!(
+            app.sample_color_at(Point::new(20.0, 20.0), false),
+            Some(red)
+        );
+        assert_eq!(
+            app.sample_color_at(Point::new(0.0, 20.0), false),
+            Some(blue)
+        );
+        // Inside the outline's band, just within the edge.
+        assert_eq!(
+            app.sample_color_at(Point::new(1.5, 20.0), false),
+            Some(blue)
+        );
     }
 
     #[test]

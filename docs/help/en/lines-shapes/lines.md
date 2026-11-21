@@ -127,6 +127,21 @@ handles.
 
 The result is an ordinary curve; the control points are not kept.
 
+## Curvature Pen {#curvature-pen}
+
+The [[tool.curvature_pen]] tool draws a smooth curve through the points you
+click, with no handles to pull.
+
+1. Click to place each point. The curve runs through every point and bends
+   smoothly by itself; the preview shows where the next click takes it.
+2. Hold <kbd>Alt</kbd> (or <kbd>C</kbd> or <kbd>V</kbd>) while you click to
+   make that point a corner.
+3. Double-click or press <kbd>Enter</kbd> to finish. Click the first point
+   (once there are three) to close the curve.
+
+The result is an ordinary curve whose nodes are the points you clicked, so
+the [[tool.shape]] tool edits it like any other.
+
 ## Polyline {#polyline}
 
 The [[tool.polyline]] tool draws straight segments one after the other:
@@ -176,6 +191,17 @@ style and start and end arrowheads, and a button that closes an open curve.
 The [[tool.freehand]] tool adds the smoothing. With nothing selected, it
 reminds you how to finish a curve. See [Outlines](outlines.md) for the
 outline settings.
+
+**Parallel lines** (with the Freehand, Bezier, Pen, Polyline, 2-Point Line and
+3-Point Curve tools) draws lines alongside each new curve: set how many
+**Lines** on each side, the **Gap** from one line to the next, and whether
+they go on **Both sides** or only on the curve's left. The lines are curves of
+their own with the curve's outline, selected with it; one Undo takes them away
+and leaves the curve. It is off at first.
+
+While you pull the handle of the first node of a curve with the Pen or Bezier
+tool, the opposite handle shows too, so you see the direction the curve leaves
+in both ways.
 
 ## Editing curves afterwards {#edit}
 

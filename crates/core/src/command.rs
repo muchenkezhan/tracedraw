@@ -153,6 +153,18 @@ pub enum Command {
         shape: ShapeId,
         mask: Option<crate::document::OpacityMask>,
     },
+    /// How group `shape` puts its members together (`None`: one after
+    /// another, as plain groups do).
+    SetGroupLook {
+        shape: ShapeId,
+        look: Option<crate::document::GroupLook>,
+    },
+    /// Stretch zones of symbol `index` (`None`: an instance stretches as
+    /// a whole).
+    SetSymbolScaleGrid {
+        index: usize,
+        grid: Option<crate::document::ScaleGrid>,
+    },
     /// Bitmap effects (and their picture) on a vector object; `None`
     /// removes them.
     SetRasterFx {
@@ -319,6 +331,10 @@ pub enum Command {
         shapes: Vec<ShapeId>,
         fills: Vec<Fill>,
         strokes: Vec<Stroke>,
+        /// The further fills' looks of their own (`Shape::fill_looks`);
+        /// `None` keeps them, as many as there are fills.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        looks: Option<Vec<crate::document::FillLook>>,
     },
     SetOverprint {
         shapes: Vec<ShapeId>,
@@ -396,6 +412,10 @@ pub enum Command {
     /// objects follow a colour style that changes (#778).
     ReplaceColors {
         pairs: Vec<(crate::Color, crate::Color)>,
+        /// Only these objects (any depth inside them); empty: the whole
+        /// drawing (#3534).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shapes: Vec<ShapeId>,
     },
     /// Move `shapes` directly in front of (or behind) `reference` in its layer.
     OrderRelative {
@@ -575,6 +595,8 @@ impl Command {
             Command::SetDocumentPaletteNames { .. } => "Document Palette",
             Command::SetInks { .. } => "Spot Inks",
             Command::SetOpacityMask { .. } => "Opacity Mask",
+            Command::SetGroupLook { .. } => "Group Look",
+            Command::SetSymbolScaleGrid { .. } => "Stretch Zones",
             Command::SetRasterFx { .. } => "Effect",
             Command::AddSymbol { .. } => "New Symbol",
             Command::SetSymbolShape { .. } => "Edit Symbol",
@@ -840,6 +862,22 @@ impl Command {
                 }
                 s.opacity_mask = *mask;
             }
+            Command::SetSymbolScaleGrid { index, grid } => {
+                let sym = doc
+                    .symbols
+                    .get_mut(*index)
+                    .ok_or(Error::SymbolNotFound(*index))?;
+                sym.shape.scale_grid = grid.map(|g| Box::new(g.sanitized()));
+            }
+            Command::SetGroupLook { shape, look } => {
+                let s = doc
+                    .find_shape_mut(*shape)
+                    .ok_or(Error::ShapeNotFound(*shape))?;
+                if !matches!(s.kind, ShapeKind::Group { .. }) {
+                    return Err(Error::NotGroup(*shape));
+                }
+                s.group_look = look.filter(|l| !l.is_plain());
+            }
             Command::SetRasterFx { shape, fx } => {
                 let s = doc
                     .find_shape_mut(*shape)
@@ -857,7 +895,10 @@ impl Command {
                     return Err(Error::SymbolCycle(*index));
                 }
                 if let Some(sym) = doc.symbols.get_mut(*index) {
+                    // The stretch zones stay with the symbol through an edit.
+                    let grid = shape.scale_grid.clone().or(sym.shape.scale_grid.take());
                     sym.shape = shape.clone();
+                    sym.shape.scale_grid = grid;
                 }
             }
             Command::MovePage { page, to } => {
@@ -1218,11 +1259,18 @@ impl Command {
                 shapes,
                 fills,
                 strokes,
+                looks,
             } => {
                 for id in shapes {
                     let s = any_mut(doc, *id)?;
                     s.extra_fills = fills.clone();
                     s.extra_strokes = strokes.clone();
+                    let mut l = match looks {
+                        Some(l) => l.clone(),
+                        None => s.fill_looks.as_deref().cloned().unwrap_or_default(),
+                    };
+                    l.truncate(fills.len());
+                    s.fill_looks = (!l.iter().all(|x| x.is_plain())).then(|| Box::new(l));
                 }
             }
             Command::SetOverprint {
@@ -1327,8 +1375,15 @@ impl Command {
             Command::ReplaceFontFamily { from, to } => {
                 doc.replace_font_family(from, to);
             }
-            Command::ReplaceColors { pairs } => {
-                crate::color_convert::replace_colors(doc, pairs);
+            Command::ReplaceColors { pairs, shapes } => {
+                if shapes.is_empty() {
+                    crate::color_convert::replace_colors(doc, pairs);
+                } else {
+                    for id in shapes {
+                        any(doc, *id)?;
+                    }
+                    crate::color_convert::replace_colors_in(doc, shapes, pairs);
+                }
             }
             Command::OrderRelative {
                 shapes,
@@ -1694,11 +1749,11 @@ impl Command {
                     any_mut(doc, *id)?.shadow = *shadow;
                 }
             }
-            Command::AddGuide { page, guide } => doc.page_mut(*page)?.guides.push(*guide),
+            Command::AddGuide { page, guide } => doc.page_mut(*page)?.guides.push(guide.clone()),
             Command::MoveGuide { page, index, guide } => {
                 let p = doc.page_mut(*page)?;
                 if let Some(g) = p.guides.get_mut(*index) {
-                    *g = *guide;
+                    *g = guide.clone();
                 }
             }
             Command::DeleteGuide { page, index } => {
@@ -3229,6 +3284,50 @@ mod tests {
         .apply(&mut doc)
         .unwrap();
         assert!(doc.find_shape(cid).unwrap().opacity_mask.is_none());
+    }
+    #[test]
+    fn only_groups_take_a_look() {
+        use crate::document::GroupLook;
+        let mut doc = Document::default();
+        let layer = doc.pages[0].layers[0].id;
+        let r = Shape::new(
+            doc.ids_mut().shape(),
+            ShapeKind::Rect {
+                rect: crate::geometry::Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        let rid = r.id;
+        let group = Shape::new(
+            doc.ids_mut().shape(),
+            ShapeKind::Group {
+                children: vec![r.clone()],
+            },
+        );
+        let gid = group.id;
+        doc.layer_mut(layer).unwrap().shapes.push(group);
+        let look = Some(GroupLook {
+            as_one: false,
+            knockout: true,
+        });
+        assert!(Command::SetGroupLook { shape: rid, look }
+            .apply(&mut doc)
+            .is_err());
+        Command::SetGroupLook { shape: gid, look }
+            .apply(&mut doc)
+            .unwrap();
+        assert_eq!(doc.find_shape(gid).unwrap().group_look, look);
+        let back = Document::from_json(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(back.find_shape(gid).unwrap().group_look, look);
+        // Nothing set is no look.
+        Command::SetGroupLook {
+            shape: gid,
+            look: Some(GroupLook::default()),
+        }
+        .apply(&mut doc)
+        .unwrap();
+        assert!(doc.find_shape(gid).unwrap().group_look.is_none());
     }
     use crate::geometry::Rect;
 

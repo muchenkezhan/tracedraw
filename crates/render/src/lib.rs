@@ -6,6 +6,7 @@
 #![allow(clippy::field_reassign_with_default)]
 pub mod accel;
 pub mod bitmap_effects;
+pub mod halftone;
 mod image_cache;
 
 use tiny_skia::{
@@ -94,6 +95,51 @@ pub struct Preview {
     pub transform: Affine,
 }
 
+/// The page-space box of every object of a page, worked out once for a
+/// render and shared by its bands: a band's culling asks every object's
+/// box, and before this cache each of the bands (one per core) walked
+/// the whole page's paths again (#3559).
+type PageBounds = std::collections::HashMap<ShapeId, Rect>;
+
+/// [`PageBounds`] of the page's drawable layers: each shape's box with
+/// the transforms of the groups and clip frames holding it taken in,
+/// the same value [`Renderer::reach`] would compute for it.
+#[cfg(not(target_arch = "wasm32"))]
+fn page_bounds_cache(doc: &Document, page: PageId) -> PageBounds {
+    fn walk(s: &Shape, parent: Affine, map: &mut PageBounds) {
+        let b = if parent == Affine::IDENTITY {
+            s.bounds()
+        } else {
+            parent.transform_rect_bbox(s.bounds())
+        };
+        map.insert(s.id, b);
+        let t = parent * s.transform;
+        match &s.kind {
+            ShapeKind::Group { children } => {
+                for c in children {
+                    walk(c, t, map);
+                }
+            }
+            ShapeKind::ClipFrame { frame, contents } => {
+                walk(frame, t, map);
+                for c in contents {
+                    walk(c, t, map);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut map = PageBounds::new();
+    if let Ok(layers) = doc.layers_drawn_for_page(page) {
+        for layer in layers {
+            for s in &layer.shapes {
+                walk(s, Affine::IDENTITY, &mut map);
+            }
+        }
+    }
+    map
+}
+
 /// Runs bitmap effects over straight (not premultiplied) RGBA pixels of
 /// `width` x `height`, in place. The renderer has no bitmap effects of its
 /// own: the application that has them registers this for the Bitmap
@@ -171,6 +217,11 @@ struct Flags {
     /// Drawing the warped outline of a text: filled with the nonzero rule
     /// as the text is, so letters that overlap leave no hole (#647).
     text_outline: bool,
+    /// Drawing on a layer of its own that starts see-through (a halftone
+    /// screens it next): an inner shadow keeps each pixel's coverage and
+    /// darkens the object's edge pixels as fully as their insides, so the
+    /// edge shows no light rim once the layer is screened.
+    atop: bool,
 }
 
 impl Flags {
@@ -183,6 +234,7 @@ impl Flags {
             anti_alias: opts.anti_alias,
             draft: opts.draft,
             text_outline: false,
+            atop: false,
         }
     }
 }
@@ -197,6 +249,7 @@ impl Default for Flags {
             anti_alias: true,
             draft: false,
             text_outline: false,
+            atop: false,
         }
     }
 }
@@ -295,7 +348,7 @@ pub fn render_page_cancellable(
 /// (#2389). A zoom on a large drawing showed the last picture scaled,
 /// blurry, until the whole new one was ready: the canvas now lays each
 /// band over it as it comes, sharp where it is done, the middle of the
-/// window first, as CorelDRAW fills its window in while it draws. The
+/// window first. The
 /// bands are a few times as many as the cores, so the first comes in a
 /// fraction of the time; each is drawn with the rows of margin shadow
 /// blurs need. Drawn whole (no bands handed over) where bands cannot be
@@ -332,6 +385,9 @@ pub fn render_page_progressive(
     };
     let middle = |b: &(u32, u32, u32, u32)| (b.0 + b.1) / 2;
     bands.sort_by_key(|b| middle(b).abs_diff(first));
+    // Every band's culling asks every object's box: work the boxes out
+    // once here instead of once per band (#3559).
+    let boxes = page_bounds_cache(doc, page);
     let next = AtomicUsize::new(0);
     let done: std::sync::Mutex<Vec<(u32, Pixmap)>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|sc| {
@@ -347,7 +403,8 @@ pub fn render_page_progressive(
                 let mut o = opts.clone();
                 o.height = ry1 - ry0;
                 o.view.origin_y = opts.view.origin_y - ry0 as f64;
-                let Some(part) = render_page_whole(doc, page, &o, Some(cancel)) else {
+                let Some(part) = render_page_whole_in(doc, page, &o, Some(cancel), Some(&boxes))
+                else {
                     return;
                 };
                 if cancelled() {
@@ -507,6 +564,55 @@ fn snap_upright(m: [f64; 6], w: u32, h: u32) -> Option<([f64; 6], Option<tiny_sk
     Some(([a, 0.0, 0.0, d, e, f], area))
 }
 
+/// The Blend If ranges `shape` is drawn with (its own lightness, what
+/// lies beneath), when it has the effect and it hides anything.
+fn blend_if(shape: &Shape) -> Option<([f64; 4], [f64; 4])> {
+    shape.effects.iter().find_map(|e| match e {
+        tracedraw_core::live::Effect::BlendIf { this, below }
+            if *this != tracedraw_core::live::BLEND_IF_ALL
+                || *below != tracedraw_core::live::BLEND_IF_ALL =>
+        {
+            Some((*this, *below))
+        }
+        _ => None,
+    })
+}
+
+/// How a Displace effect of `shape` shades it from the photo beneath:
+/// the shading, its strength and the photo's middle grey, when it does
+/// (#3595).
+fn surface_shading(
+    shape: &Shape,
+) -> Option<(tracedraw_core::live::SurfaceShade, f64, f64)> {
+    use tracedraw_core::live::{Effect, SurfaceShade};
+    shape.effects.iter().find_map(|e| match e {
+        Effect::Displace {
+            map,
+            shade,
+            strength,
+            ..
+        } if *shade != SurfaceShade::None && *strength > 0.0 => {
+            Some((*shade, *strength, map.as_ref().map_or(0.5, |m| m.mean)))
+        }
+        _ => None,
+    })
+}
+
+/// The first Halftone effect of `shape`, when it has one switched on.
+fn halftone_of(shape: &Shape) -> Option<tracedraw_core::live::Effect> {
+    shape
+        .effects
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                tracedraw_core::live::Effect::Halftone { size, .. }
+                    if size.is_finite() && *size > 0.0
+            )
+        })
+        .cloned()
+}
+
 /// The radius (mm) of the Gaussian blur `shape` is drawn with, when it
 /// has one switched on (#1141).
 fn gaussian_blur(shape: &Shape) -> Option<f64> {
@@ -515,6 +621,17 @@ fn gaussian_blur(shape: &Shape) -> Option<f64> {
             if radius.is_finite() && *radius > 0.0 =>
         {
             Some(*radius)
+        }
+        _ => None,
+    })
+}
+
+/// The width (mm) over which `shape` fades out towards its edge, when it
+/// has a Feather effect.
+fn feather(shape: &Shape) -> Option<f64> {
+    shape.effects.iter().find_map(|e| match e {
+        tracedraw_core::live::Effect::Feather { radius } if radius.is_finite() && *radius > 0.0 => {
+            Some(radius.min(1000.0))
         }
         _ => None,
     })
@@ -534,6 +651,8 @@ fn reach_walk(s: &Shape, lens: &mut bool, blur: &mut f64) {
         let r = match e {
             Effect::OuterShadow { offset, blur, .. } => blur.abs() + offset.hypot(),
             Effect::Glow { blur, .. } | Effect::GaussianBlur { radius: blur } => blur.abs(),
+            // Whole dots reach half a cell past the edge.
+            Effect::Halftone { size, .. } => size.abs(),
             _ => 0.0,
         };
         if r.is_finite() {
@@ -603,6 +722,9 @@ fn render_page_in_bands(
         return None;
     }
     let bands = band_layout(h, cores, blur_margin(blur_mm, opts.view.zoom))?;
+    // Every band's culling asks every object's box: work the boxes out
+    // once here instead of once per band (#3559).
+    let boxes = page_bounds_cache(doc, page);
     let parts: Vec<Option<Pixmap>> = std::thread::scope(|sc| {
         let handles: Vec<_> = bands
             .iter()
@@ -610,7 +732,8 @@ fn render_page_in_bands(
                 let mut o = opts.clone();
                 o.height = ry1 - ry0;
                 o.view.origin_y = opts.view.origin_y - ry0 as f64;
-                sc.spawn(move || render_page_whole(doc, page, &o, cancel))
+                let boxes = &boxes;
+                sc.spawn(move || render_page_whole_in(doc, page, &o, cancel, Some(boxes)))
             })
             .collect();
         handles
@@ -690,6 +813,18 @@ fn render_page_whole(
     opts: &RenderOptions,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Pixmap> {
+    render_page_whole_in(doc, page, opts, cancel, None)
+}
+
+/// [`render_page_whole`] with the page's object boxes already worked
+/// out (`bounds`), shared by the bands of one render (#3559).
+fn render_page_whole_in(
+    doc: &Document,
+    page: PageId,
+    opts: &RenderOptions,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    bounds: Option<&PageBounds>,
+) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(opts.width.max(1), opts.height.max(1))?;
     let page = doc.page(page).ok()?;
     let screen = opts.view.affine();
@@ -702,6 +837,7 @@ fn render_page_whole(
         flags,
         symbols: &doc.symbols,
         preview: opts.preview.as_ref(),
+        bounds,
         origin: (0, 0),
         cancel,
     };
@@ -820,6 +956,11 @@ struct Renderer<'a> {
     /// Objects drawn displaced (the live drag preview), on a layer or
     /// inside a group or a clip frame.
     preview: Option<&'a Preview>,
+    /// The page-space box of every object of the page, worked out once
+    /// for a render in bands ([`page_bounds_cache`]): each band's
+    /// culling asks every object's box, and without it all bands paid
+    /// that walk again (#3559). `None` on single-pass renders.
+    bounds: Option<&'a PageBounds>,
     /// Where `pixmap` lies on the target it is laid on, in pixels: a
     /// semi-transparent object's layer covers only what it reaches, and
     /// pattern tiles stay where they fall on the target (#1335).
@@ -842,6 +983,7 @@ impl Renderer<'_> {
             flags: self.flags,
             symbols: self.symbols,
             preview: self.preview,
+            bounds: self.bounds,
             origin: self.origin,
             cancel: self.cancel,
         }
@@ -889,7 +1031,7 @@ impl Renderer<'_> {
             }
             _ => {}
         }
-        let Some(b) = Self::reach(shape, parent) else {
+        let Some(b) = Self::reach(shape, parent, self.bounds) else {
             return false;
         };
         b.x1 < visible.x0 || b.x0 > visible.x1 || b.y1 < visible.y0 || b.y0 > visible.y1
@@ -919,12 +1061,14 @@ impl Renderer<'_> {
     /// Where a plain object (no group or clip frame) inside `parent` can
     /// paint, page mm: its bounds grown by what its outline may reach.
     /// `None` when its bounds are not finite. Effects, shadows, symbols
-    /// and the drag preview reach further; callers leave those out.
-    fn reach(shape: &Shape, parent: Affine) -> Option<Rect> {
-        let b = if parent == Affine::IDENTITY {
-            shape.bounds()
-        } else {
-            parent.transform_rect_bbox(shape.bounds())
+    /// and the drag preview reach further; callers leave those out. The
+    /// box comes from the render's shared [`PageBounds`] when there is
+    /// one (#3559).
+    fn reach(shape: &Shape, parent: Affine, cached: Option<&PageBounds>) -> Option<Rect> {
+        let b = match cached.and_then(|c| c.get(&shape.id)) {
+            Some(b) => *b,
+            None if parent == Affine::IDENTITY => shape.bounds(),
+            None => parent.transform_rect_bbox(shape.bounds()),
         };
         if !b.x0.is_finite() || !b.y0.is_finite() || !b.x1.is_finite() || !b.y1.is_finite() {
             return None;
@@ -979,7 +1123,7 @@ impl Renderer<'_> {
         {
             return whole;
         }
-        let Some(page) = Self::reach(shape, parent) else {
+        let Some(page) = Self::reach(shape, parent, self.bounds) else {
             return whole;
         };
         let r = self.screen.transform_rect_bbox(page).inflate(grow, grow);
@@ -988,6 +1132,57 @@ impl Renderer<'_> {
         let (x0, y0) = (clamp(r.x0.floor() - 1.0, w), clamp(r.y0.floor() - 1.0, h));
         let (x1, y1) = (clamp(r.x1.ceil() + 1.0, w), clamp(r.y1.ceil() + 1.0, h));
         (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+    }
+
+    /// A group with a look (see `GroupLook`): its members drawn into a
+    /// layer of their own (each hiding what it covers of the ones before
+    /// it with a knockout), the layer then laid down with the group's
+    /// `opacity`.
+    fn draw_group_on_its_own(
+        &mut self,
+        children: &[Shape],
+        look: tracedraw_core::document::GroupLook,
+        transform: Affine,
+        opacity: f64,
+    ) {
+        let (w, h) = (self.pixmap.width(), self.pixmap.height());
+        let Some(mut layer) = Pixmap::new(w, h) else {
+            return;
+        };
+        let sight = self.sight();
+        for c in children {
+            if sight.is_some_and(|v| self.out_of_sight_in(c, transform, &v)) {
+                continue;
+            }
+            let t = self.child_transform(c, transform);
+            if !look.knockout {
+                let mut sub = self.sub(&mut layer);
+                sub.draw_shape(c, t);
+                continue;
+            }
+            // The member as it paints, and where it lies: drawn solid, its
+            // coverage hides what came before, see-through or not.
+            let (Some(mut paint), Some(mut cover)) = (Pixmap::new(w, h), Pixmap::new(w, h)) else {
+                continue;
+            };
+            {
+                let mut sub = self.sub(&mut paint);
+                sub.draw_shape(c, t);
+            }
+            {
+                let mut solid = c.clone();
+                solid.opacity = 1.0;
+                let mut sub = self.sub(&mut cover);
+                sub.draw_shape(&solid, t);
+            }
+            knock_out(&mut layer, &paint, &cover);
+        }
+        let pp = tiny_skia::PixmapPaint {
+            opacity: opacity.clamp(0.0, 1.0) as f32,
+            ..Default::default()
+        };
+        self.pixmap
+            .draw_pixmap(0, 0, layer.as_ref(), &pp, Transform::identity(), None);
     }
 
     fn child_transform(&self, child: &Shape, transform: Affine) -> Affine {
@@ -1020,6 +1215,17 @@ impl Renderer<'_> {
         }
         if !shape.visible {
             return;
+        }
+        // Halftone: the object as drawn with all its other effects, on a
+        // layer of its own, turned into dots.
+        if self.flags.complex_effects && !self.flags.wireframe {
+            if let Some(ht) = halftone_of(shape) {
+                let mut plain = shape.clone();
+                plain
+                    .effects
+                    .retain(|e| !matches!(e, tracedraw_core::live::Effect::Halftone { .. }));
+                return self.draw_halftoned(&plain, parent, &ht);
+            }
         }
         // Character backgrounds go under the text, in its transform.
         if matches!(shape.kind, ShapeKind::Text { .. }) && !self.flags.wireframe {
@@ -1104,10 +1310,20 @@ impl Renderer<'_> {
                         self.draw_shape(&part, parent);
                     }
                 }
+            } else if let Some((this, below)) = blend_if(shape) {
+                // Blend If: the object shown by its own lightness and
+                // that of what lies beneath it.
+                self.draw_blend_if(&main, parent, &this, &below);
+            } else if let Some((shade, strength, mean)) = surface_shading(shape) {
+                // Displace's shading: the photo's shadows and highlights
+                // taken onto the object (#3595).
+                self.draw_surface_shaded(&main, parent, shade, strength, mean);
             } else if let Some(radius) = gaussian_blur(shape) {
                 // Gaussian blur (#1141): the object drawn on its own
                 // and blurred.
                 self.draw_blurred(&main, parent, radius);
+            } else if let Some(radius) = feather(shape) {
+                self.draw_feathered(&main, parent, radius);
             } else {
                 self.draw_shape(&main, parent);
             }
@@ -1125,12 +1341,14 @@ impl Renderer<'_> {
                             opacity,
                             blur,
                             merge,
+                            spread,
                         } => InnerShadow {
                             offset: *offset,
                             color: *color,
                             opacity: *opacity,
                             blur: *blur,
                             merge: *merge,
+                            spread: *spread,
                         },
                         tracedraw_core::live::Effect::Glow {
                             inner: true,
@@ -1144,6 +1362,7 @@ impl Renderer<'_> {
                             opacity: *opacity,
                             blur: *blur,
                             merge: *merge,
+                            spread: 0.0,
                         },
                         _ => continue,
                     };
@@ -1186,6 +1405,17 @@ impl Renderer<'_> {
         {
             if let Some(sh) = shape.shadow.as_ref().filter(|sh| sh.opacity > 0.0) {
                 self.draw_group_shadow(sh, shape, parent);
+            }
+        }
+        if let (ShapeKind::Group { children }, Some(look)) = (&shape.kind, shape.group_look) {
+            // A group drawn on its own first, then laid down as one
+            // picture (its transparency on the whole), its members
+            // hiding the ones beneath them with a knockout.
+            if !look.is_plain() && !self.flags.wireframe {
+                if shape.opacity > 0.0 {
+                    self.draw_group_on_its_own(children, look, transform, shape.opacity);
+                }
+                return;
             }
         }
         if let ShapeKind::Group { children } = &shape.kind {
@@ -1616,6 +1846,33 @@ impl Renderer<'_> {
             } else {
                 1.0
             };
+            if let Some(pieces) = (!self.flags.wireframe)
+                .then(|| {
+                    tracedraw_core::shaping::along_slices(
+                        &page_path,
+                        stroke,
+                        stroke.width * object_scale,
+                    )
+                })
+                .flatten()
+            {
+                // A gradient along the line: each piece in its colour.
+                for (piece, color, alpha) in pieces {
+                    let Some(pp) = to_sk_path(&(self.screen * piece)) else {
+                        continue;
+                    };
+                    let [r, g, b] = color.to_rgb8();
+                    paint.set_color_rgba8(r, g, b, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8);
+                    self.pixmap.fill_path(
+                        &pp,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+                return;
+            }
             if let Some(band) =
                 tracedraw_core::shaping::outline_band(&page_path, stroke, object_scale)
             {
@@ -1940,7 +2197,7 @@ impl Renderer<'_> {
         rule: FillRule,
     ) {
         let b = page_path.bounding_box();
-        let extent = Self::reach(shape, parent).map_or(b, |r| r.union(b));
+        let extent = Self::reach(shape, parent, self.bounds).map_or(b, |r| r.union(b));
         let object = parent * shape.transform;
         let Some((layer_at, mut layer, screen)) = self.shadow_target_over(sh, b, extent) else {
             return;
@@ -2145,6 +2402,14 @@ impl Renderer<'_> {
         };
         let [cr, cg, cb] = ish.color.to_rgb8();
         let alpha = layer_alpha_sampler(&layer, k, pad);
+        // Spread chokes the feathered edge: the shadow is solid over that
+        // share of it and fades over the rest.
+        let keep = 1.0
+            - if ish.spread.is_finite() {
+                ish.spread.clamp(0.0, 0.99)
+            } else {
+                0.0
+            };
         let data = mask.data();
         for (n, px) in out.pixels_mut().iter_mut().enumerate() {
             let m = data[n];
@@ -2152,11 +2417,52 @@ impl Renderer<'_> {
                 continue;
             }
             let (x, y) = ((n as u32) % ow, (n as u32) / ow);
-            let a = alpha(x, y) / 255.0 * f64::from(m) / 255.0 * opacity;
+            let cast = (alpha(x, y) / 255.0 / keep).min(1.0);
+            let cover = if self.flags.atop {
+                1.0
+            } else {
+                f64::from(m) / 255.0
+            };
+            let a = cast * cover * opacity;
             *px =
                 tiny_skia::ColorU8::from_rgba(cr, cg, cb, (a * 255.0).round() as u8).premultiply();
         }
+        if !self.flags.atop {
+            composite_layer(self.pixmap, &out, (x0 as i32, y0 as i32), ish.merge);
+            return;
+        }
+        // Each pixel keeps the coverage it had: the shadow lands on the
+        // object only.
+        let pw = self.pixmap.width() as usize;
+        let before: Vec<u8> = (y0..y1)
+            .flat_map(|y| {
+                let row = &self.pixmap.pixels()[y as usize * pw..];
+                (x0..x1).map(move |x| row[x as usize].alpha())
+            })
+            .collect();
         composite_layer(self.pixmap, &out, (x0 as i32, y0 as i32), ish.merge);
+        let pixels = self.pixmap.pixels_mut();
+        for (n, &was) in before.iter().enumerate() {
+            let (x, y) = (x0 as usize + n % ow as usize, y0 as usize + n / ow as usize);
+            let p = &mut pixels[y * pw + x];
+            let now = p.alpha();
+            if now == was {
+                continue;
+            }
+            let k = if now == 0 {
+                0.0
+            } else {
+                f32::from(was) / f32::from(now)
+            };
+            let c = |v: u8| ((f32::from(v) * k).round() as u8).min(was);
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(
+                c(p.red()),
+                c(p.green()),
+                c(p.blue()),
+                was,
+            )
+            .unwrap_or(*p);
+        }
     }
 
     /// The stacked outer shadows and outer glows of `shape` (#1141),
@@ -2238,6 +2544,268 @@ impl Renderer<'_> {
         if px > 0 {
             accel::box_blur(&mut layer, px, 3);
         }
+        composite_layer(
+            self.pixmap,
+            &layer,
+            (x as i32, y as i32),
+            tracedraw_core::live::MergeMode::Normal,
+        );
+    }
+
+    /// Feather: the object drawn on its own and faded out towards its
+    /// edge over `radius` mm: its pixels kept as much as a mask of its
+    /// outline, shrunk by half the radius and blurred, covers them. An
+    /// object with no fill, or too thin for the shrunk outline, is drawn
+    /// as it is.
+    fn draw_feathered(&mut self, shape: &Shape, parent: Affine, radius: f64) {
+        use tracedraw_core::shaping::{offset_smooth, Join};
+        if matches!(shape.fill, tracedraw_core::Fill::None) {
+            self.draw_shape(shape, parent);
+            return;
+        }
+        let (x, y, w, h) = self.layer_area(shape, parent);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let inset = offset_smooth(
+            &(parent * shape.page_path()),
+            -radius / 2.0,
+            0.0,
+            Join::Round,
+            shape.fill_rule,
+        );
+        let to_layer = Affine::translate((-f64::from(x), -f64::from(y))) * self.screen;
+        let sk = if inset.elements().is_empty() {
+            None
+        } else {
+            to_sk_path(&(to_layer * inset))
+        };
+        note_scratch(w, h);
+        let (Some(sk), Some(mut layer), Some(mut mask)) = (sk, Pixmap::new(w, h), Pixmap::new(w, h))
+        else {
+            self.draw_shape(shape, parent);
+            return;
+        };
+        {
+            let mut sub = self.sub(&mut layer);
+            sub.screen = to_layer;
+            sub.origin = (self.origin.0 + x as i32, self.origin.1 + y as i32);
+            sub.draw_shape(shape, parent);
+        }
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(0, 0, 0, 255);
+        paint.anti_alias = self.flags.anti_alias;
+        mask.fill_path(&sk, &paint, FillRule::Winding, Transform::identity(), None);
+        let px = (radius * self.zoom / 6.0).round().clamp(0.0, 64.0) as i32;
+        if px > 0 {
+            accel::box_blur(&mut mask, px, 3);
+        }
+        for (d, m) in layer.data_mut().chunks_exact_mut(4).zip(mask.data().chunks_exact(4)) {
+            let a = u16::from(m[3]);
+            for c in d.iter_mut() {
+                *c = ((u16::from(*c) * a + 127) / 255) as u8;
+            }
+        }
+        composite_layer(
+            self.pixmap,
+            &layer,
+            (x as i32, y as i32),
+            tracedraw_core::live::MergeMode::Normal,
+        );
+    }
+
+    /// Blend If: the object drawn on a layer of its own, each pixel kept
+    /// as much as its lightness falls in `this` and the lightness of the
+    /// target beneath it (over white paper where nothing is drawn yet)
+    /// falls in `below`, then laid over the target.
+    fn draw_blend_if(&mut self, shape: &Shape, parent: Affine, this: &[f64; 4], below: &[f64; 4]) {
+        let (x, y, w, h) = self.layer_area_grown(shape, parent, 1.0);
+        if w == 0 || h == 0 {
+            return;
+        }
+        note_scratch(w, h);
+        let Some(mut layer) = Pixmap::new(w, h) else {
+            self.draw_shape(shape, parent);
+            return;
+        };
+        {
+            let mut sub = self.sub(&mut layer);
+            sub.screen = Affine::translate((-f64::from(x), -f64::from(y))) * self.screen;
+            sub.origin = (self.origin.0 + x as i32, self.origin.1 + y as i32);
+            sub.draw_shape(shape, parent);
+        }
+        let tw = self.pixmap.width() as usize;
+        let back = self.pixmap.pixels();
+        let (x0, y0) = (x as usize, y as usize);
+        let lw = w as usize;
+        for (i, px) in layer.pixels_mut().iter_mut().enumerate() {
+            let a = px.alpha();
+            if a == 0 {
+                continue;
+            }
+            let fa = f64::from(a);
+            let own = tracedraw_core::live::blend_if_lightness(
+                f64::from(px.red()) / fa,
+                f64::from(px.green()) / fa,
+                f64::from(px.blue()) / fa,
+            );
+            let (bx, by) = (x0 + i % lw, y0 + i / lw);
+            let under = back.get(by * tw + bx).map_or(1.0, |b| {
+                let paper = 255.0 - f64::from(b.alpha());
+                tracedraw_core::live::blend_if_lightness(
+                    (f64::from(b.red()) + paper) / 255.0,
+                    (f64::from(b.green()) + paper) / 255.0,
+                    (f64::from(b.blue()) + paper) / 255.0,
+                )
+            });
+            let k = tracedraw_core::live::blend_if_weight(this, own)
+                * tracedraw_core::live::blend_if_weight(below, under);
+            if k >= 1.0 {
+                continue;
+            }
+            let scale = |c: u8| (f64::from(c) * k).round().clamp(0.0, 255.0) as u8;
+            let (r, g, b, a) = (scale(px.red()), scale(px.green()), scale(px.blue()), scale(a));
+            *px = tiny_skia::PremultipliedColorU8::from_rgba(r.min(a), g.min(a), b.min(a), a)
+                .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        }
+        composite_layer(
+            self.pixmap,
+            &layer,
+            (x as i32, y as i32),
+            tracedraw_core::live::MergeMode::Normal,
+        );
+    }
+
+    /// Displace's shading (#3595): the object drawn on a layer of its own,
+    /// each pixel's colour multiplied down where the target beneath it
+    /// (over white paper) is darker than the photo's middle grey `mean`
+    /// and screened up where it is lighter, by `strength`, then laid over
+    /// the target.
+    fn draw_surface_shaded(
+        &mut self,
+        shape: &Shape,
+        parent: Affine,
+        shade: tracedraw_core::live::SurfaceShade,
+        strength: f64,
+        mean: f64,
+    ) {
+        let (x, y, w, h) = self.layer_area_grown(shape, parent, 1.0);
+        if w == 0 || h == 0 {
+            return;
+        }
+        note_scratch(w, h);
+        let Some(mut layer) = Pixmap::new(w, h) else {
+            self.draw_shape(shape, parent);
+            return;
+        };
+        {
+            let mut sub = self.sub(&mut layer);
+            sub.screen = Affine::translate((-f64::from(x), -f64::from(y))) * self.screen;
+            sub.origin = (self.origin.0 + x as i32, self.origin.1 + y as i32);
+            sub.draw_shape(shape, parent);
+        }
+        let tw = self.pixmap.width() as usize;
+        let back = self.pixmap.pixels();
+        let (x0, y0) = (x as usize, y as usize);
+        let lw = w as usize;
+        for (i, px) in layer.pixels_mut().iter_mut().enumerate() {
+            let a = px.alpha();
+            if a == 0 {
+                continue;
+            }
+            let (bx, by) = (x0 + i % lw, y0 + i / lw);
+            let Some(b) = back.get(by * tw + bx) else {
+                continue;
+            };
+            let paper = 255.0 - f64::from(b.alpha());
+            let under = tracedraw_core::live::blend_if_lightness(
+                (f64::from(b.red()) + paper) / 255.0,
+                (f64::from(b.green()) + paper) / 255.0,
+                (f64::from(b.blue()) + paper) / 255.0,
+            );
+            let (mul, scr) = tracedraw_core::live::surface_shade(shade, strength, mean, under);
+            if mul >= 1.0 && scr <= 0.0 {
+                continue;
+            }
+            // Premultiplied: c' = c * mul, then screened as a + (A - a) * scr.
+            let fa = f64::from(a);
+            let tone = |c: u8| {
+                let c = f64::from(c) * mul;
+                (c + (fa - c) * scr).round().clamp(0.0, fa) as u8
+            };
+            let (r, g, bl) = (tone(px.red()), tone(px.green()), tone(px.blue()));
+            *px = tiny_skia::PremultipliedColorU8::from_rgba(r, g, bl, a)
+                .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        }
+        composite_layer(
+            self.pixmap,
+            &layer,
+            (x as i32, y as i32),
+            tracedraw_core::live::MergeMode::Normal,
+        );
+    }
+
+    /// `shape` (its Halftone taken off) drawn on a layer of its own with
+    /// all it reaches (shadows, glows), and the layer turned into the
+    /// halftone `ht` before it goes onto the target.
+    fn draw_halftoned(&mut self, shape: &Shape, parent: Affine, ht: &tracedraw_core::live::Effect) {
+        let tracedraw_core::live::Effect::Halftone {
+            pattern,
+            mode,
+            size,
+            scale,
+            softness,
+            angle,
+            center_x,
+            center_y,
+            clip,
+            color,
+        } = ht
+        else {
+            return self.draw_shape(shape, parent);
+        };
+        let (mut lens, mut reach) = (false, 0.0);
+        reach_walk(shape, &mut lens, &mut reach);
+        let grow = ((reach + size.abs()) * self.zoom).ceil().clamp(0.0, 4096.0) + 2.0;
+        let (x, y, w, h) = self.layer_area_grown(shape, parent, grow);
+        if w == 0 || h == 0 {
+            return;
+        }
+        note_scratch(w, h);
+        let Some(mut layer) = Pixmap::new(w, h) else {
+            return self.draw_shape(shape, parent);
+        };
+        let to_layer = Affine::translate((-f64::from(x), -f64::from(y))) * self.screen;
+        {
+            let mut sub = self.sub(&mut layer);
+            sub.screen = to_layer;
+            sub.origin = (self.origin.0 + x as i32, self.origin.1 + y as i32);
+            sub.flags.atop = true;
+            sub.draw_shape(shape, parent);
+        }
+        // The screen's centre across the object's bounds, and its angle,
+        // both in the layer's pixels (y down there).
+        let b = (parent * shape.page_path()).bounding_box();
+        let c = to_layer
+            * tracedraw_core::geometry::Point::new(
+                b.x0 + center_x.clamp(0.0, 1.0) * b.width(),
+                b.y0 + center_y.clamp(0.0, 1.0) * b.height(),
+            );
+        let rgb = color.to_rgb8();
+        halftone::halftone(
+            &mut layer,
+            &halftone::Params {
+                pattern: *pattern,
+                mode: *mode,
+                cell: size * self.zoom,
+                scale: *scale,
+                softness: *softness,
+                angle: -angle.to_radians(),
+                origin: (c.x, c.y),
+                clip: *clip,
+                color: [rgb[0], rgb[1], rgb[2]],
+            },
+        );
         composite_layer(
             self.pixmap,
             &layer,
@@ -2690,6 +3258,44 @@ impl Renderer<'_> {
         composite_layer(self.pixmap, &layer, (ox as i32, oy as i32), merge);
     }
 
+    /// Dither the pixels the screen-space path `sk` covers: each colour
+    /// channel moved up or down by up to two levels, by an even pattern
+    /// fixed to the page (the same wherever the view is drawn in bands).
+    fn dither_area(&mut self, sk: &SkPath, rule: FillRule) {
+        let (w, h) = (self.pixmap.width(), self.pixmap.height());
+        let Some(mut mask) = tiny_skia::Mask::new(w, h) else {
+            return;
+        };
+        mask.fill_path(sk, rule, self.flags.anti_alias, Transform::identity());
+        let (ox, oy) = self.origin;
+        let m = mask.data();
+        let data = self.pixmap.data_mut();
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = y * w as usize + x;
+                let cover = m[i];
+                if cover == 0 {
+                    continue;
+                }
+                let d = &mut data[i * 4..i * 4 + 4];
+                let a = i32::from(d[3]);
+                if a == 0 {
+                    continue;
+                }
+                // A hash of the page pixel: an even noise from -2 to 2.
+                let (px, py) = ((x as i32 + ox) as u32, (y as i32 + oy) as u32);
+                let mut z = px.wrapping_mul(0x8DA6_B343) ^ py.wrapping_mul(0xD816_3841);
+                z ^= z >> 13;
+                z = z.wrapping_mul(0x9E37_79B1);
+                z ^= z >> 16;
+                let n = ((z & 0xFF) as i32 - 128) * 2 * i32::from(cover) / (128 * 255);
+                for c in d.iter_mut().take(3) {
+                    *c = (i32::from(*c) + n).clamp(0, a) as u8;
+                }
+            }
+        }
+    }
+
     /// Fill a screen-space path with any fill type.
     fn draw_fill(&mut self, fill: &Fill, page_path: &BezPath, sk: &SkPath, rule: FillRule) {
         self.draw_fill_blended(fill, page_path, sk, rule, tiny_skia::BlendMode::SourceOver);
@@ -2721,6 +3327,17 @@ impl Renderer<'_> {
         blend: tiny_skia::BlendMode,
         object: Affine,
     ) {
+        // A dithered fountain: drawn as it is, then a faint even noise
+        // over what it covers, so close colours show no steps.
+        if let Fill::Fountain(f) = fill {
+            if f.dither {
+                let mut plain = f.clone();
+                plain.dither = false;
+                self.draw_fill_of(&Fill::Fountain(plain), page_path, sk, rule, blend, object);
+                self.dither_area(sk, rule);
+                return;
+            }
+        }
         if blend != tiny_skia::BlendMode::SourceOver && !matches!(fill, Fill::Solid(_)) {
             let (w, h) = (self.pixmap.width(), self.pixmap.height());
             let Some(mut layer) = Pixmap::new(w, h) else {
@@ -2817,6 +3434,15 @@ impl Renderer<'_> {
                     tracedraw_core::FountainKind::Shaped => {
                         self.fill_shaped(f, sk, sk, rule);
                     }
+                    tracedraw_core::FountainKind::Points => {
+                        let f2 = f.clone();
+                        let places = f.point_places();
+                        let key = format!("{f:?}");
+                        self.fill_procedural(page_path, sk, rule, &key, move |u, v| {
+                            let p = Point::new(b.x0 + u * b.width(), b.y0 + v * b.height());
+                            f2.points_sample(&places, b, p)
+                        });
+                    }
                     tracedraw_core::FountainKind::Linear => {
                         let a = f.angle.to_radians();
                         let (cx, cy) = (b.center().x, b.center().y);
@@ -2897,6 +3523,12 @@ impl Renderer<'_> {
                 self.fill_procedural(page_path, sk, rule, &key, move |u, v| {
                     let x = u * b.width() / t2.scale.max(0.1);
                     let y = v * b.height() / t2.scale.max(0.1);
+                    if t2.kind.is_holographic() {
+                        let f = |c: [u8; 3]| c.map(|v| v as f32 / 255.0);
+                        let glitter = t2.kind == tracedraw_core::TextureKind::HoloGlitter;
+                        let [r, g, bl] = holo_color(x, y, t2.seed, glitter, f(ca), f(cb));
+                        return (Color::Rgb { r, g, b: bl }, 1.0);
+                    }
                     let n = texture_value(t2.kind, x, y, t2.seed) as f32;
                     let l = |x: u8, y: u8| {
                         (x as f32 + (y as f32 - x as f32) * n)
@@ -3506,6 +4138,7 @@ impl Renderer<'_> {
                 },
                 symbols: self.symbols,
                 preview: None,
+                bounds: None,
                 origin: (0, 0),
                 cancel: None,
             };
@@ -3666,6 +4299,8 @@ struct InnerShadow {
     opacity: f64,
     blur: f64,
     merge: tracedraw_core::live::MergeMode,
+    /// 0..1, see `Effect::InnerShadow`.
+    spread: f64,
 }
 
 /// An object as its shadow sees it: `shape`, its outline `path` on the
@@ -3826,7 +4461,7 @@ fn cast_boxes(shape: &Shape, parent: Affine) -> Option<(Rect, Rect)> {
     let extent = match shape.kind {
         ShapeKind::Group { .. } | ShapeKind::ClipFrame { .. } => extent,
         _ if shape.stroke.is_none() => extent,
-        _ => Renderer::reach(shape, parent).map_or(extent, |r| r.union(extent)),
+        _ => Renderer::reach(shape, parent, None).map_or(extent, |r| r.union(extent)),
     };
     (b.width().is_finite() && b.height().is_finite()).then_some((b, extent))
 }
@@ -5199,7 +5834,114 @@ pub fn texture_value(kind: tracedraw_core::TextureKind, x: f64, y: f64, seed: u3
             let r = ((x - 0.5).powi(2) + (y * 0.2).powi(2)).sqrt() * 6.0 + fbm(x, y, seed) * 1.5;
             r.fract()
         }
+        tracedraw_core::TextureKind::Holographic | tracedraw_core::TextureKind::HoloGlitter => {
+            holo_field(x, y, seed).shade as f64
+        }
     }
+}
+
+/// The numbers of the holographic texture at one point (feature units):
+/// how light the foil is there (0 colour A, 1 colour B), the phase of
+/// the rainbow and how strongly it shows.
+struct HoloField {
+    shade: f32,
+    phase: f32,
+    strength: f32,
+}
+
+fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn holo_field(x: f64, y: f64, seed: u32) -> HoloField {
+    // The coordinates bent by two slow noise fields, so the bands flow
+    // in curls as a film of oil does.
+    let wx = fbm(x * 0.7 + 5.2, y * 0.7 + 1.3, seed);
+    let wy = fbm(x * 0.7 + 9.1, y * 0.7 + 4.7, seed ^ 0x51ED);
+    let (px, py) = (x + 1.8 * wx, y + 1.8 * wy);
+    // The film's thickness sets the colour; a slight slope across the
+    // object adds the long sweep of a foil lit from one side.
+    let film = fbm(px * 0.9, py * 0.9, seed ^ 0xA3C5);
+    let phase = film * 1.8 + x * 0.06 + y * 0.04;
+    // Broad light and dark patches, as the foil catches the light.
+    let sheen = fbm(px * 0.45 + 3.3, py * 0.45 + 7.7, seed ^ 0x7719);
+    let shade = smoothstep(0.32, 0.66, sheen);
+    // The rainbow shows most in the half tones, less in the brightest
+    // highlights and the deepest shadows.
+    let strength = 0.15 + 0.85 * (1.0 - (2.0 * shade - 1.0).abs()).powf(0.6);
+    HoloField {
+        shade: shade as f32,
+        phase: phase as f32,
+        strength: strength as f32,
+    }
+}
+
+/// A colour of the spectrum at `phase` (one turn per unit) as a thin
+/// film shows it: three cosines a little apart, so the turn runs through
+/// gold, magenta, deep blue and cyan more than through green.
+fn spectrum(phase: f32) -> [f32; 3] {
+    let t = std::f32::consts::TAU * phase;
+    [
+        0.5 + 0.5 * t.cos(),
+        0.5 + 0.5 * (t - 0.9).cos(),
+        0.5 + 0.5 * (t - 2.2).cos(),
+    ]
+}
+
+fn grain_hash(ix: i64, iy: i64, seed: u32, k: u64) -> f32 {
+    let mut h = (ix as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (iy as u64).wrapping_mul(0xC2B2AE3D27D4EB4F)
+        ^ ((seed as u64) << 8 | k).wrapping_mul(0x165667B19E3779F9);
+    h ^= h >> 31;
+    h = h.wrapping_mul(0xD6E8FEB86659FD93);
+    h ^= h >> 32;
+    (h & 0xFFFF) as f32 / 65535.0
+}
+
+/// The colour (RGB, 0 to 1) of a holographic texture at `x`, `y`
+/// (feature units, as [`texture_value`]): the foil from `dark` to
+/// `light`, the spectrum laid over it, and with `glitter` fine grains
+/// of spectral colour sparkling on top. The same numbers always give
+/// the same colour: the look is fixed, not tied to a viewing angle.
+pub fn holo_color(
+    x: f64,
+    y: f64,
+    seed: u32,
+    glitter: bool,
+    dark: [f32; 3],
+    light: [f32; 3],
+) -> [f32; 3] {
+    let f = holo_field(x, y, seed);
+    let spec = spectrum(f.phase);
+    // The rainbow is as bright as the foil under it: dim and deep in the
+    // dark patches, pale in the light ones.
+    let lum = 0.3 + 0.7 * f.shade;
+    let k = 0.85 * f.strength;
+    let mut c = [0.0f32; 3];
+    for i in 0..3 {
+        let base = dark[i] + (light[i] - dark[i]) * f.shade;
+        let tint = lum * (0.1 + spec[i].powf(1.4));
+        c[i] = base + (tint - base) * k;
+    }
+    if glitter {
+        // Square grains, 80 to a feature, about a quarter of them lit.
+        // Each catches the light in a hue near the film's there and is
+        // brighter or darker than it, so the grain sparkles where the
+        // rainbow shows and fades in the plain patches.
+        let (gx, gy) = ((x * 80.0).floor() as i64, (y * 80.0).floor() as i64);
+        if grain_hash(gx, gy, seed, 1) < 0.25 {
+            let g = spectrum(f.phase + 0.35 * (grain_hash(gx, gy, seed, 2) - 0.5));
+            let up = grain_hash(gx, gy, seed, 3);
+            let a = f.strength * (0.3 + 0.6 * grain_hash(gx, gy, seed, 4));
+            let lift = if up < 0.6 { 1.1 } else { 0.45 };
+            for i in 0..3 {
+                let target = (0.25 + 0.75 * g[i]) * lift;
+                c[i] += (target - c[i]) * a;
+            }
+        }
+    }
+    c.map(|v| v.clamp(0.0, 1.0))
 }
 
 fn bbox(p: &BezPath) -> Rect {
@@ -5449,6 +6191,34 @@ fn clip_segment(a: Point, b: Point, m: f64) -> Option<(Point, Point, bool, bool)
 /// Rasterise a fill over `bounds` (page mm) at `dpi`, y up mapped to image
 /// rows top-down. Used by exporters that have no native pattern or
 /// texture support (PDF, SVG fallback).
+/// `paint` laid into `layer` where `cover` lies, hiding what `layer` held
+/// there: the layer keeps `1 - cover` of itself under the paint
+/// (premultiplied pixels of the same size).
+fn knock_out(layer: &mut Pixmap, paint: &Pixmap, cover: &Pixmap) {
+    for ((d, s), k) in layer
+        .pixels_mut()
+        .iter_mut()
+        .zip(paint.pixels())
+        .zip(cover.pixels())
+    {
+        let ka = u32::from(k.alpha());
+        if ka == 0 {
+            continue;
+        }
+        let keep = 255 - ka;
+        let mix = |dv: u8, sv: u8| (u32::from(sv) + (u32::from(dv) * keep + 127) / 255).min(255) as u8;
+        let a = mix(d.alpha(), s.alpha());
+        let (r, g, b) = (
+            mix(d.red(), s.red()).min(a),
+            mix(d.green(), s.green()).min(a),
+            mix(d.blue(), s.blue()).min(a),
+        );
+        if let Some(c) = tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, a) {
+            *d = c;
+        }
+    }
+}
+
 pub fn render_fill_image(fill: &Fill, bounds: Rect, dpi: f64) -> Option<Pixmap> {
     let zoom = dpi / 25.4;
     let w = (bounds.width() * zoom).ceil().max(1.0) as u32;
@@ -5473,6 +6243,7 @@ pub fn render_fill_image(fill: &Fill, bounds: Rect, dpi: f64) -> Option<Pixmap> 
         flags: Flags::default(),
         symbols: &[],
         preview: None,
+        bounds: None,
         origin: (0, 0),
         cancel: None,
     };
@@ -5516,6 +6287,7 @@ pub fn render_fill_image_in(fill: &Fill, path: &BezPath, dpi: f64) -> Option<Pix
         flags: Flags::default(),
         symbols: &[],
         preview: None,
+        bounds: None,
         origin: (0, 0),
         cancel: None,
     };
@@ -5558,6 +6330,7 @@ pub fn render_pattern_cell(p: &tracedraw_core::Pattern, dpi: f64) -> Option<(Pix
         flags: Flags::default(),
         symbols: &[],
         preview: None,
+        bounds: None,
         origin: (0, 0),
         cancel: None,
     };
@@ -6393,6 +7166,80 @@ mod tests {
         s
     }
 
+    /// The drag preview answers membership once per object drawn: a Vec
+    /// there made a drag of a large selection quadratic in the number of
+    /// objects on the page. Run with `cargo test --release -p
+    /// tracedraw-render -- --ignored preview_membership --nocapture`
+    /// (#3559, step 5).
+    #[test]
+    #[ignore]
+    fn preview_membership_cost_on_a_large_drawing() {
+        let n = 8000u64;
+        let shapes: Vec<Shape> = (0..n)
+            .map(|i| {
+                let (x, y) = ((i % 100) as f64 * 12.0, (i / 100) as f64 * 12.0);
+                rect(i + 100, Rect::new(x, y, x + 10.0, y + 10.0), Color::rgb8(255, 0, 0))
+            })
+            .collect();
+        let (doc, page) = doc_with(shapes);
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            view: ViewTransform {
+                zoom: 1.0,
+                origin_x: 0.0,
+                origin_y: 64.0,
+                stretch_y: 1.0,
+            },
+            preview: Some(Preview {
+                shapes: (100..100 + n).map(tracedraw_core::ShapeId).collect(),
+                transform: Affine::translate((0.0, 1.0)),
+            }),
+            ..RenderOptions::default()
+        };
+        let t = std::time::Instant::now();
+        let pm = render_page(&doc, page, &opts).unwrap();
+        let elapsed = t.elapsed();
+        assert_eq!(pm.width(), 64);
+        eprintln!("render with a preview of {n} objects: {elapsed:?}");
+    }
+
+    /// A render in bands asks every object's box once for all bands
+    /// together, not once per band (#3559). Run with `cargo test
+    /// --release -p tracedraw-render --lib -- --ignored banded_render
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn banded_render_asks_boxes_once() {
+        let n = 8000u64;
+        let shapes: Vec<Shape> = (0..n)
+            .map(|i| {
+                let (x, y) = ((i % 100) as f64 * 12.0, (i / 100) as f64 * 12.0);
+                rect(i + 100, Rect::new(x, y, x + 10.0, y + 10.0), Color::rgb8(255, 0, 0))
+            })
+            .collect();
+        let (doc, page) = doc_with(shapes);
+        let opts = RenderOptions {
+            width: 1600,
+            height: 1600,
+            view: ViewTransform {
+                zoom: 1.5,
+                origin_x: 0.0,
+                origin_y: 2400.0,
+                stretch_y: 1.0,
+            },
+            ..RenderOptions::default()
+        };
+        // A warm-up, then the measured run.
+        let pm = render_page(&doc, page, &opts).expect("render");
+        assert_eq!(pm.width(), 1600);
+        let t = std::time::Instant::now();
+        let pm = render_page(&doc, page, &opts).expect("render");
+        let elapsed = t.elapsed();
+        assert_eq!(pm.width(), 1600);
+        eprintln!("banded render of {n} objects: {elapsed:?}");
+    }
+
     /// A semi-transparent object draws into a layer only as large as
     /// what it can reach (#1335), and the page comes out as with a layer
     /// the size of the window: plain, outlined with arrowheads, with a
@@ -6508,6 +7355,7 @@ mod tests {
                     flags: Flags::from_options(&opts),
                     symbols: &[],
                     preview: None,
+                    bounds: None,
                     origin: (0, 0),
                     cancel: None,
                 };
@@ -6528,6 +7376,7 @@ mod tests {
                 flags: Flags::from_options(&opts),
                 symbols: &[],
                 preview: None,
+                bounds: None,
                 origin: (0, 0),
                 cancel: None,
             }
@@ -6647,6 +7496,39 @@ mod tests {
         assert_eq!(px(&pm, 50, 89), (0, 255, 0));
         // Just outside it, the black one shows.
         assert_eq!(px(&pm, 50, 91), (0, 0, 0));
+    }
+
+    /// A further fill with a look of its own: grown and moved, it paints
+    /// beside the first fill, which stays where it is.
+    #[test]
+    fn a_further_fill_draws_with_its_own_look() {
+        let mut r = rect(1, Rect::new(10.0, 40.0, 30.0, 60.0), Color::rgb8(255, 0, 0));
+        r.stroke = None;
+        r.extra_fills = vec![Fill::Solid(Color::rgb8(0, 0, 255))];
+        r.fill_looks = Some(Box::new(vec![tracedraw_core::document::FillLook {
+            grow: 5.0,
+            move_x: 50.0,
+            move_y: 0.0,
+            blur: 0.0,
+        }]));
+        let (doc, page) = doc_with(vec![r]);
+        let opts = RenderOptions {
+            width: 100,
+            height: 100,
+            view: ViewTransform {
+                zoom: 1.0,
+                origin_x: 0.0,
+                origin_y: 100.0,
+                stretch_y: 1.0,
+            },
+            ..RenderOptions::default()
+        };
+        let pm = render_page(&doc, page, &opts).unwrap();
+        assert_eq!(px(&pm, 20, 50), (255, 0, 0), "the first fill in place");
+        assert_eq!(px(&pm, 70, 50), (0, 0, 255), "the further fill moved");
+        // Grown by 5 mm: past the moved box's edge (x 80).
+        assert_eq!(px(&pm, 83, 50), (0, 0, 255));
+        assert_eq!(pm.pixel(40, 50).unwrap().alpha(), 0);
     }
 
     /// A clip frame as an opacity mask: the contents show where the
@@ -7449,6 +8331,145 @@ mod tests {
         assert_eq!(px(&pm, 30, 50), (255, 255, 255));
     }
 
+    /// Blend If: a red bar over a page half black, half white shows only
+    /// over the white half with the range of what lies beneath set to
+    /// the light half, and nowhere with its own range set past its
+    /// lightness; split ends fade.
+    #[test]
+    fn blend_if_shows_the_object_where_the_lightness_falls_in_range() {
+        use tracedraw_core::live::{Effect, BLEND_IF_ALL};
+        let dark = rect(1, Rect::new(0.0, 0.0, 50.0, 100.0), Color::BLACK);
+        let light = rect(2, Rect::new(50.0, 0.0, 100.0, 100.0), Color::WHITE);
+        let bar = |this: [f64; 4], below: [f64; 4]| {
+            let mut b = rect(3, Rect::new(0.0, 40.0, 100.0, 60.0), Color::rgb8(255, 0, 0));
+            b.effects.push(Effect::BlendIf { this, below });
+            b
+        };
+        let draw = |b: Shape| {
+            let (doc, page) = doc_with(vec![dark.clone(), light.clone(), b]);
+            render_page_image(&doc, page, 25.4).unwrap()
+        };
+        let pm = draw(bar(BLEND_IF_ALL, [0.5, 0.5, 1.0, 1.0]));
+        assert_eq!(px(&pm, 25, 50), (0, 0, 0));
+        assert_eq!(px(&pm, 75, 50), (255, 0, 0));
+        let pm = draw(bar([0.5, 0.5, 1.0, 1.0], BLEND_IF_ALL));
+        assert_eq!(px(&pm, 25, 50), (0, 0, 0));
+        assert_eq!(px(&pm, 75, 50), (255, 255, 255));
+        // The full range draws it as it is, both halves.
+        let pm = draw(bar(BLEND_IF_ALL, BLEND_IF_ALL));
+        assert_eq!(px(&pm, 25, 50), (255, 0, 0));
+        // A split dark end over a lightness half way shows it half.
+        let grey = rect(1, Rect::new(0.0, 0.0, 100.0, 100.0), Color::rgb8(128, 128, 128));
+        let (doc, page) = doc_with(vec![grey, bar(BLEND_IF_ALL, [0.0, 1.0, 1.0, 1.0])]);
+        let pm = render_page_image(&doc, page, 25.4).unwrap();
+        let (r, g, _) = px(&pm, 50, 50);
+        assert!(r > 150 && r < 230 && g > 40 && g < 100, "{:?}", px(&pm, 50, 50));
+    }
+
+    /// Displace's shading (#3595): a white bar over a page half dark
+    /// grey, half white takes the shadow of the dark half (Multiply) and
+    /// stays white over the light half; Screen lightens a black bar over
+    /// the light half only; None leaves it as it is.
+    #[test]
+    fn displace_shading_takes_the_shadows_and_highlights_beneath() {
+        use tracedraw_core::live::{Effect, SurfaceShade};
+        let dark = rect(1, Rect::new(0.0, 0.0, 50.0, 100.0), Color::rgb8(64, 64, 64));
+        let light = rect(2, Rect::new(50.0, 0.0, 100.0, 100.0), Color::WHITE);
+        let bar = |color: Color, shade: SurfaceShade| {
+            let mut b = rect(3, Rect::new(0.0, 40.0, 100.0, 60.0), color);
+            b.effects.push(Effect::Displace {
+                map: None,
+                horizontal: 0.0,
+                vertical: 0.0,
+                shade,
+                strength: 1.0,
+            });
+            b
+        };
+        let draw = |b: Shape| {
+            let (doc, page) = doc_with(vec![dark.clone(), light.clone(), b]);
+            render_page_image(&doc, page, 25.4).unwrap()
+        };
+        // The photo's middle grey is 0.5 with no map: the dark half (0.25)
+        // halves the white bar.
+        let pm = draw(bar(Color::WHITE, SurfaceShade::Multiply));
+        let (r, _, _) = px(&pm, 25, 50);
+        assert!((120..=136).contains(&r), "{r}");
+        assert_eq!(px(&pm, 75, 50), (255, 255, 255));
+        let pm = draw(bar(Color::BLACK, SurfaceShade::Screen));
+        assert_eq!(px(&pm, 25, 50), (0, 0, 0));
+        assert_eq!(px(&pm, 75, 50), (255, 255, 255));
+        let pm = draw(bar(Color::WHITE, SurfaceShade::None));
+        assert_eq!(px(&pm, 25, 50), (255, 255, 255));
+    }
+
+    #[test]
+    fn halftone_turns_the_object_and_its_effects_into_dots() {
+        use tracedraw_core::live::Effect;
+        let page_white = rect(1, Rect::new(0.0, 0.0, 100.0, 100.0), Color::WHITE);
+        let mut grey = rect(
+            2,
+            Rect::new(20.0, 20.0, 80.0, 80.0),
+            Color::rgb8(128, 128, 128),
+        );
+        grey.effects.push(Effect::Halftone {
+            pattern: 0,
+            mode: 2,
+            size: 2.0,
+            scale: 1.0,
+            softness: 0.0,
+            angle: 45.0,
+            center_x: 0.5,
+            center_y: 0.5,
+            clip: true,
+            color: Color::BLACK,
+        });
+        let (doc, page) = doc_with(vec![page_white.clone(), grey.clone()]);
+        let pm = render_page_image(&doc, page, 254.0).unwrap();
+        // Inside: black dots on the white page, about half of it inked.
+        let (mut dark, mut light) = (0, 0);
+        for y in (300..700).step_by(3) {
+            for x in (300..700).step_by(3) {
+                match px(&pm, x, y).0 {
+                    0..=60 => dark += 1,
+                    200..=255 => light += 1,
+                    _ => {}
+                }
+            }
+        }
+        let inked = f64::from(dark) / f64::from(dark + light);
+        assert!((inked - 0.5).abs() < 0.12, "{inked}");
+        // Outside, nothing.
+        assert_eq!(px(&pm, 100, 100), (255, 255, 255));
+        // An inner shadow on it darkens the edges first: bigger dots there.
+        grey.effects.insert(
+            0,
+            Effect::InnerShadow {
+                offset: tracedraw_core::geometry::Vec2::ZERO,
+                color: Color::BLACK,
+                opacity: 1.0,
+                blur: 6.0,
+                merge: tracedraw_core::live::MergeMode::Multiply,
+                spread: 0.0,
+            },
+        );
+        let (doc, page) = doc_with(vec![page_white, grey]);
+        let pm = render_page_image(&doc, page, 254.0).unwrap();
+        let ink = |x0: u32, x1: u32| {
+            let mut n = 0u32;
+            for y in (300..700).step_by(2) {
+                for x in (x0..x1).step_by(2) {
+                    if px(&pm, x, y).0 < 128 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let (edge, middle) = (ink(205, 240), ink(480, 515));
+        assert!(edge > middle, "{edge} {middle}");
+    }
+
     #[test]
     fn complex_effects_off_skips_the_transparency_mask() {
         let mut s = rect(1, Rect::new(0.0, 0.0, 100.0, 10.0), Color::rgb8(0, 0, 0));
@@ -7534,6 +8555,7 @@ mod tests {
             center: tracedraw_core::geometry::Point::new(50.0, 0.0),
             angle: 90.0,
             lines: 1,
+            rotate: false,
         });
         s.effects.push(tracedraw_core::live::Effect::Transparency {
             mask: Fill::Solid(Color::rgb8(128, 128, 128)),
@@ -7565,6 +8587,7 @@ mod tests {
             opacity: 1.0,
             blur: 0.0,
             merge: tracedraw_core::live::MergeMode::Normal,
+            spread: 0.0,
         });
         let (doc, page) = doc_with(vec![s]);
         let pm = render_page_image(&doc, page, 25.4).unwrap();
@@ -7583,12 +8606,56 @@ mod tests {
             opacity: 1.0,
             blur: 4.0,
             merge: tracedraw_core::live::MergeMode::Normal,
+            spread: 0.0,
         });
         let (doc, page) = doc_with(vec![f]);
         let pm = render_page_image(&doc, page, 25.4).unwrap();
         let (edge, mid) = (px(&pm, 22, 50).0, px(&pm, 30, 50).0);
         assert!(edge < mid && mid < 255, "fades from {edge} to {mid}");
         assert_eq!(px(&pm, 15, 50), (255, 255, 255), "outside is untouched");
+    }
+
+    /// Soft edge: a black square fades out towards its edge over the
+    /// radius, black in the middle, untouched outside.
+    #[test]
+    fn soft_edge_fades_the_object_towards_its_edge() {
+        let mut f = rect(1, Rect::new(20.0, 20.0, 80.0, 80.0), Color::BLACK);
+        f.effects
+            .push(tracedraw_core::live::Effect::Feather { radius: 10.0 });
+        let (doc, page) = doc_with(vec![f]);
+        let pm = render_page_image(&doc, page, 25.4).unwrap();
+        assert!(px(&pm, 50, 50).0 < 10, "{:?}", px(&pm, 50, 50));
+        let (edge, inside) = (px(&pm, 21, 50).0, px(&pm, 26, 50).0);
+        assert!(edge > 150 && inside < edge, "fades from {inside} to {edge}");
+        assert_eq!(px(&pm, 15, 50), (255, 255, 255), "outside is untouched");
+    }
+
+    /// Spread makes an inner shadow's feathered edge solid further in:
+    /// darker at the same depth, still fading toward the middle and
+    /// still nothing outside the object.
+    #[test]
+    fn inner_shadow_spread_darkens_the_feathered_edge() {
+        let shade = |spread: f64| {
+            let mut s = rect(1, Rect::new(20.0, 20.0, 80.0, 80.0), Color::WHITE);
+            s.effects.push(tracedraw_core::live::Effect::InnerShadow {
+                offset: tracedraw_core::geometry::Vec2::ZERO,
+                color: Color::BLACK,
+                opacity: 1.0,
+                blur: 8.0,
+                merge: tracedraw_core::live::MergeMode::Normal,
+                spread,
+            });
+            let (doc, page) = doc_with(vec![s]);
+            render_page_image(&doc, page, 25.4).unwrap()
+        };
+        let (plain, spread) = (shade(0.0), shade(0.6));
+        let (a, b) = (px(&plain, 24, 50).0, px(&spread, 24, 50).0);
+        assert!(b + 20 < a, "spread is darker near the edge: {b} against {a}");
+        assert_eq!(px(&spread, 50, 50), (255, 255, 255), "middle stays lit");
+        assert_eq!(px(&spread, 15, 50), (255, 255, 255), "outside is untouched");
+        // Out of range values are kept in range.
+        let wild = shade(f64::NAN);
+        assert_eq!(px(&wild, 24, 50), px(&plain, 24, 50));
     }
 
     /// The layer effects drawn by the renderer (#1141): an outer shadow
@@ -8292,6 +9359,32 @@ mod tests {
         }
     }
 
+    /// A dithered gradient differs from the plain one by at most two
+    /// levels a channel, in some pixels, the same every time.
+    #[test]
+    fn a_dithered_gradient_adds_faint_noise() {
+        let b = Rect::new(0.0, 0.0, 100.0, 10.0);
+        let mut f = Fountain::two(
+            FountainKind::Linear,
+            Color::rgb8(100, 100, 100),
+            Color::rgb8(110, 110, 110),
+            0.0,
+        );
+        let plain = render_fill_image(&Fill::Fountain(f.clone()), b, 25.4).unwrap();
+        f.dither = true;
+        let dithered = render_fill_image(&Fill::Fountain(f.clone()), b, 25.4).unwrap();
+        let again = render_fill_image(&Fill::Fountain(f), b, 25.4).unwrap();
+        assert_eq!(dithered.data(), again.data());
+        let diffs: Vec<i32> = plain
+            .data()
+            .iter()
+            .zip(dithered.data())
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+            .collect();
+        assert!(diffs.iter().all(|d| *d <= 2), "{:?}", diffs.iter().max());
+        assert!(diffs.iter().filter(|d| **d > 0).count() > 100);
+    }
+
     #[test]
     fn free_fill_nodes_place_the_gradient() {
         use tracedraw_core::style::FountainHandles;
@@ -8523,6 +9616,123 @@ mod tests {
         assert_eq!(px(&columns, 2, 17), (0, 0, 0));
         assert_eq!(px(&columns, 12, 12), (0, 0, 0));
         assert_eq!(px(&columns, 12, 17), (255, 255, 255));
+    }
+
+    /// Hexagonal tiles laid with half a tile of row offset and a quarter
+    /// of row overlap cover the page with no gaps; without the overlap
+    /// the corners between the rows stay empty.
+    #[test]
+    fn overlapping_rows_interlock_hexagons() {
+        use tracedraw_core::style::PatternPlacement;
+        let r = 10.0;
+        let (w, h) = (3f64.sqrt() * r, 2.0 * r);
+        let mut hex = tracedraw_core::geometry::BezPath::new();
+        for k in 0..6 {
+            let a = std::f64::consts::FRAC_PI_2 + f64::from(k) * std::f64::consts::FRAC_PI_3;
+            let q = tracedraw_core::geometry::Point::new(w / 2.0 + r * a.cos(), h / 2.0 + r * a.sin());
+            if k == 0 {
+                hex.move_to(q);
+            } else {
+                hex.line_to(q);
+            }
+        }
+        hex.close_path();
+        let mut cell = tracedraw_core::Shape::new(
+            tracedraw_core::ShapeId(7),
+            tracedraw_core::ShapeKind::Path {
+                path: hex,
+                closed: true,
+            },
+        );
+        cell.fill = Fill::Solid(Color::rgb8(255, 0, 0));
+        cell.stroke = None;
+        let red_share = |overlap: f64| {
+            let mut s = rect(1, Rect::new(0.0, 0.0, 60.0, 60.0), Color::WHITE);
+            s.fill = Fill::Pattern(Pattern::Vector {
+                shapes: vec![cell.clone()],
+                tile: tracedraw_core::geometry::Size::new(w, h),
+                placement: PatternPlacement {
+                    shift_percent: 50.0,
+                    overlap_percent: overlap,
+                    ..PatternPlacement::default()
+                },
+            });
+            let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(60.0, 60.0));
+            let page = doc.pages[0].id;
+            let layer = doc.pages[0].layers[0].id;
+            doc.layer_mut(layer).unwrap().shapes.push(s);
+            let pm = render_page_image(&doc, page, 25.4 * 4.0).unwrap();
+            let red = pm
+                .pixels()
+                .iter()
+                .filter(|p| p.red() > 200 && p.green() < 60)
+                .count();
+            red as f64 / pm.pixels().len() as f64
+        };
+        let gaps = red_share(0.0);
+        let hexes = red_share(25.0);
+        assert!(gaps < 0.8, "{gaps}");
+        assert!(hexes > 0.97, "{hexes}");
+    }
+
+    /// A red and a blue square overlapping in a group: drawn as one, the
+    /// group's transparency goes on the whole and the red does not show
+    /// through the blue; with a knockout, a see-through blue shows the
+    /// page beneath the group, not the red.
+    #[test]
+    fn group_looks_draw_the_group_as_one_and_knock_out() {
+        use tracedraw_core::document::GroupLook;
+        let page_with = |member_opacity: f64, group_opacity: f64, look: Option<GroupLook>| {
+            let mut red = rect(2, Rect::new(0.0, 0.0, 20.0, 10.0), Color::rgb8(255, 0, 0));
+            let mut blue = rect(3, Rect::new(10.0, 0.0, 30.0, 10.0), Color::rgb8(0, 0, 255));
+            red.opacity = member_opacity;
+            blue.opacity = member_opacity;
+            let mut g = tracedraw_core::Shape::new(
+                tracedraw_core::ShapeId(1),
+                tracedraw_core::ShapeKind::Group {
+                    children: vec![red, blue],
+                },
+            );
+            g.opacity = group_opacity;
+            g.group_look = look;
+            let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(30.0, 10.0));
+            let page = doc.pages[0].id;
+            let layer = doc.pages[0].layers[0].id;
+            doc.layer_mut(layer).unwrap().shapes.push(g);
+            render_page_image(&doc, page, 25.4).unwrap()
+        };
+        let as_one = Some(GroupLook {
+            as_one: true,
+            knockout: false,
+        });
+        let knockout = Some(GroupLook {
+            as_one: false,
+            knockout: true,
+        });
+        // A plain half-transparent group: the red shows through the blue.
+        let plain = px(&page_with(1.0, 0.5, None), 15, 5);
+        assert!(plain.0 > 40 && plain.2 > 100, "{plain:?}");
+        // As one: the blue alone at half strength over the white page.
+        let one = px(&page_with(1.0, 0.5, as_one), 15, 5);
+        assert!(one.0 > 120 && one.1 > 120 && one.2 > 250, "{one:?}");
+        assert!((i32::from(one.0) - i32::from(one.1)).abs() < 4, "{one:?}");
+        // The left part is the red alone at half strength either way.
+        assert_eq!(px(&page_with(1.0, 0.5, as_one), 5, 5), px(&plain_page(), 5, 5));
+        // Knockout: half-transparent members, the blue hides the red.
+        let ko = px(&page_with(0.5, 1.0, knockout), 15, 5);
+        assert!((i32::from(ko.0) - i32::from(ko.1)).abs() < 4 && ko.2 > 250, "{ko:?}");
+        let mixed = px(&page_with(0.5, 1.0, None), 15, 5);
+        assert!(mixed.0 > mixed.1 + 30, "the red shows without: {mixed:?}");
+
+        fn plain_page() -> Pixmap {
+            let mut red = rect(2, Rect::new(0.0, 0.0, 20.0, 10.0), Color::rgb8(255, 0, 0));
+            red.opacity = 0.5;
+            let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(30.0, 10.0));
+            let page = doc.pages[0].id;
+            let layer = doc.pages[0].layers[0].id;
+            doc.layer_mut(layer).unwrap().shapes.push(red);
+            render_page_image(&doc, page, 25.4).unwrap()
+        }
     }
 
     /// The offset moves the tiles, the rotation turns them and the tile
@@ -8994,6 +10204,49 @@ mod tests {
         assert!(left.green() < 30, "not the outline colour");
         // Outside the stroke nothing is painted.
         assert_eq!(img.pixel(50, 2).unwrap().green(), 255);
+    }
+
+    #[test]
+    fn a_gradient_along_the_line_follows_it_round_a_turn() {
+        // Right along the top, down, and back left along the bottom: the
+        // gradient runs from the start (red) to the end (blue), so the
+        // two left ends differ, where a gradient across would match them.
+        let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(100.0, 20.0));
+        let layer = doc.pages[0].layers[0].id;
+        let id = doc.ids_mut().shape();
+        let mut path = tracedraw_core::BezPath::new();
+        path.move_to((5.0, 5.0));
+        path.line_to((95.0, 5.0));
+        path.line_to((95.0, 15.0));
+        path.line_to((5.0, 15.0));
+        let mut s = Shape::new(
+            id,
+            ShapeKind::Path {
+                path,
+                closed: false,
+            },
+        );
+        s.fill = Fill::None;
+        let mut stroke = Stroke::new(Color::rgb8(0, 255, 0), 4.0);
+        stroke.fill = Some(Box::new(Fill::Fountain(tracedraw_core::Fountain::two(
+            tracedraw_core::FountainKind::Linear,
+            Color::rgb8(255, 0, 0),
+            Color::rgb8(0, 0, 255),
+            0.0,
+        ))));
+        stroke.fill_along = true;
+        s.stroke = Some(stroke);
+        doc.layer_mut(layer).unwrap().shapes.push(s);
+        let img = render_page_image(&doc, doc.pages[0].id, 25.4).unwrap();
+        let a = img.pixel(7, 5).unwrap();
+        let b = img.pixel(7, 15).unwrap();
+        let (red, blue) = if a.red() > b.red() { (a, b) } else { (b, a) };
+        assert!(red.red() > 200 && red.blue() < 60, "{red:?}");
+        assert!(blue.blue() > 200 && blue.red() < 60, "{blue:?}");
+        assert!(red.green() < 30 && blue.green() < 30, "not the outline colour");
+        // The far end of the turn is half way.
+        let mid = img.pixel(95, 10).unwrap();
+        assert!(mid.red() > 80 && mid.blue() > 80, "{mid:?}");
     }
 
     /// A 100 x 10 mm rectangle filled with `fill`, drawn at 1 px/mm.
@@ -10887,6 +12140,7 @@ mod culling_tests {
             flags: Flags::from_options(&opts),
             symbols: &[],
             preview: None,
+            bounds: None,
             origin: (0, 0),
             cancel: None,
         };
@@ -11124,6 +12378,7 @@ mod band_tests {
             flags: Flags::from_options(&opts),
             symbols: &doc.symbols,
             preview: None,
+            bounds: None,
             origin: (0, 0),
             cancel: None,
         };
@@ -11567,35 +12822,54 @@ mod band_tests {
             assert!(got.is_empty(), "one core: drawn whole");
             return;
         }
-        assert!(
-            got.len() > cores.min(16),
-            "more bands than cores: {}",
-            got.len()
-        );
         let row = 900 * 4;
-        let mut covered = vec![0u8; 700];
-        for (y0, rows) in &got {
-            assert_eq!(rows.width(), 900);
-            let (a, b) = (*y0 as usize, *y0 as usize + rows.height() as usize);
-            for c in &mut covered[a..b] {
-                *c += 1;
-            }
+        // Every run hands over every row once, each band as the picture
+        // has it.
+        let check = |got: &[(u32, Pixmap)], picture: &Pixmap| {
             assert!(
-                rows.data() == &picture.data()[a * row..b * row],
-                "rows {a}..{b}"
+                got.len() > cores.min(16),
+                "more bands than cores: {}",
+                got.len()
             );
-        }
-        assert!(covered.iter().all(|c| *c == 1), "every row once");
-        // The band done first is the one holding the middle row, or one
-        // drawn beside it at the same time: the first few handed over
-        // include it.
-        let first_few = &got[..cores.min(got.len())];
-        assert!(
-            first_few
+            let mut covered = vec![0u8; 700];
+            for (y0, rows) in got {
+                assert_eq!(rows.width(), 900);
+                let (a, b) = (*y0 as usize, *y0 as usize + rows.height() as usize);
+                for c in &mut covered[a..b] {
+                    *c += 1;
+                }
+                assert!(
+                    rows.data() == &picture.data()[a * row..b * row],
+                    "rows {a}..{b}"
+                );
+            }
+            assert!(covered.iter().all(|c| *c == 1), "every row once");
+        };
+        check(&got, &picture);
+        // The band holding the middle row is the first one taken, so it
+        // is handed over among the first few, unless the test machine
+        // holds its thread back while the others finish theirs. A busy
+        // machine may do that now and then, so the middle is looked for
+        // over a few runs, each run checked whole.
+        let middle_first = |got: &[(u32, Pixmap)]| {
+            got[..cores.min(got.len())]
                 .iter()
-                .any(|(y0, r)| (*y0..*y0 + r.height()).contains(&350)),
-            "the middle comes among the first"
-        );
+                .any(|(y0, r)| (*y0..*y0 + r.height()).contains(&350))
+        };
+        let mut seen = middle_first(&got);
+        for _ in 0..8 {
+            if seen {
+                break;
+            }
+            let again: std::sync::Mutex<Vec<(u32, Pixmap)>> = std::sync::Mutex::new(Vec::new());
+            let band = |y0: u32, rows: &Pixmap| again.lock().unwrap().push((y0, rows.clone()));
+            let picture =
+                render_page_progressive(&doc, page, &opts, &cancel, 350, &band).expect("drawn");
+            let again = again.into_inner().unwrap();
+            check(&again, &picture);
+            seen = middle_first(&again);
+        }
+        assert!(seen, "the middle comes among the first");
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(render_page_progressive(&doc, page, &opts, &cancel, 0, &|_, _| ()).is_none());
     }
@@ -11841,6 +13115,7 @@ mod inner_shadow_view_tests {
             opacity: 0.8,
             blur: 2.0,
             merge: tracedraw_core::live::MergeMode::Normal,
+            spread: 0.0,
         });
         let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(100.0, 100.0));
         let layer = doc.pages[0].layers[0].id;
@@ -11910,6 +13185,7 @@ mod inner_shadow_view_tests {
                 opacity: 1.0,
                 blur: 2.0,
                 merge: tracedraw_core::live::MergeMode::Normal,
+                spread: 0.0,
             });
         } else {
             s.shadow = Some(tracedraw_core::Shadow {
@@ -12072,5 +13348,102 @@ mod whole_page_tests {
                 "{w} x {h} mm at {dpi} dpi: right column at {right}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod holo_tests {
+    use super::*;
+
+    const DARK: [f32; 3] = [0.11, 0.12, 0.17];
+    const LIGHT: [f32; 3] = [0.93, 0.93, 0.95];
+
+    fn hue_and_sat(c: [f32; 3]) -> (f32, f32) {
+        let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        let d = mx - mn;
+        if d < 1e-6 {
+            return (0.0, 0.0);
+        }
+        let h = if mx == c[0] {
+            ((c[1] - c[2]) / d).rem_euclid(6.0)
+        } else if mx == c[1] {
+            (c[2] - c[0]) / d + 2.0
+        } else {
+            (c[0] - c[1]) / d + 4.0
+        };
+        (h * 60.0, d / mx.max(1e-6))
+    }
+
+    /// The holographic look is fixed: the same point and seed always give
+    /// the same colour, and another seed another picture.
+    #[test]
+    fn holographic_colour_is_fixed() {
+        for glitter in [false, true] {
+            let a = holo_color(1.3, 2.7, 5, glitter, DARK, LIGHT);
+            assert_eq!(a, holo_color(1.3, 2.7, 5, glitter, DARK, LIGHT));
+        }
+        let differs = (0..50).any(|i| {
+            let (x, y) = (i as f64 * 0.37, i as f64 * 0.21);
+            holo_color(x, y, 1, false, DARK, LIGHT) != holo_color(x, y, 2, false, DARK, LIGHT)
+        });
+        assert!(differs);
+    }
+
+    /// Across an object the foil runs from dark to light and shows the
+    /// spectrum: coloured pixels of hues far apart, not two colours mixed.
+    #[test]
+    fn holographic_texture_shows_the_spectrum() {
+        let mut hues = [false; 6];
+        let (mut darkest, mut lightest) = (1.0f32, 0.0f32);
+        for i in 0..80 {
+            for j in 0..80 {
+                let c = holo_color(i as f64 * 0.05, j as f64 * 0.05, 1, false, DARK, LIGHT);
+                let l = (c[0] + c[1] + c[2]) / 3.0;
+                darkest = darkest.min(l);
+                lightest = lightest.max(l);
+                let (h, s) = hue_and_sat(c);
+                if s > 0.35 && l > 0.15 {
+                    hues[((h / 60.0) as usize).min(5)] = true;
+                }
+            }
+        }
+        assert!(darkest < 0.3 && lightest > 0.8, "{darkest} {lightest}");
+        assert!(hues.iter().filter(|h| **h).count() >= 3, "{hues:?}");
+    }
+
+    /// The glitter changes single grains, not the whole picture.
+    #[test]
+    fn holo_glitter_sparkles_in_grains() {
+        let (mut changed, mut n) = (0, 0);
+        for i in 0..200 {
+            let (x, y) = (i as f64 * 0.0131, i as f64 * 0.0077);
+            n += 1;
+            if holo_color(x, y, 1, true, DARK, LIGHT) != holo_color(x, y, 1, false, DARK, LIGHT) {
+                changed += 1;
+            }
+        }
+        assert!(changed > n / 20 && changed < n / 2, "{changed} of {n}");
+    }
+
+    /// The renderer paints a holographic texture fill in colour.
+    #[test]
+    fn holographic_texture_fill_renders_in_colour() {
+        let fill = Fill::Texture(tracedraw_core::Texture {
+            kind: tracedraw_core::TextureKind::Holographic,
+            color_a: Color::rgb8(28, 30, 44),
+            color_b: Color::rgb8(236, 238, 242),
+            scale: 20.0,
+            seed: 1,
+        });
+        let pm = render_fill_image(&fill, Rect::new(0.0, 0.0, 60.0, 60.0), 50.0).unwrap();
+        let coloured = pm
+            .pixels()
+            .iter()
+            .filter(|p| {
+                let (r, g, b) = (p.red() as i32, p.green() as i32, p.blue() as i32);
+                r.max(g).max(b) - r.min(g).min(b) > 60
+            })
+            .count();
+        assert!(coloured > pm.pixels().len() / 50, "{coloured}");
     }
 }

@@ -1117,6 +1117,13 @@ pub struct WarningPrefs {
     /// own, so "Do not show this message again" ticked on the plain note
     /// before the dialog existed does not silence the dialog (#1243).
     pub ask_missing_fonts: bool,
+    /// Take the automatic font for each missing one without asking
+    /// (#3725): the Missing Fonts dialog's choices made at once, as OK
+    /// with the automatic fonts would, when every missing family has one.
+    pub accept_missing_fonts: bool,
+    /// With [`Self::accept_missing_fonts`]: replace the families in the
+    /// drawing (saved with it) rather than for this session only.
+    pub accept_missing_fonts_keep: bool,
     /// Before an item is taken off the Shelf.
     pub shelf_remove: bool,
     /// The hint to turn on hardware acceleration when the window is
@@ -1131,6 +1138,8 @@ impl Default for WarningPrefs {
             unread_objects: true,
             missing_fonts: true,
             ask_missing_fonts: true,
+            accept_missing_fonts: false,
+            accept_missing_fonts_keep: true,
             shelf_remove: true,
             hardware_acceleration: true,
         }
@@ -1178,6 +1187,54 @@ pub struct CurvePrefs {
     /// segment, so higher values make more lines.
     #[serde(default)]
     pub straight_threshold: u32,
+    /// Parallel Lines on the curve tools' property bar (#3626): lines
+    /// drawn alongside each new curve. Off at first.
+    #[serde(default)]
+    pub parallel: ParallelLines,
+}
+
+/// Lines drawn alongside each curve made with the Freehand, Bezier, Pen,
+/// Polyline, 2-Point Line and 3-Point Curve tools (`parallel_lines.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParallelLines {
+    pub on: bool,
+    /// Lines on each side drawn on, 1 to 10.
+    pub count: u32,
+    /// The distance from one line to the next, mm.
+    pub gap: f64,
+    /// Lines on both sides of the curve, else on its left only.
+    pub both_sides: bool,
+}
+
+impl Default for ParallelLines {
+    fn default() -> Self {
+        ParallelLines {
+            on: false,
+            count: 1,
+            gap: 5.0,
+            both_sides: false,
+        }
+    }
+}
+
+impl ParallelLines {
+    /// The distances of the lines from the curve, left positive, nearest
+    /// first: none while off.
+    pub fn distances(&self) -> Vec<f64> {
+        if !self.on || !self.gap.is_finite() || self.gap <= 0.0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for k in 1..=self.count.clamp(1, 10) {
+            let d = f64::from(k) * self.gap;
+            out.push(d);
+            if self.both_sides {
+                out.push(-d);
+            }
+        }
+        out
+    }
 }
 
 /// The modifier key that constrains the angle while drawing curves.
@@ -1223,6 +1280,7 @@ impl Default for CurvePrefs {
             pen_ignores_hand: true,
             corner_threshold: 0,
             straight_threshold: 0,
+            parallel: ParallelLines::default(),
         }
     }
 }

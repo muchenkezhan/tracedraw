@@ -128,7 +128,15 @@ fn move_item(
     }
 }
 
-fn control(ui: &mut Ui, symbol: &str, label: &str, enabled: bool) -> egui::Response {
+enum ControlIcon {
+    MoveUp,
+    MoveDown,
+    Collapse,
+    Expand,
+    Clear,
+}
+
+fn control(ui: &mut Ui, icon: ControlIcon, label: &str, enabled: bool) -> egui::Response {
     let response = ui.add_enabled(
         enabled,
         egui::Button::new("").min_size(egui::vec2(22.0, 24.0)),
@@ -140,22 +148,22 @@ fn control(ui: &mut Ui, symbol: &str, label: &str, enabled: bool) -> egui::Respo
     } else {
         ui.visuals().widgets.noninteractive.fg_stroke
     };
-    let segments = match symbol {
-        "↑" => vec![
+    let segments: &[[(f32, f32); 2]] = match icon {
+        ControlIcon::MoveUp => &[
             [(-4.0, 0.0), (0.0, -4.0)],
             [(0.0, -4.0), (4.0, 0.0)],
             [(0.0, -4.0), (0.0, 5.0)],
         ],
-        "↓" => vec![
+        ControlIcon::MoveDown => &[
             [(-4.0, 0.0), (0.0, 4.0)],
             [(0.0, 4.0), (4.0, 0.0)],
             [(0.0, 4.0), (0.0, -5.0)],
         ],
-        "▾" => vec![[(-4.0, -2.0), (0.0, 2.0)], [(0.0, 2.0), (4.0, -2.0)]],
-        "▸" => vec![[(-2.0, -4.0), (2.0, 0.0)], [(2.0, 0.0), (-2.0, 4.0)]],
-        _ => vec![[(-3.0, -3.0), (3.0, 3.0)], [(-3.0, 3.0), (3.0, -3.0)]],
+        ControlIcon::Collapse => &[[(-4.0, -2.0), (0.0, 2.0)], [(0.0, 2.0), (4.0, -2.0)]],
+        ControlIcon::Expand => &[[(-2.0, -4.0), (2.0, 0.0)], [(2.0, 0.0), (-2.0, 4.0)]],
+        ControlIcon::Clear => &[[(-3.0, -3.0), (3.0, 3.0)], [(-3.0, 3.0), (3.0, -3.0)]],
     };
-    for [(x1, y1), (x2, y2)] in segments {
+    for &[(x1, y1), (x2, y2)] in segments {
         ui.painter().line_segment(
             [center + egui::vec2(x1, y1), center + egui::vec2(x2, y2)],
             stroke,
@@ -186,7 +194,11 @@ fn tree_row(
                 });
                 let toggle = control(
                     ui,
-                    if expanded { "▾" } else { "▸" },
+                    if expanded {
+                        ControlIcon::Collapse
+                    } else {
+                        ControlIcon::Expand
+                    },
                     &label,
                     state.search.trim().is_empty(),
                 );
@@ -257,7 +269,12 @@ fn tree_row(
             } else {
                 name
             });
-            let up = control(ui, "↑", &tr("options.context_menu_move_up"), row.index > 0);
+            let up = control(
+                ui,
+                ControlIcon::MoveUp,
+                &tr("options.context_menu_move_up"),
+                row.index > 0,
+            );
             #[cfg(test)]
             remember_rect(ui, ("up", menu, &row.path), &up);
             if up.clicked() {
@@ -274,7 +291,7 @@ fn tree_row(
             }
             let down = control(
                 ui,
-                "↓",
+                ControlIcon::MoveDown,
                 &tr("options.context_menu_move_down"),
                 row.index + 1 < row.siblings.len(),
             );
@@ -483,7 +500,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     .id_salt("context_menu_search")
                     .desired_width(width),
             );
-            if has_search && control(ui, "×", &tr("font_list.filter_clear"), true).clicked() {
+            if has_search
+                && control(ui, ControlIcon::Clear, &tr("font_list.filter_clear"), true).clicked()
+            {
                 state.search.clear();
                 search.request_focus();
             }
