@@ -765,6 +765,7 @@ impl App {
                     opacity,
                     blur,
                     merge,
+                    spread,
                 } => Some((
                     *offset,
                     crate::app::InnerShadowStyle {
@@ -772,6 +773,7 @@ impl App {
                         opacity: *opacity,
                         blur: *blur,
                         merge: *merge,
+                        spread: *spread,
                     },
                 )),
                 _ => None,
@@ -979,6 +981,7 @@ impl App {
                         shapes: id.clone(),
                         fills: Vec::new(),
                         strokes: Vec::new(),
+                        looks: None,
                     },
                     Command::SetShadow {
                         shapes: id.clone(),
@@ -1155,6 +1158,7 @@ impl App {
                 center,
                 angle: 90.0,
                 lines: 1,
+                rotate: false,
             });
             let cmd = Command::SetEffects {
                 shape: s.id,
@@ -1197,6 +1201,7 @@ impl App {
             center,
             angle: 90.0,
             lines: 1,
+            rotate: false,
         });
         if let Err(e) = self
             .engine
@@ -1417,6 +1422,7 @@ impl App {
                     center,
                     angle,
                     lines,
+                    ..
                 } => Some((s.id, *center, *angle, *lines)),
                 _ => None,
             })
@@ -1513,6 +1519,28 @@ impl App {
         if let Err(e) = self.engine.run_batch("Clear Transparency", &cmds) {
             self.status = e.to_string();
         }
+    }
+
+    /// Object > Apply Uniform Transparency (#3622): the selected objects
+    /// (bitmaps and groups too) get a uniform transparency over fill and
+    /// outline in the Normal merge mode, at the amount last used (50% at
+    /// first); one undo step.
+    pub fn apply_uniform_transparency(&mut self) {
+        use crate::mixed::TransparencyField as F;
+        let last = self.transparency_default.amount;
+        let amount = if last > 0.0 && last <= 100.0 {
+            last
+        } else {
+            50.0
+        };
+        let set = crate::effects_ui::TransparencySettings {
+            kind: 0,
+            amount,
+            merge: tracedraw_core::live::MergeMode::Normal,
+            target: 2,
+            ..Default::default()
+        };
+        self.patch_transparency(&set, &[F::Kind, F::Amount, F::Merge, F::Target]);
     }
 
     /// Object > Clip to Frame > Edit Contents: take the contents out so they can
@@ -1914,6 +1942,37 @@ impl App {
         if let Err(e) = self.engine.run_batch("Opacity Mask", &cmds) {
             self.status = e.to_string();
         }
+    }
+
+    /// Object > Group > Draw as One and Members Hide Those Beneath: each
+    /// selected group's look with `as_one` and `knockout` set where
+    /// given; one undo step.
+    pub fn set_group_looks(&mut self, as_one: Option<bool>, knockout: Option<bool>) {
+        let cmds: Vec<Command> = self
+            .selected_shapes()
+            .iter()
+            .filter(|s| matches!(s.kind, ShapeKind::Group { .. }))
+            .map(|s| {
+                let mut look = s.group_look.unwrap_or_default();
+                if let Some(v) = as_one {
+                    look.as_one = v;
+                }
+                if let Some(v) = knockout {
+                    look.knockout = v;
+                }
+                Command::SetGroupLook {
+                    shape: s.id,
+                    look: Some(look),
+                }
+            })
+            .collect();
+        if cmds.is_empty() {
+            return;
+        }
+        if let Err(e) = self.engine.run_batch("Group Look", &cmds) {
+            self.status = e.to_string();
+        }
+        self.raster.borrow_mut().invalidate();
     }
 
     /// After moving unlocked clip frames by `t`, keep their contents in place.
@@ -2919,6 +2978,123 @@ impl App {
         self.selection = vec![id];
     }
 
+    /// Object > Flatten Transparency: the selected objects become one
+    /// opaque bitmap of how they look over what lies beneath them (at 300
+    /// dpi, shaped like them), in their place in the stack; the objects
+    /// beneath stay. One undo step. For printers and files that cannot mix
+    /// transparency.
+    pub fn flatten_transparency(&mut self) {
+        let shapes = self.selected_shapes();
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        let Some(area) = self.convert_to_bitmap_area() else {
+            return;
+        };
+        let Some(alone) = self.selection_alone(area) else {
+            return;
+        };
+        let ids: Vec<ShapeId> = shapes.iter().map(|s| s.id).collect();
+        // What lies beneath: the objects on the page's visible layers
+        // below the topmost selected one, with the selection on top.
+        let doc = self.doc();
+        let tops: Vec<ShapeId> = ids
+            .iter()
+            .map(|id| doc.ancestors(*id).first().copied().unwrap_or(*id))
+            .collect();
+        let mut tmp = alone.clone();
+        let l = tmp.pages[0].layers[0].id;
+        let mut beneath = Vec::new();
+        let mut below_top = Vec::new();
+        for lay in self.page_layers() {
+            for sh in &lay.shapes {
+                if tops.contains(&sh.id) {
+                    beneath.append(&mut below_top);
+                } else if lay.visible {
+                    below_top.push(sh.clone());
+                }
+            }
+        }
+        let dpi = 300.0;
+        if let Ok(tl) = tmp.layer_mut(l) {
+            let mut all: Vec<Shape> = beneath
+                .into_iter()
+                .filter(|s| self.visual_bounds(s).overlaps(area))
+                .map(|mut c| {
+                    c.transform_by(Affine::translate((-area.x0, -area.y0)));
+                    c
+                })
+                .collect();
+            all.append(&mut tl.shapes);
+            tl.shapes = all;
+        }
+        let Some((whole, w, h)) = render_alone_png(&tmp, dpi, false, true) else {
+            return;
+        };
+        // The selection's shape: drawn alone without its transparency.
+        let mut solid = alone;
+        for lay in &mut solid.pages[0].layers {
+            for sh in &mut lay.shapes {
+                sh.opacity = 1.0;
+                sh.effects
+                    .retain(|e| !matches!(e, Effect::Transparency { .. }));
+            }
+        }
+        let Some((mask, _, _)) = render_alone_png(&solid, dpi, true, true) else {
+            return;
+        };
+        let (Some(mut img), Some(mask)) = (
+            crate::bitmap_fx::decode(&whole),
+            crate::bitmap_fx::decode(&mask),
+        ) else {
+            return;
+        };
+        if img.dimensions() != mask.dimensions() {
+            return;
+        }
+        // Only where the selection draws.
+        for (px, m) in img.pixels_mut().zip(mask.pixels()) {
+            px.0[3] = m.0[3];
+        }
+        let Some(png) = crate::bitmap_fx::encode(&img) else {
+            return;
+        };
+        let id = self.engine.new_shape_id();
+        let mut bitmap = Shape::new(
+            id,
+            ShapeKind::Bitmap {
+                rect: area,
+                width_px: w,
+                height_px: h,
+                png: png.into(),
+                fx: None,
+            },
+        );
+        bitmap.fill = Fill::None;
+        bitmap.stroke = None;
+        let mut cmds = vec![
+            Command::DeleteShapes {
+                shapes: ids.clone(),
+            },
+            Command::AddShape {
+                layer,
+                shape: bitmap,
+            },
+        ];
+        if let Some((at_layer, index)) = self.stack_place_of(&ids) {
+            cmds.push(Command::Reorder {
+                shape: id,
+                layer: at_layer,
+                index,
+            });
+        }
+        if let Err(e) = self.engine.run_batch("Flatten Transparency", &cmds) {
+            self.status = e.to_string();
+            return;
+        }
+        self.selection = vec![id];
+    }
+
     /// Where an object that replaces `ids` goes in the stack: the layer of
     /// the topmost of them (each counted by its object on the layer, the
     /// group or clip frame it is in), at the place it has once `ids` are
@@ -3600,6 +3776,7 @@ impl App {
             own.column_gutters = para.column_gutters.clone();
             own.columns_right_to_left = para.columns_right_to_left;
             own.fit_to_frame = para.fit_to_frame;
+            own.type_block = para.type_block;
             own.baseline_grid_mm = para.baseline_grid_mm;
             own.vertical_align = para.vertical_align;
             own.vertical = para.vertical;
@@ -3636,6 +3813,117 @@ impl App {
         };
         f(&mut p);
         self.set_paragraph_style(id, p);
+    }
+
+    /// Text > Bullets On/Off (Ctrl+Shift+L, #3593): bullets on or off for
+    /// the paragraphs at the caret of the paragraph text being edited,
+    /// else for every paragraph of the selected paragraph text. On when
+    /// the first of them has none, off when it has them. The bullet
+    /// itself stays as it was set (its character, font, size, indent), so
+    /// a text with a bullet of its own gets it back, and one that never
+    /// had one gets the default bullet. Nothing happens without paragraph
+    /// text.
+    pub fn toggle_bullets(&mut self) {
+        let targets: Vec<Shape> = match &self.text_edit {
+            Some(te) => self
+                .doc()
+                .find_shape(te.shape)
+                .cloned()
+                .into_iter()
+                .collect(),
+            None => self.selected_shapes(),
+        }
+        .into_iter()
+        .filter(|s| matches!(s.kind, ShapeKind::Text { frame: Some(_), .. }))
+        .collect();
+        let Some(first) = targets.first() else {
+            return;
+        };
+        let on = !self
+            .paragraph_style_of(first)
+            .is_some_and(|(_, p)| p.bullets);
+        for s in targets {
+            self.edit_paragraph_style(s.id, |p| p.bullets = on);
+        }
+    }
+
+    /// Text > Increase List Level and Decrease List Level (#3685): the
+    /// paragraphs with bullets at the caret of the paragraph text being
+    /// edited, else every paragraph with bullets of the selected
+    /// paragraph text, go one list level deeper or back up, each from its
+    /// own level. A number takes the next numbering of 1, a, i and a
+    /// symbol the next plain bullet, so the levels show apart.
+    pub fn change_list_level(&mut self, deeper: bool) {
+        let targets: Vec<Shape> = match &self.text_edit {
+            Some(te) => self
+                .doc()
+                .find_shape(te.shape)
+                .cloned()
+                .into_iter()
+                .collect(),
+            None => self.selected_shapes(),
+        }
+        .into_iter()
+        .filter(|s| matches!(s.kind, ShapeKind::Text { frame: Some(_), .. }))
+        .collect();
+        for s in targets {
+            let range = self.paragraph_range(s.id);
+            let mut kind = s.kind.clone();
+            tracedraw_core::paragraphs::edit_paragraph_formats(&mut kind, range, |f| {
+                if f.bullets {
+                    f.bullet.change_level(&mut f.bullet_char, deeper);
+                }
+            });
+            if kind != s.kind {
+                self.run(Command::SetShapeKind { shape: s.id, kind });
+            }
+        }
+    }
+
+    /// The vertical alignment the text property bar shows (#3543): that
+    /// of the first paragraph text in a frame among the text being edited
+    /// or the selected texts; `None` with no such text.
+    pub fn frame_text_vertical_align(&self) -> Option<tracedraw_core::VerticalAlign> {
+        self.hyphenation_targets().iter().find_map(|id| {
+            match &self.doc().find_shape(*id)?.kind {
+                ShapeKind::Text {
+                    frame: Some(_),
+                    para,
+                    ..
+                } => Some(para.vertical_align),
+                _ => None,
+            }
+        })
+    }
+
+    /// Set the vertical alignment in the frame of the text being edited,
+    /// or of every selected paragraph text, from the text property bar
+    /// (#3543), as the Text docker does for one text. One undo step.
+    pub fn set_frame_text_vertical_align(&mut self, v: tracedraw_core::VerticalAlign) {
+        let mut cmds = Vec::new();
+        for id in self.hyphenation_targets() {
+            let Some(s) = self.doc().find_shape(id) else {
+                continue;
+            };
+            let mut kind = s.kind.clone();
+            if let ShapeKind::Text {
+                frame: Some(_),
+                para,
+                ..
+            } = &mut kind
+            {
+                if para.vertical_align != v {
+                    para.vertical_align = v;
+                    cmds.push(Command::SetShapeKind { shape: id, kind });
+                }
+            }
+        }
+        if cmds.is_empty() {
+            return;
+        }
+        if let Err(e) = self.engine.run_batch("Vertical Alignment", &cmds) {
+            self.status = format!("Vertical Alignment: {e}");
+        }
     }
 
     /// The texts Text > Use Hyphenation acts on: the one being edited,
@@ -3873,6 +4161,7 @@ impl App {
                 ..Default::default()
             }),
         }) {
+            self.note_text_path_source(id, path_id);
             self.text_edit = Some(crate::app::TextEdit::at_end(id, 0));
             self.select(vec![id]);
         }
@@ -3909,22 +4198,28 @@ impl App {
             self.selection = vec![text.id];
             return;
         }
+        let (text_id, curve_id) = (text.id, curve.id);
+        let before = self.engine.revision();
         let mut cmds = vec![Command::SetShapeKind {
-            shape: text.id,
+            shape: text_id,
             kind,
         }];
         // A squeezed text's squeeze went into its letters (#3485): the
         // transform keeps the rest.
         if transform != text.transform {
             cmds.push(Command::TransformShapes {
-                shapes: vec![text.id],
+                shapes: vec![text_id],
                 transform: transform * text.transform.inverse(),
             });
         }
         if let Err(e) = self.engine.run_batch("Fit Text to Path", &cmds) {
             self.status = e.to_string();
         }
-        self.selection = vec![text.id];
+        // Where the text came from, for Follow Path (#3571).
+        if self.engine.revision() != before {
+            self.note_text_path_source(text_id, curve_id);
+        }
+        self.selection = vec![text_id];
     }
 
     /// The path whose outline is at `p` (within 4 screen pixels) that
@@ -4003,6 +4298,47 @@ impl App {
     /// changes there is no step to undo. Each text was a step of its own,
     /// and a text already in the case still gave an Undo that did nothing.
     pub fn change_case(&mut self, mode: CaseMode) {
+        // Characters selected in the text being edited: only those
+        // change (#3762). The whole text changed.
+        if let Some(te) = self.text_edit.clone().filter(|te| te.has_selection()) {
+            let (from, to) = te.selection();
+            let Some(s) = self.doc().find_shape(te.shape).cloned() else {
+                return;
+            };
+            let ShapeKind::Text {
+                mut spans,
+                origin,
+                frame,
+                align,
+                para,
+                on_path,
+            } = s.kind
+            else {
+                return;
+            };
+            let before = tracedraw_core::spans_text(&spans);
+            change_case_in_range(&mut spans, from, to, mode);
+            if tracedraw_core::spans_text(&spans) == before {
+                return;
+            }
+            let len = tracedraw_core::spans_char_count(&spans);
+            self.run(Command::SetShapeKind {
+                shape: s.id,
+                kind: ShapeKind::Text {
+                    spans,
+                    origin,
+                    frame,
+                    align,
+                    para,
+                    on_path,
+                },
+            });
+            if let Some(te) = self.text_edit.as_mut() {
+                te.caret = te.caret.min(len);
+                te.anchor = te.anchor.min(len);
+            }
+            return;
+        }
         let mut cmds = Vec::new();
         for s in self.text_shapes() {
             let ShapeKind::Text {
@@ -4748,6 +5084,71 @@ impl App {
         self.add_colors_to_palette(i, &colors)
     }
 
+    /// Every colour of the selected objects (fills, outlines, gradient
+    /// stops, at any depth inside groups) changed to the nearest colour
+    /// of palette `i`, one undo step (#3534): a design moved from one
+    /// palette to another. The registration colour stays. False when
+    /// nothing changed.
+    pub fn fit_selection_to_palette(&mut self, i: usize) -> bool {
+        if !self.has_document() || self.selection.is_empty() {
+            return false;
+        }
+        let Some(targets) = self.palettes.get(i).map(|p| {
+            p.colors
+                .iter()
+                .map(|(_, c)| *c)
+                .filter(|c| *c != Color::Registration)
+                .collect::<Vec<_>>()
+        }) else {
+            return false;
+        };
+        if targets.is_empty() {
+            return false;
+        }
+        let nearest = |c: Color| -> Color {
+            targets
+                .iter()
+                .copied()
+                .min_by(|a, b| c.delta_e(*a).total_cmp(&c.delta_e(*b)))
+                .unwrap_or(c)
+        };
+        let used = std::cell::RefCell::new(Vec::<Color>::new());
+        for s in self.selected_shapes() {
+            let mut s = s.clone();
+            tracedraw_core::color_convert::map_shape_colors(&mut s, &|c| {
+                let mut u = used.borrow_mut();
+                if !u.contains(&c) {
+                    u.push(c);
+                }
+                c
+            });
+        }
+        let pairs: Vec<(Color, Color)> = used
+            .into_inner()
+            .into_iter()
+            .filter(|c| *c != Color::Registration)
+            .map(|c| (c, nearest(c)))
+            .filter(|(a, b)| a != b)
+            .collect();
+        if pairs.is_empty() {
+            self.status = tr("palette.fit_selection_none");
+            return false;
+        }
+        let shapes = self.selection.clone();
+        if let Err(e) = self.engine.run_batch(
+            "Fit Colors to Palette",
+            &[Command::ReplaceColors {
+                pairs: pairs.clone(),
+                shapes,
+            }],
+        ) {
+            self.status = e.to_string();
+            return false;
+        }
+        self.status = trf("palette.fit_selection_done", &[("n", &pairs.len().to_string())]);
+        true
+    }
+
     /// Keep the palettes made in TraceDraw (no file behind them) in the
     /// preferences.
     pub fn store_user_palettes(&mut self) {
@@ -4925,6 +5326,23 @@ impl App {
         ) && self.mix_into_mesh_nodes(c)
         {
             return;
+        }
+        // With Interactive Fill and a fountain node picked, the colour
+        // mixes into that node, as a plain click colours it (#3747: it
+        // did nothing).
+        if self.tool == crate::tools::Tool::InteractiveFill {
+            if let Some((f, i)) = self.selected_fill_node() {
+                if let Some(old) = f.stops.get(i).map(|s| s.color) {
+                    self.set_fountain_node(
+                        i,
+                        Some(crate::ui::palette::mix(old, c, 0.1)),
+                        None,
+                        None,
+                        false,
+                    );
+                }
+                return;
+            }
         }
         let cmds: Vec<Command> = self
             .selected_shapes()
@@ -5386,6 +5804,45 @@ pub fn placement_on(
 #[cfg(test)]
 fn apply_case(text: &str, mode: CaseMode) -> String {
     apply_case_runs(&[text], mode).pop().unwrap_or_default()
+}
+
+/// Change Case on characters `from..to` of a text's spans, each span
+/// keeping its look; a sentence or a word goes on from one span into
+/// the next (#3270, #3762).
+pub fn change_case_in_range(
+    spans: &mut [tracedraw_core::TextSpan],
+    from: usize,
+    to: usize,
+    mode: CaseMode,
+) {
+    // The part of each span inside the range, as byte ranges.
+    let mut parts = Vec::new();
+    let mut at = 0usize;
+    for (i, s) in spans.iter().enumerate() {
+        let n = s.text.chars().count();
+        let (a, b) = (from.max(at), to.min(at + n));
+        if a < b {
+            let byte = |c: usize| {
+                s.text
+                    .char_indices()
+                    .nth(c - at)
+                    .map(|(k, _)| k)
+                    .unwrap_or(s.text.len())
+            };
+            parts.push((i, byte(a), byte(b)));
+        }
+        at += n;
+    }
+    let runs: Vec<&str> = parts
+        .iter()
+        .map(|&(i, a, b)| spans[i].text.get(a..b).unwrap_or(""))
+        .collect();
+    let changed = apply_case_runs(&runs, mode);
+    for (&(i, a, b), new) in parts.iter().zip(changed).rev() {
+        if let Some(s) = spans.get_mut(i) {
+            s.text.replace_range(a..b, &new);
+        }
+    }
 }
 
 /// [`apply_case`] for the runs of one text, each in its own look, as one
@@ -5986,6 +6443,8 @@ fn effects_reach(s: &Shape) -> f64 {
         .map(|e| match e {
             Effect::OuterShadow { offset, blur, .. } => blur.abs() + offset.hypot(),
             Effect::Glow { blur, .. } | Effect::GaussianBlur { radius: blur } => blur.abs(),
+            // Whole dots reach half a cell past the edge.
+            Effect::Halftone { size, .. } => size.abs(),
             _ => 0.0,
         })
         .filter(|r| r.is_finite())
@@ -6050,6 +6509,187 @@ fn scale_base(s: &tracedraw_core::document::Shape) -> Option<(f64, f64)> {
 mod tests {
     use super::*;
     use crate::tools::Tool;
+
+    /// #3622, #3621: uniform transparency on and off, and the document
+    /// palette's eyedropper, run as menu commands (so a shortcut can run
+    /// them), each one undo step.
+    #[test]
+    fn transparency_and_palette_sampling_run_as_commands() {
+        let ctx = crate::theme::ui_context();
+        // A command run inside a frame, as a shortcut runs it.
+        let run = |app: &mut App, key: &str| {
+            let mut ran = false;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ran = crate::ui::menus::run_command(app, ui.ctx(), key);
+            });
+            out.textures_delta.clear();
+            ran
+        };
+        let mut app = App::headless();
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![id]);
+        let opacity = |app: &App| app.doc().find_shape(id).map(|s| s.opacity);
+        assert!(run(&mut app, "menu.object.transparency_apply"));
+        assert_eq!(opacity(&app), Some(0.5), "50% at first");
+        assert!(run(&mut app, "menu.object.transparency_remove"));
+        assert_eq!(opacity(&app), Some(1.0));
+        app.undo();
+        assert_eq!(opacity(&app), Some(0.5));
+        // The amount last used in the docker.
+        app.transparency_default.amount = 30.0;
+        app.apply_uniform_transparency();
+        assert!((opacity(&app).unwrap() - 0.7).abs() < 1e-9);
+        // The palette's eyedropper starts and stops as its button does.
+        assert!(!app.pending_palette_sample);
+        assert!(run(&mut app, "menu.window.palette_sample"));
+        assert!(app.pending_palette_sample);
+        run(&mut app, "menu.window.palette_sample");
+        assert!(!app.pending_palette_sample);
+    }
+
+    /// Object > Flatten Transparency: a see-through blue square over a
+    /// red one becomes an opaque purple bitmap in its place; the red one
+    /// stays; one undo step.
+    #[test]
+    fn flatten_transparency_bakes_what_lies_beneath() {
+        let mut app = App::headless();
+        let square = |app: &mut App, c: tracedraw_core::Color| {
+            let id = app
+                .new_shape(ShapeKind::Rect {
+                    rect: kurbo::Rect::new(0.0, 0.0, 10.0, 10.0),
+                    radius: 0.0,
+                    corners: None,
+                })
+                .expect("rect");
+            app.run(Command::SetFill {
+                shapes: vec![id],
+                fill: Fill::Solid(c),
+            });
+            app.run(Command::SetStroke {
+                shapes: vec![id],
+                stroke: None,
+            });
+            id
+        };
+        let red = square(&mut app, tracedraw_core::Color::rgb8(255, 0, 0));
+        let blue = square(&mut app, tracedraw_core::Color::rgb8(0, 0, 255));
+        app.select(vec![blue]);
+        app.transparency_default.amount = 50.0;
+        app.apply_uniform_transparency();
+        app.flatten_transparency();
+        let [bid] = app.selection[..] else {
+            panic!("{:?}", app.selection);
+        };
+        let b = app.doc().find_shape(bid).expect("bitmap").clone();
+        assert!(app.doc().find_shape(blue).is_none());
+        assert!(app.doc().find_shape(red).is_some());
+        assert_eq!(b.opacity, 1.0);
+        let ShapeKind::Bitmap { png, .. } = &b.kind else {
+            panic!("{:?}", b.kind);
+        };
+        let img = crate::bitmap_fx::decode(png).expect("png");
+        let (w, h) = img.dimensions();
+        let c = img.get_pixel(w / 2, h / 2).0;
+        assert!(
+            c[0] > 100 && c[0] < 160 && c[1] < 20 && c[2] > 100 && c[2] < 160,
+            "{c:?}"
+        );
+        assert_eq!(c[3], 255);
+        app.undo();
+        assert!(app.doc().find_shape(blue).is_some());
+    }
+
+    /// #3543: the text property bar's vertical alignment sets it in the
+    /// frame of every selected paragraph text in one undo step; artistic
+    /// text has none to show.
+    #[test]
+    fn the_text_bar_sets_the_vertical_alignment_of_paragraph_text() {
+        use tracedraw_core::VerticalAlign;
+        let mut app = App::headless();
+        let text = |app: &mut App, frame: Option<tracedraw_core::Size>| {
+            app.new_shape(ShapeKind::Text {
+                spans: vec![tracedraw_core::TextSpan::new("lorem ipsum", "DejaVu Sans", 10.0)],
+                origin: kurbo::Point::new(20.0, 150.0),
+                frame,
+                align: tracedraw_core::TextAlign::Left,
+                para: Default::default(),
+                on_path: None,
+            })
+            .expect("text")
+        };
+        let artistic = text(&mut app, None);
+        app.select(vec![artistic]);
+        assert_eq!(app.frame_text_vertical_align(), None);
+        let a = text(&mut app, Some(tracedraw_core::Size::new(100.0, 60.0)));
+        let b = text(&mut app, Some(tracedraw_core::Size::new(80.0, 40.0)));
+        app.select(vec![artistic, a, b]);
+        assert_eq!(app.frame_text_vertical_align(), Some(VerticalAlign::Top));
+        let steps = app.engine.history_labels().0.len();
+        app.set_frame_text_vertical_align(VerticalAlign::Bottom);
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+        let valign = |app: &App, id| match &app.doc().find_shape(id).expect("text").kind {
+            ShapeKind::Text { para, .. } => para.vertical_align,
+            _ => unreachable!(),
+        };
+        assert_eq!((valign(&app, a), valign(&app, b)), (VerticalAlign::Bottom, VerticalAlign::Bottom));
+        assert_eq!(app.frame_text_vertical_align(), Some(VerticalAlign::Bottom));
+        app.undo();
+        assert_eq!(valign(&app, a), VerticalAlign::Top);
+    }
+
+    /// A palette bar changes the selected objects' colours to its nearest
+    /// ones, inside groups too, one undo step; other objects keep theirs
+    /// (#3534).
+    #[test]
+    fn the_selection_moves_to_the_nearest_colours_of_a_palette() {
+        let mut app = App::headless();
+        let rect = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: kurbo::Rect::new(x, 0.0, x + 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect")
+        };
+        let a = rect(&mut app, 0.0);
+        let b = rect(&mut app, 20.0);
+        let c = rect(&mut app, 40.0);
+        app.select(vec![a]);
+        app.apply_fill(Fill::Solid(Color::rgb8(250, 10, 10)));
+        app.select(vec![b]);
+        app.apply_fill(Fill::Solid(Color::rgb8(10, 10, 240)));
+        app.select(vec![c]);
+        app.apply_fill(Fill::Solid(Color::rgb8(250, 10, 10)));
+        app.select(vec![a, b]);
+        app.group_selection();
+        let red = Color::rgb8(255, 0, 0);
+        let blue = Color::rgb8(0, 0, 255);
+        app.palettes.push(crate::palette::Palette {
+            name: "Two".into(),
+            key: "",
+            colors: vec![("Red".into(), red), ("Blue".into(), blue)],
+            builtin: false,
+            path: None,
+        });
+        let i = app.palettes.len() - 1;
+        let steps = app.engine.history_labels().0.len();
+        assert!(app.fit_selection_to_palette(i));
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
+        let fill = |app: &App, id| app.doc().find_shape(id).expect("shape").fill.clone();
+        assert_eq!(fill(&app, a), Fill::Solid(red));
+        assert_eq!(fill(&app, b), Fill::Solid(blue));
+        assert_eq!(fill(&app, c), Fill::Solid(Color::rgb8(250, 10, 10)));
+        // Already in the palette: nothing to change.
+        assert!(!app.fit_selection_to_palette(i));
+        app.undo();
+        assert_eq!(fill(&app, a), Fill::Solid(Color::rgb8(250, 10, 10)));
+    }
 
     fn symbol_of(app: &mut App, rect: kurbo::Rect) -> ShapeId {
         let a = app
@@ -6853,24 +7493,35 @@ mod tests {
         let (mut app, layer) = app_with_first_page_range();
         app.tool = Tool::Bezier;
         app.curve = Some(crate::app::CurveInProgress {
-            nodes: vec![
-                (Point::new(5.0, 10.0), None),
-                (Point::new(20.0, 10.0), None),
-                (Point::new(30.0, 20.0), None),
-            ],
             smooth: true,
             ..Default::default()
         });
+        // Record the anchor steps the tool would record while drawing.
+        // Three undos should traverse the curve, not remove the test page.
+        for point in [
+            Point::new(5.0, 10.0),
+            Point::new(20.0, 10.0),
+            Point::new(30.0, 20.0),
+            Point::new(40.0, 15.0),
+        ] {
+            app.curve_step();
+            app.curve.as_mut().expect("curve").nodes.push((point, None));
+        }
+        let before = app.engine.history_labels().0.len();
         app.finish_curve();
+        assert_eq!(app.engine.history_labels().0.len(), before + 3);
         assert_eq!(app.doc().layer(layer).expect("curve layer").shapes.len(), 1);
         app.goto_page(1);
+        let excluded_page = app.page;
         for _ in 0..3 {
             app.undo();
+            assert_eq!(app.page, excluded_page);
             assert!(app.curve.is_none());
             assert!(app.selection.is_empty());
         }
         while app.engine.redo_label().is_some() {
             app.redo();
+            assert_eq!(app.page, excluded_page);
             assert!(app.curve.is_none());
             assert!(app.selection.is_empty());
         }
@@ -7692,6 +8343,40 @@ mod tests {
             assert_eq!(texts(&app), want, "{mode:?}");
             app.undo();
         }
+    }
+
+    /// #3762: with characters selected in the text being edited, Change
+    /// Case changes only those; the whole text changed.
+    #[test]
+    fn change_case_with_a_text_selection_changes_only_the_selection() {
+        let mut app = App::headless();
+        let id = app
+            .new_shape(ShapeKind::Text {
+                spans: vec![TextSpan::new("one two three\nfour", "Arial", 12.0)],
+                origin: tracedraw_core::Point::new(10.0, 10.0),
+                frame: None,
+                align: tracedraw_core::TextAlign::Left,
+                para: Default::default(),
+                on_path: None,
+            })
+            .expect("text");
+        let text = |app: &App| match &app.doc().find_shape(id).expect("text").kind {
+            ShapeKind::Text { spans, .. } => tracedraw_core::spans_text(spans),
+            _ => String::new(),
+        };
+        let mut te = crate::text_editing::TextEdit::at_end(id, 18);
+        te.anchor = 4;
+        te.caret = 7;
+        app.text_edit = Some(te);
+        app.change_case(CaseMode::Upper);
+        assert_eq!(text(&app), "one TWO three\nfour");
+        app.undo();
+        assert_eq!(text(&app), "one two three\nfour");
+        // Without a selection the whole text changes, as before.
+        app.text_edit = Some(crate::text_editing::TextEdit::at_end(id, 18));
+        app.select(vec![id]);
+        app.change_case(CaseMode::Upper);
+        assert_eq!(text(&app), "ONE TWO THREE\nFOUR");
     }
 
     /// Change Case on several texts is one undo step, and a text already
