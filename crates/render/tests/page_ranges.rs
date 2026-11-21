@@ -158,6 +158,7 @@ fn range_output_missing_blends_keep_renderer_effects_and_their_scope() {
             color: Color::BLACK,
             opacity: 0.6,
             blur: 1.0,
+            spread: 0.0,
             merge: MergeMode::Normal,
         }],
         vec![Effect::FillOpacity { opacity: 0.25 }],
