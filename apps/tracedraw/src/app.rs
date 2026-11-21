@@ -131,7 +131,7 @@ pub fn drawing_scale() -> f64 {
 }
 
 /// The inner shadow the Inner Shadow tool gives the next object dragged
-/// on (#2473), as CorelDRAW's Inner Shadow tool starts: black, half
+/// on (#2473): black, half
 /// opaque, feathered and multiplied with the object.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InnerShadowStyle {
@@ -141,6 +141,8 @@ pub struct InnerShadowStyle {
     /// Feathering, millimetres.
     pub blur: f64,
     pub merge: tracedraw_core::live::MergeMode,
+    /// 0..1, see `Effect::InnerShadow`.
+    pub spread: f64,
 }
 
 impl Default for InnerShadowStyle {
@@ -150,6 +152,7 @@ impl Default for InnerShadowStyle {
             opacity: 0.5,
             blur: 2.0,
             merge: tracedraw_core::live::MergeMode::Multiply,
+            spread: 0.0,
         }
     }
 }
@@ -430,12 +433,17 @@ pub enum Drag {
     /// Rotating the selection about `center`. `grab` is the selection's
     /// own point (a node) the turn started from in rotate mode, which the
     /// turn carries onto other objects' points and edges (#933); `None`
-    /// for a rotate handle.
+    /// for a rotate handle. With Shift held the selection is also
+    /// scaled, keeping its proportions, by how far the pointer is from
+    /// `center` against `start_radius` (#3772); `scale` is that factor,
+    /// 1 without Shift.
     Rotate {
         center: Point,
         start_angle: f64,
         current_angle: f64,
         grab: Option<Point>,
+        start_radius: f64,
+        scale: f64,
     },
     /// Rubber-band selection; with `touching` (Alt) objects it touches
     /// count too.
@@ -748,6 +756,11 @@ pub struct CurveInProgress {
     pub dragging_handle: bool,
     /// B-Spline tool: the nodes are control points the curve runs near.
     pub bspline: bool,
+    /// Curvature Pen (with `bspline`, whose clicks it shares): the curve
+    /// runs through the points placed, smooth at each, with a corner at
+    /// the fixed ones (placed with Alt, C or V held); it is made a plain
+    /// curve, its points its nodes.
+    pub curvature: bool,
     /// B-Spline tool: the control points placed with C or V held, which
     /// the curve passes through with a corner (fixed points, #2060); one
     /// flag a node, missing ones floating.
@@ -869,6 +882,9 @@ impl CurveInProgress {
     pub fn path_closed(&self, preview: Option<Point>, closed: bool) -> tracedraw_core::BezPath {
         if closed && self.bspline {
             let pts: Vec<Point> = self.nodes.iter().map(|n| n.0).collect();
+            if self.curvature {
+                return tracedraw_core::geometry::curvature_path(&pts, &self.spline_fixed, true);
+            }
             return tracedraw_core::geometry::bspline_path_fixed(&pts, &self.spline_fixed, true);
         }
         let mut path = self.open_path(preview);
@@ -925,6 +941,9 @@ impl CurveInProgress {
         }
         if self.bspline {
             let pts = self.bspline_controls(preview);
+            if self.curvature {
+                return tracedraw_core::geometry::curvature_path(&pts, &self.spline_fixed, false);
+            }
             return tracedraw_core::geometry::bspline_path_fixed(&pts, &self.spline_fixed, false);
         }
         for (i, (p, _)) in nodes.iter().enumerate() {
@@ -1397,6 +1416,10 @@ pub struct App {
     pub join_pending: Option<crate::join_tool::JoinEnd>,
     /// The formula settings used last, for the next new formula (#2183).
     pub last_formula: Option<crate::formula::FormulaSpec>,
+    /// The Transform Each settings used last.
+    pub last_transform_each: crate::ui::transform_each::TransformEach,
+    /// The Light Flare settings used last.
+    pub last_flare: crate::ui::flare::Flare,
     pub blend_steps: u32,
     /// The Blend docker's options for the next blend (and the shown one).
     pub blend_options: tracedraw_core::live::BlendOptions,
@@ -1510,7 +1533,9 @@ pub struct App {
     /// frame; it is made once when the drag ends.
     pub node_drag_shown: Option<NodeDragShown>,
     /// The visual bounds of objects with live effects, for the document
-    /// revision they were measured at (see [`App::visual_bounds`]).
+    /// revision they were measured at (see [`App::visual_bounds`]);
+    /// plain objects' geometric bounds measured once per change of the
+    /// drawing share it (see [`App::plain_bounds_cached`], #3559).
     pub visual_cache: std::cell::RefCell<(u64, std::collections::HashMap<ShapeId, Rect>)>,
     /// The Edit Fill dialog's fill is shown on the selection as an engine
     /// preview (#436).
@@ -1527,6 +1552,9 @@ pub struct App {
     /// and the selection they were gathered for (see
     /// [`App::selected_rc`]).
     pub selected_cache: std::cell::RefCell<Option<SelectedCache>>,
+    /// Mesh guides flattened at the current zoom, reused while panning
+    /// and between frames; only changed edges need new subdivision.
+    pub mesh_grid_cache: std::cell::RefCell<crate::canvas::MeshGridCache>,
     /// The selection's outlines flattened for Mask Outside Page, with the
     /// gathered selection and the zoom they were made for (see
     /// [`App::selected_outlines`]).
@@ -1676,6 +1704,10 @@ pub struct App {
     /// Clip frame being edited in place: (frame id, the page's other
     /// objects when editing began; see `clip_edit_contents`).
     pub clip_frame_edit: Option<(ShapeId, std::collections::HashSet<ShapeId>)>,
+    /// Draw Behind on the drawing tools' property bar: what they draw
+    /// goes behind the selected objects of its layer, or to the back of
+    /// the layer with nothing selected there. Off at first.
+    pub draw_behind: bool,
     /// The undo steps that began and finished editing a clip frame's
     /// contents, so undo and redo across them leave or enter the edit
     /// (#851).
@@ -1739,6 +1771,7 @@ pub struct App {
     pub settings: crate::settings::Settings,
     pub welcome_tab: WelcomeTab,
     pub fullscreen_preview: bool,
+    pub preview_session: Option<crate::ui::preview::PreviewSession>,
     /// File > Print Preview, while it is open.
     pub print_preview: Option<crate::ui::print_preview::PrintPreview>,
     /// The printer list being read off the interface's thread for the
@@ -1800,6 +1833,19 @@ pub struct App {
     /// without the shadow, or the other way round (#1906).
     pub show_page_shadow: bool,
     pub simulate_overprints: bool,
+    /// View > Separations: the ink the drawing window shows alone, an
+    /// index of [`App::separation_names`]; `None` shows every ink.
+    pub view_plate: Option<usize>,
+    /// The drawing as that ink shows it, kept for the drawing's revision
+    /// and page (see [`App::separation_view_doc`]).
+    pub view_plate_doc: std::cell::RefCell<
+        Option<(
+            u64,
+            usize,
+            tracedraw_core::PageId,
+            std::rc::Rc<tracedraw_core::Document>,
+        )>,
+    >,
     pub rasterize_complex_effects: bool,
     pub show_bleed: bool,
     pub show_printable_area: bool,
@@ -2067,6 +2113,10 @@ pub struct App {
     pub envelope_mode: tracedraw_core::envelope::Mode,
     /// The mapping new envelopes take.
     pub envelope_mapping: tracedraw_core::envelope::Mapping,
+    /// The columns and rows a new mesh envelope takes.
+    pub envelope_mesh: (u8, u8),
+    /// Cut into Grid's window and settings.
+    pub grid_cut: crate::cut_tools::GridCut,
     /// An envelope node or handle being dragged.
     pub envelope_drag: Option<crate::envelope_edit::EnvelopeDrag>,
     /// The boxes of selected objects with no envelope yet, for the frame
@@ -2257,6 +2307,9 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     pub live_handle_cache:
         std::cell::RefCell<Option<((u64, Vec<ShapeId>), Option<crate::fit_live::LiveHandles>)>>,
+    /// The document revision texts following their paths were last
+    /// fitted at (see [`App::refresh_text_follow`]).
+    pub text_follow_checked: u64,
     /// Rounded connectors' corner radius, mm.
     pub connector_radius: f64,
     /// The document revision connectors were last checked at (see
@@ -2313,6 +2366,10 @@ pub struct App {
     /// Smart Fill stops at the edges of the outlines as they are drawn,
     /// their width, not at their middle line (#3321).
     pub area_fill_outline_edges: bool,
+    /// Smart Fill with Live on: a click paints the area the lines of a
+    /// group close off as a live fill of the group, which follows its
+    /// lines when they move ([`tracedraw_core::live_paint`]).
+    pub area_fill_live: bool,
     pub mesh_rows: u32,
     pub mesh_cols: u32,
     /// Mesh Fill bar: the colours Shuffle draws from (an index into
@@ -2965,6 +3022,11 @@ pub struct FloatingDocker {
     /// The window is put at `pos` on the next frame (it was just dropped
     /// or moved); otherwise it keeps where egui has it.
     pub place: bool,
+    /// In a window of the system of its own, which can go to another
+    /// monitor (#2884), instead of floating inside the main window.
+    pub own_window: bool,
+    /// Where that window was last seen on the desktop.
+    pub desktop: Option<Pos2>,
 }
 
 impl FloatingDocker {
@@ -3255,6 +3317,8 @@ impl App {
             dimension_points: Vec::new(),
             join_pending: None,
             last_formula: None,
+            last_transform_each: Default::default(),
+            last_flare: Default::default(),
             blend_steps: 20,
             blend_options: Default::default(),
             blend_spacing_mm: 5.0,
@@ -3316,6 +3380,7 @@ impl App {
             recolor_preview: false,
             fx_preview: Default::default(),
             selected_cache: std::cell::RefCell::new(None),
+            mesh_grid_cache: Default::default(),
             outline_cache: std::cell::RefCell::new(None),
             view_anchor: None,
             window_layout: Default::default(),
@@ -3375,6 +3440,7 @@ impl App {
             marquee_moved_from: None,
             tab_ruler_menu: None,
             clip_frame_edit: None,
+            draw_behind: false,
             clip_edit_marks: Vec::new(),
             symmetry_edit: None,
             symmetry_step: None,
@@ -3399,6 +3465,7 @@ impl App {
             settings: crate::settings::Settings::default(),
             welcome_tab: WelcomeTab::GetStarted,
             fullscreen_preview: false,
+            preview_session: None,
             print_preview: None,
             printer_fetch: None,
             print_job: None,
@@ -3427,6 +3494,8 @@ impl App {
             show_page_border: true,
             show_page_shadow: true,
             simulate_overprints: false,
+            view_plate: None,
+            view_plate_doc: std::cell::RefCell::new(None),
             rasterize_complex_effects: true,
             show_bleed: false,
             show_printable_area: false,
@@ -3563,6 +3632,8 @@ impl App {
             lens: Default::default(),
             envelope_mode: Default::default(),
             envelope_mapping: Default::default(),
+            envelope_mesh: (3, 3),
+            grid_cut: crate::cut_tools::GridCut::default(),
             envelope_drag: None,
             envelope_box_cache: std::cell::RefCell::new((u64::MAX, u64::MAX, Default::default())),
             bevel: Default::default(),
@@ -3635,6 +3706,7 @@ impl App {
             blends_checked: 0,
             live_fits_checked: 0,
             live_handle_cache: Default::default(),
+            text_follow_checked: 0,
             connector_radius: 3.0,
             connectors_checked: u64::MAX,
             connector_radius_step: None,
@@ -3658,6 +3730,7 @@ impl App {
             area_outline_width: 0.2,
             area_outline_color: Color::BLACK,
             area_fill_outline_edges: false,
+            area_fill_live: false,
             mesh_rows: 2,
             mesh_cols: 2,
             mesh_palette: 0,
@@ -4292,6 +4365,7 @@ impl App {
             smart_outline_width: self.area_outline_width,
             smart_outline_color: self.area_outline_color,
             smart_outline_edges: self.area_fill_outline_edges,
+            smart_fill_live: self.area_fill_live,
             brush_radius: self.brush_radius,
             roughen_amount: self.roughen_amount,
             brush: self.brush,
@@ -4401,6 +4475,7 @@ impl App {
         self.area_outline_width = finite(t.smart_outline_width, 0.0, 1000.0, 0.2);
         self.area_outline_color = t.smart_outline_color;
         self.area_fill_outline_edges = t.smart_outline_edges;
+        self.area_fill_live = t.smart_fill_live;
         self.brush_radius = finite(t.brush_radius, 0.5, 500.0, 10.0);
         self.roughen_amount = finite(t.roughen_amount, 0.05, 50.0, 2.0);
         self.brush = t.brush.clamped();
@@ -4416,6 +4491,7 @@ impl App {
         self.recognize = crate::recognize::RecognizeSettings {
             recognition: t.recognize.recognition.min(5),
             smoothing: t.recognize.smoothing.min(5),
+            scribble_erases: t.recognize.scribble_erases,
         };
         self.knife = crate::knife::KnifeSettings {
             gap: finite(t.knife.gap, 0.0, 1000.0, 0.0),
@@ -4648,6 +4724,8 @@ impl App {
                     tab: f.tab.key().to_string(),
                     pos: [f.pos.x, f.pos.y],
                     size: [f.size.x, f.size.y],
+                    own_window: f.own_window,
+                    desktop: f.desktop.map(|p| [p.x, p.y]),
                 })
                 .collect(),
         }
@@ -4720,6 +4798,11 @@ impl App {
                     },
                     size,
                     place: true,
+                    own_window: f.own_window,
+                    desktop: f
+                        .desktop
+                        .filter(|p| p.iter().all(|v| v.is_finite()))
+                        .map(|p| Pos2::new(p[0], p[1])),
                 })
             })
             .collect();
@@ -4885,6 +4968,26 @@ impl App {
         }
     }
 
+    /// Give the panel `tab` a window of the system of its own, to put it
+    /// on another monitor (#2884), or bring it back to float inside the
+    /// main window (`on` false). A panel in a column floats first.
+    pub fn set_docker_own_window(&mut self, tab: DockerTab, on: bool) {
+        if on && self.docker_place(tab) != Some(DockerPlace::Floating) {
+            self.move_docker(tab, DockerPlace::Floating, None);
+        }
+        if let Some(f) = self.floating_dockers.iter_mut().find(|f| f.tab == tab) {
+            f.own_window = on;
+            f.place = true;
+        }
+    }
+
+    /// Whether the panel `tab` is in a window of its own.
+    pub fn docker_in_own_window(&self, tab: DockerTab) -> bool {
+        self.floating_dockers
+            .iter()
+            .any(|f| f.tab == tab && f.own_window)
+    }
+
     /// `tab` is open somewhere (in a column, in front or behind, or
     /// floating).
     pub fn docker_open(&self, tab: DockerTab) -> bool {
@@ -4995,6 +5098,12 @@ impl App {
             .iter()
             .find(|f| f.tab == tab)
             .map(|f| (f.pos, f.size));
+        let own = self
+            .floating_dockers
+            .iter()
+            .find(|f| f.tab == tab)
+            .map(|f| (f.own_window, f.desktop))
+            .unwrap_or_default();
         self.take_docker(tab);
         match place {
             DockerPlace::Right => {
@@ -5024,6 +5133,8 @@ impl App {
                     pos: Pos2::new(pos.x.max(0.0), pos.y.max(0.0)),
                     size,
                     place: true,
+                    own_window: own.0,
+                    desktop: own.1,
                 });
             }
         }
@@ -5212,7 +5323,8 @@ impl App {
         // New drawings start with this drawing's grid, rulers and
         // guideline settings.
         if self.has_document() {
-            self.settings.document_defaults = crate::settings::DocumentDefaults::of(self.doc());
+            self.settings.document_defaults =
+                crate::settings::DocumentDefaults::of_page(self.doc(), Some(self.page));
         }
         self.save_settings();
         self.status = crate::i18n::tr("status.settings_saved");
@@ -6061,13 +6173,10 @@ impl App {
         lines
     }
 
-    /// `s` with every symbol instance it is or holds (in groups and clip
-    /// frames) replaced by its symbol's objects, placed as the instance
-    /// places them: what the outlines drawn over a selection follow. A
-    /// bare instance only knows a 10 x 10 placeholder box, which the
-    /// selection outline and the Shape tool's frame showed instead of
-    /// the symbol (#3437). `None` when `s` holds no instance.
-    pub fn with_symbols_drawn(&self, s: &Shape) -> Option<Shape> {
+    /// `s` is or holds (in groups and clip frames) a symbol instance;
+    /// what [`App::with_symbols_drawn`] answers for, without building
+    /// the drawn shape. Deepest eight levels, as there.
+    pub(crate) fn holds_symbol_instance(s: &Shape) -> bool {
         const DEEPEST: usize = 8;
         fn holds(s: &Shape, depth: usize) -> bool {
             depth <= DEEPEST
@@ -6080,7 +6189,18 @@ impl App {
                     _ => false,
                 }
         }
+        holds(s, 0)
+    }
+
+    /// `s` with every symbol instance it is or holds (in groups and clip
+    /// frames) replaced by its symbol's objects, placed as the instance
+    /// places them: what the outlines drawn over a selection follow. A
+    /// bare instance only knows a 10 x 10 placeholder box, which the
+    /// selection outline and the Shape tool's frame showed instead of
+    /// the symbol (#3437). `None` when `s` holds no instance.
+    pub fn with_symbols_drawn(&self, s: &Shape) -> Option<Shape> {
         fn drawn(s: &Shape, symbols: &[tracedraw_core::document::Symbol], depth: usize) -> Shape {
+            const DEEPEST: usize = 8;
             if depth > DEEPEST {
                 return s.clone();
             }
@@ -6118,7 +6238,29 @@ impl App {
                 _ => s.clone(),
             }
         }
-        holds(s, 0).then(|| drawn(s, &self.doc().symbols, 0))
+        Self::holds_symbol_instance(s).then(|| drawn(s, &self.doc().symbols, 0))
+    }
+
+    /// The geometric bounds of `s`, a top-level object of the current
+    /// page straight from `page_layers`, measured once per change of the
+    /// drawing (#3559): hit testing and snapping ask for the box of
+    /// every object of the page on every pointer move. `None` when the
+    /// box is not the object's own — live effects and symbol instances
+    /// draw something else (see [`Self::visual_bounds`]) — so callers
+    /// fall back to asking it. Never call with a shape that is not in
+    /// the drawing: an effect's preview part carries its source's id,
+    /// and the cache would answer with the source's box.
+    pub(crate) fn plain_bounds_cached(&self, s: &Shape) -> Option<Rect> {
+        if s.has_live_effects() || Self::holds_symbol_instance(s) {
+            return None;
+        }
+        let revision = self.engine.revision();
+        let mut cache = self.visual_cache.try_borrow_mut().ok()?;
+        if cache.0 != revision {
+            cache.0 = revision;
+            cache.1.clear();
+        }
+        Some(*cache.1.entry(s.id).or_insert_with(|| s.bounds()))
     }
 
     /// The bounds of what `s` (in page space) draws, its live effects
@@ -6214,6 +6356,11 @@ impl App {
             return;
         }
         if let Some(k) = keep {
+            if let Err(e) = self.engine.amend(&k) {
+                self.status = e.to_string();
+            }
+        }
+        if let Some(k) = self.drawn_behind(&cmd) {
             if let Err(e) = self.engine.amend(&k) {
                 self.status = e.to_string();
             }
@@ -6811,7 +6958,7 @@ impl App {
             let redo_to = c.nodes.last().copied().filter(|_| !closes);
             self.note_pen_curve_step(id, c.nodes.first().copied(), redo_to);
         }
-        if c.bspline {
+        if c.bspline && !c.curvature {
             // A B-spline of its own keeps its control points (one that
             // went on from another curve is a curve like that one).
             if let Some(id) = id {
@@ -7549,7 +7696,7 @@ impl App {
     /// Copies take the centre of rotation moved for their originals, at
     /// the same place of each copy (or of the copies' box): a copy made
     /// with Duplicate and turned, then repeated, goes on round the point
-    /// the original was turned about, as in CorelDRAW. The copies turned
+    /// the original was turned about. The copies turned
     /// about the middle of their box (#2375, #2376).
     fn carry_pivots(&mut self, pairs: &[(ShapeId, ShapeId)]) {
         for (orig, copy) in pairs {
@@ -7904,7 +8051,7 @@ impl App {
             if matches!(
                 self.tool,
                 Tool::MeshFill | Tool::Shape | Tool::InteractiveFill
-            ) && self.color_mesh_node(*c)
+            ) && (self.color_mesh_node(*c) || self.color_color_point(*c))
             {
                 return;
             }
@@ -9104,7 +9251,11 @@ impl App {
                 .map(|d| (d, crate::i18n::tr("status.opened")))
         };
         match result {
-            Ok((doc, msg)) => {
+            Ok((mut doc, msg)) => {
+                // Brush strokes of a `.cdr` file open live (#3680).
+                if ext == "cdr" {
+                    crate::fit_live::adopt_imported_strokes(&mut doc);
+                }
                 self.open_document(doc, None);
                 if ext == "pmd" {
                     self.open_limits = Some(crate::i18n::tr("pmd.limits"));
@@ -10016,13 +10167,34 @@ impl App {
         if !matches!(self.dialog, crate::ui::dialogs::Dialog::None) {
             return;
         }
+        // Options > Global > Warnings may take the automatic font for each
+        // missing one without asking (#3725), as OK in the dialog would
+        // with its automatic choices; a family with no font to stand in
+        // for it is still asked about.
+        let mut accepted = false;
+        if self.ask_missing_fonts
+            && self.settings.warnings.accept_missing_fonts
+            && !self.missing_fonts.is_empty()
+        {
+            let mut st =
+                crate::ui::missing_fonts::MissingFontsState::new(name.clone(), 0, &self.missing_fonts);
+            if st.rows.iter().all(|r| r.automatic.is_some()) {
+                st.keep = self.settings.warnings.accept_missing_fonts_keep;
+                self.apply_font_choices(&st);
+                accepted = true;
+            }
+        }
         let w = &self.settings.warnings;
         // The windowed application asks which font draws each missing
         // one (#936), as long as Options > Global > Warnings asks for the
         // dialog itself (its own choice, not the plain note's: a "Do not
         // show again" ticked on the note before the dialog existed left
         // the dialog unseen, #1243); the note about unread objects follows.
-        if self.ask_missing_fonts && w.ask_missing_fonts && !self.missing_fonts.is_empty() {
+        if !accepted
+            && self.ask_missing_fonts
+            && w.ask_missing_fonts
+            && !self.missing_fonts.is_empty()
+        {
             self.dialog = crate::ui::dialogs::Dialog::MissingFonts(
                 crate::ui::missing_fonts::MissingFontsState::new(
                     name,
@@ -10039,7 +10211,7 @@ impl App {
         // when they were checked) opens the Warnings page when clicked,
         // so the dialog can be turned on again from where its absence is
         // noticed.
-        if self.ask_missing_fonts && !self.missing_fonts.is_empty() {
+        if !accepted && self.ask_missing_fonts && !self.missing_fonts.is_empty() {
             self.status_opens_options = Some((
                 self.status.clone(),
                 crate::ui::dialogs::OptionsPage::Warnings,
@@ -10048,7 +10220,7 @@ impl App {
         let notes = crate::ui::dialogs::OpenNotes {
             name,
             unread: if w.unread_objects { unread } else { 0 },
-            fonts: if w.missing_fonts {
+            fonts: if w.missing_fonts && !accepted {
                 self.missing_fonts.clone()
             } else {
                 Vec::new()
@@ -11532,6 +11704,7 @@ pub fn fill_description(fill: &Fill) -> String {
             tracedraw_core::FountainKind::Conical => tr("fill.conical_fountain"),
             tracedraw_core::FountainKind::Square => tr("fill.square_fountain"),
             tracedraw_core::FountainKind::Shaped => tr("fill.shaped_fountain"),
+            tracedraw_core::FountainKind::Points => tr("fill.points_fountain"),
         },
         Fill::Pattern(tracedraw_core::Pattern::TwoColor { tile, .. }) => {
             trf(

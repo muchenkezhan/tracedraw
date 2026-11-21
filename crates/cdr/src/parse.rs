@@ -327,6 +327,13 @@ pub(crate) const ARG_GUIDE_LINE: u32 = 16000;
 pub(crate) const ARG_BLEND_STEPS: u32 = 3000;
 /// Object type of a contour's linked group (`LIST lnkg`).
 const OBJ_CONTOUR_GROUP: u32 = 15;
+/// Object type of a drop shadow's linked group (`LIST lnkg`, version 15).
+const OBJ_DROP_SHADOW: u32 = 23;
+/// Length of the drop shadow record (argument 3000 of its linked group).
+const DROP_SHADOW_RECORD_LEN: usize = 107;
+/// Millimetres of feathering for each unit of the record's feathering
+/// (its default, 15, as the 1.5 mm a new shadow takes here).
+const DROP_SHADOW_FEATHER_MM: f64 = 0.1;
 /// Length of the contour record (argument 3000 of a contour's linked
 /// group) in the one layout seen, version 9.
 const CONTOUR_RECORD_LEN: usize = 44;
@@ -569,6 +576,13 @@ struct Ctx<'a> {
     /// Facing pages (version 21 `mcfg` byte 26): objects are placed from
     /// the spine of the spread, not the page centre.
     facing_pages: bool,
+    /// The document's link table (`lnkt`): a linked group's number to the
+    /// number of the object it is linked to (see [`crate::artistic`]).
+    links: HashMap<u32, u32>,
+    /// While `links` has any: the objects read, by their numbers
+    /// (`spnd`), and the file's identities (`spid`) of each.
+    spnd_shapes: HashMap<u32, tracedraw_core::ShapeId>,
+    spids: HashMap<tracedraw_core::ShapeId, tracedraw_core::document::Uid>,
 
     /// The node types a curve's node bytes give where its handles read
     /// otherwise, for the shape being read.
@@ -647,6 +661,9 @@ impl<'a> Ctx<'a> {
             on_path: HashMap::new(),
             pending_text_transform: None,
             facing_pages: false,
+            links: HashMap::new(),
+            spnd_shapes: HashMap::new(),
+            spids: HashMap::new(),
 
             pending_node_types: Default::default(),
             cmyk_profile: None,
@@ -762,6 +779,9 @@ pub(crate) fn parse_document_kept_data(
             // runs of lowercase letters among other fields (assumed).
             let names = v3_font_names(ctx.data(c));
             ctx.v3_fonts = names;
+        } else if c.is(b"lnkt") {
+            let pairs = crate::artistic::links(ctx.data(c));
+            ctx.links.extend(pairs);
         } else if c.is(b"ole2") {
             let pictures = crate::ole::embedded_pictures(ctx.data(c));
             ctx.embedded.extend(pictures);
@@ -2697,10 +2717,14 @@ impl<'a> Ctx<'a> {
         self.read_transform_chain(c, &[]).matrices()
     }
 
-    /// A `trfd`'s entries in order: its matrices and, from version 16,
+    /// A `trfd`'s entries in order: its matrices and, from version 15,
     /// its envelopes (entry type 1), each taking its frame from the next
     /// of `envds` (the `envd` chunks after the `trfd`, in the same order).
     /// An envelope that cannot be read, or has no `envd`, is left out.
+    /// Version 15 envelopes are laid out as version 16's (#3222: 1087 of
+    /// them in a version 15 file, the box at byte 14 of the entry and the
+    /// corner indexes 0 to 3 after it; its reference pictures show the
+    /// dance pads and panels bent as the envelopes then draw them).
     fn read_transform_chain(&mut self, c: &Chunk, envds: &[&Chunk]) -> TransformChain {
         let identity = TransformChain::default();
         let d = self.data(c);
@@ -2724,7 +2748,7 @@ impl<'a> Ctx<'a> {
             if v >= 13 {
                 tr.skip(8);
             }
-            // Record type 0x08 is an affine matrix, 0x01 (version 16+) an
+            // Record type 0x08 is an affine matrix, 0x01 (version 15+) an
             // envelope, 0x10 (version 16+) a distortion; others are
             // ignored.
             match tr.u16() {
@@ -2769,7 +2793,7 @@ impl<'a> Ctx<'a> {
                     }
                     continue;
                 }
-                Some(0x01) if v >= 16 => {
+                Some(0x01) if v >= 15 => {
                     if chain.projective.is_some() {
                         self.report
                             .warn("an envelope after a perspective is not applied");
@@ -4122,6 +4146,57 @@ impl<'a> Ctx<'a> {
         Some((steps, settings))
     }
 
+    /// The drop shadow of a linked group whose own `lgob` holds a `loda`
+    /// of object type 23 ([`OBJ_DROP_SHADOW`]): an empty group that
+    /// follows the object it shadows (version 15, #3222; later versions
+    /// keep a picture of the shadow in the group, drawn as it is). Its
+    /// argument of type 3000 is a record of 119 bytes starting with u32
+    /// 0x514 and u32 111 (offsets from the record's start): the offset
+    /// as two i32 in the units of the coordinates at 8 and 12, the
+    /// opacity as a u32 out of 255 at 16, the feathering as a u32 at 20,
+    /// the colour at 57 and the merge code at 103 (9 multiplies, 0
+    /// Normal, as the transparency record's). The other fields are not
+    /// read; the shadow is flat, feathered in the middle.
+    fn drop_shadow_record(&mut self, group: &Chunk) -> Option<tracedraw_core::document::Shadow> {
+        let lgob = group.children.iter().find(|k| k.is(b"lgob"))?;
+        let loda = lgob.children.iter().find(|k| k.is(b"loda"))?;
+        let d = self.data(loda);
+        let l = self.read_loda(d)?;
+        if l.kind != OBJ_DROP_SHADOW {
+            return None;
+        }
+        let arg = l.args.iter().find(|a| a.ty == ARG_BLEND_STEPS)?;
+        let rec = d.get(arg.off..arg.end)?;
+        if rec.len() < DROP_SHADOW_RECORD_LEN || rec[..8] != [0x14, 0x05, 0, 0, 0x6f, 0, 0, 0] {
+            return None;
+        }
+        let mut r = self.reader_at(rec, 8);
+        let dx = f64::from(r.i32()?) * UNIT_MM;
+        let dy = f64::from(r.i32()?) * UNIT_MM;
+        let opacity = f64::from(r.u32()?.min(255)) / 255.0;
+        let feather = f64::from(r.u32()?.min(500));
+        let mut r = self.reader_at(rec, 57);
+        let color = self.read_color(&mut r)?;
+        let merge = match self.reader_at(rec, 103).u32()? {
+            9 => tracedraw_core::live::MergeMode::Multiply,
+            0 => tracedraw_core::live::MergeMode::Normal,
+            code => {
+                self.report.warn(format!(
+                    "drop shadow merge mode {code} not read; the shadow multiplies"
+                ));
+                tracedraw_core::live::MergeMode::Multiply
+            }
+        };
+        Some(tracedraw_core::document::Shadow {
+            offset: tracedraw_core::geometry::Vec2::new(dx, dy),
+            opacity,
+            blur: feather * DROP_SHADOW_FEATHER_MM,
+            color,
+            merge,
+            ..Default::default()
+        })
+    }
+
     /// The offset (mm) of a contour's linked group (`LIST lnkg` whose own
     /// `lgob` holds a `loda` of object type 15): the u32 at the start of
     /// its argument of type 3000, in the units of the coordinates. The
@@ -4262,6 +4337,8 @@ impl<'a> Ctx<'a> {
         // A version 16+ transparency record read on its own, for a style
         // string that does not say what the transparency is (#2960).
         let mut record_transparency: Option<RecordTransparency> = None;
+        // How a version 13 to 15 transparency mixes with what lies beneath.
+        let mut record_merge = tracedraw_core::live::MergeMode::Normal;
 
         for arg in &l.args {
             match arg.ty {
@@ -4272,6 +4349,7 @@ impl<'a> Ctx<'a> {
                         v15_mask_axis = Some(axis);
                     }
                     record_transparency = self.read_transparency_record_v16(d, *arg);
+                    record_merge = self.read_transparency_merge(d, *arg);
                     if let Some(l) = self.read_lens(d, *arg) {
                         lens = Some(l);
                     } else if let Some((o, m)) = self.read_transparency_v11(d, *arg) {
@@ -4282,6 +4360,10 @@ impl<'a> Ctx<'a> {
                         v15_mask_axis = axis;
                     } else if let Some(o) = self.read_uniform_transparency_record(d, *arg) {
                         record_opacity = Some(o);
+                    } else if self.v < 16 && record_transparency.is_some() {
+                        // Versions 13 to 15: the record read above is the
+                        // transparency, not the bytes the oldest files
+                        // keep their amount in (#3222).
                     } else if let Some(o) = self.read_opacity(d, *arg) {
                         opacity = o;
                     }
@@ -4729,8 +4811,22 @@ impl<'a> Ctx<'a> {
                 .effects
                 .push(tracedraw_core::live::Effect::Transparency {
                     mask,
-                    merge: tracedraw_core::live::MergeMode::Normal,
+                    merge: record_merge,
                     target,
+                });
+        } else if record_merge != tracedraw_core::live::MergeMode::Normal && shape.opacity < 1.0 {
+            // A uniform transparency that does not merge as Normal: a
+            // mask of one grey, whose lightness is the opacity.
+            let grey = Color::Gray {
+                v: shape.opacity as f32,
+            };
+            shape.opacity = 1.0;
+            shape
+                .effects
+                .push(tracedraw_core::live::Effect::Transparency {
+                    mask: Fill::Solid(grey),
+                    merge: record_merge,
+                    target: 2,
                 });
         }
         if let Some(l) = lens {
@@ -4897,8 +4993,8 @@ impl<'a> Ctx<'a> {
         };
         let mut contents = self.read_objects(group, ids, page_size, depth + 1);
         // The contents' group may carry an envelope of its own (version
-        // 16+), as other groups do.
-        if self.v >= 16 {
+        // 15+), as other groups do.
+        if self.v >= 15 {
             if let Some(chain) = self.own_transform_chain(group) {
                 if !chain.warps.is_empty() {
                     for child in contents.iter_mut() {
@@ -4976,6 +5072,9 @@ impl<'a> Ctx<'a> {
         // Contours found in this list: where their steps start and end
         // among the objects read, and their offset (see `contour_record`).
         let mut contours: Vec<(usize, usize, f64)> = Vec::new();
+        // Brush strokes: where their objects start and end, and
+        // their linked group's number (see `crate::artistic`).
+        let mut strokes: Vec<(usize, usize, u32)> = Vec::new();
         for c in &list.children {
             if c.is(b"obj ") {
                 let id = ids.shape();
@@ -5011,6 +5110,7 @@ impl<'a> Ctx<'a> {
                         }
                         shape.visible &= visible;
                         self.note_static_id(c, shape.id);
+                        self.note_link_number(c, shape.id);
                         out.push(shape);
                     }
                     None if std::mem::take(&mut self.last_was_guide) => {}
@@ -5044,10 +5144,11 @@ impl<'a> Ctx<'a> {
                     self.outer_transform = saved * m;
                 }
                 let mut children = self.read_objects(c, ids, page_size, depth + 1);
-                // A version 16+ group with an envelope: its objects carry
-                // the matrices before the envelope; the envelope and the
-                // matrices after it are the group's own.
-                if self.v >= 16 {
+                // A version 15+ group with an envelope (#3222 for version
+                // 15): its objects carry the matrices before the envelope;
+                // the envelope and the matrices after it are the group's
+                // own.
+                if self.v >= 15 {
                     if let Some(chain) = self.own_transform_chain(c) {
                         if !chain.warps.is_empty() {
                             for child in children.iter_mut() {
@@ -5180,7 +5281,13 @@ impl<'a> Ctx<'a> {
                 // between its two end objects, its `loda` of object type 7
                 // holding the step count (#597).
                 if out.len() == before {
-                    if let Some((steps, settings)) = self.blend_steps(c) {
+                    // A version 15 drop shadow: an empty linked group
+                    // after its object, its record holding the settings.
+                    if let Some(shadow) = self.drop_shadow_record(c) {
+                        if let Some(owner) = out.last_mut() {
+                            owner.shadow = Some(shadow);
+                        }
+                    } else if let Some((steps, settings)) = self.blend_steps(c) {
                         let steps = self.budget_blend_steps(steps);
                         blends.push((before, steps, settings));
                     }
@@ -5188,6 +5295,8 @@ impl<'a> Ctx<'a> {
                     // A contour keeps its steps as objects of its linked
                     // group, which stands just before its object (#1031).
                     contours.push((before, out.len(), offset));
+                } else if let Some(number) = self.artistic_group(c) {
+                    strokes.push((before, out.len(), number));
                 }
             } else if c.list_type.is_some() {
                 // Other lists (`lgob`, `spnd`, ...) are not objects, but
@@ -5242,7 +5351,87 @@ impl<'a> Ctx<'a> {
                 },
             });
         }
+        self.mark_brush_strokes(out, first, &strokes);
         self.make_contours_live(out, &contours);
+    }
+
+    /// Keep the number (`spnd`) and identity (`spid`) of the object list
+    /// `c` read as `shape`, while the file links objects (`lnkt`).
+    fn note_link_number(&mut self, c: &Chunk, shape: tracedraw_core::ShapeId) {
+        if self.links.is_empty() {
+            return;
+        }
+        if let Some(n) = c
+            .children
+            .iter()
+            .find(|k| k.is(b"spnd"))
+            .and_then(|k| self.reader(self.data(k)).u32())
+        {
+            self.spnd_shapes.insert(n, shape);
+        }
+        if let Some(u) = c
+            .children
+            .iter()
+            .find(|k| k.is(b"spid"))
+            .and_then(|k| crate::artistic::uid_of_spid(self.data(k)))
+        {
+            self.spids.insert(shape, u);
+        }
+    }
+
+    /// The number (`spnd`) of a linked group that is a brush
+    /// stroke (its own `lgob` holds a `loda` of object type 28) linked
+    /// to a guide in the link table.
+    fn artistic_group(&mut self, group: &Chunk) -> Option<u32> {
+        if self.links.is_empty() {
+            return None;
+        }
+        let lgob = group.children.iter().find(|k| k.is(b"lgob"))?;
+        let loda = lgob.children.iter().find(|k| k.is(b"loda"))?;
+        let l = self.read_loda(self.data(loda))?;
+        if l.kind != crate::artistic::OBJ_ARTISTIC_GROUP {
+            return None;
+        }
+        let sp = group.children.iter().find(|k| k.is(b"spnd"))?;
+        let n = self.reader(self.data(sp)).u32()?;
+        self.links.contains_key(&n).then_some(n)
+    }
+
+    /// Mark the guide of each brush stroke of `strokes` (its
+    /// objects `out[start..end]`) with them, the guide being among the
+    /// objects of this list read from `first` (see `crate::artistic`).
+    /// The objects stay as the file draws them.
+    fn mark_brush_strokes(&mut self, out: &mut [Shape], first: usize, strokes: &[(usize, usize, u32)]) {
+        for &(start, end, number) in strokes {
+            let guide = self
+                .links
+                .get(&number)
+                .and_then(|g| self.spnd_shapes.get(g))
+                .and_then(|id| {
+                    out.iter()
+                        .enumerate()
+                        .skip(first)
+                        .find(|(i, s)| (*i < start || *i >= end) && s.id == *id)
+                        .map(|(i, _)| i)
+                })
+                .filter(|&i| matches!(out[i].kind, ShapeKind::Path { .. }));
+            let Some(gi) = guide else {
+                continue;
+            };
+            let all_known = out[start..end].iter().all(|s| self.spids.contains_key(&s.id));
+            if end - start < 2 || !all_known || !self.spids.contains_key(&out[gi].id) {
+                continue;
+            }
+            for i in (start..end).chain(std::iter::once(gi)) {
+                if out[i].uid.is_none() {
+                    out[i].uid = self.spids.get(&out[i].id).copied();
+                }
+            }
+            let objects = out[start..end].to_vec();
+            if crate::artistic::mark(&mut out[gi], &objects) {
+                log::debug!("Brush stroke of {} objects on a guide", objects.len());
+            }
+        }
     }
 
     /// Make each contour of `contours` live: the object right after its
@@ -5548,12 +5737,19 @@ impl<'a> Ctx<'a> {
     /// mostly say the same in the object's style string, which wins;
     /// this is for a style string that does not. `None` for other
     /// records.
+    ///
+    /// Versions 13 to 15 have no style string, and the record is all
+    /// there is (#3222, a version 15 file of 19 pages whose reference
+    /// pictures show its panels and pads see-through): a uniform type 0
+    /// with its amount (33, 44 and 66 percent in that file, which before
+    /// came out solid; 0 at byte 29 marks it) and patterns of type 9
+    /// read the same way.
     fn read_transparency_record_v16(
         &mut self,
         d: &'a [u8],
         arg: Arg,
     ) -> Option<RecordTransparency> {
-        if self.v < 16 || arg.end.checked_sub(arg.off)? < 8 + 117 {
+        if self.v < 13 || arg.end.checked_sub(arg.off)? < 8 + 117 {
             return None;
         }
         let data = d.get(..arg.end)?;
@@ -5562,7 +5758,12 @@ impl<'a> Ctx<'a> {
             return None;
         }
         let body = r.pos - 1;
-        let kind = self.reader_at(data, body + 37).u16()?;
+        let mut kind = self.reader_at(data, body + 37).u16()?;
+        // Versions 13 to 15 mark a uniform transparency with 0 at byte
+        // 29 (1 for the others), whatever byte 37 holds.
+        if self.v < 16 && self.reader_at(data, body + 29).u32()? == 0 {
+            kind = 0;
+        }
         let percent = self.reader_at(data, body + 61).f64()?;
         let end = self.reader_at(data, body + 69).f64()?;
         let fill_id = self.reader_at(data, body + 105).u32()?;
@@ -5587,6 +5788,45 @@ impl<'a> Ctx<'a> {
                     "transparency of type {kind} names fill {fill_id}, not a fountain or pattern; object drawn opaque"
                 ));
                 None
+            }
+        }
+    }
+
+    /// The merge mode of a version 13 to 15 transparency record (see
+    /// `read_transparency_record_v16`): a u32 at byte 77 of the body
+    /// (#3222). Code 0 is Normal. Code 9 darkens what lies beneath by
+    /// the object's colour: the version 15 file of #3222 holds it on
+    /// two light grey panels at 50 percent over teal, and its reference
+    /// pictures show them as a darker teal of the same hue (each channel
+    /// about 0.89 of the teal beneath, which a 50 percent multiply by a
+    /// grey of 0.78 gives; a Normal mix gave a pale grey). Other codes
+    /// are named in a warning and merge as Normal. Later versions keep
+    /// the mode in the style string.
+    fn read_transparency_merge(
+        &mut self,
+        d: &'a [u8],
+        arg: Arg,
+    ) -> tracedraw_core::live::MergeMode {
+        use tracedraw_core::live::MergeMode;
+        if !(13..16).contains(&self.v) || arg.end.saturating_sub(arg.off) < 8 + 117 {
+            return MergeMode::Normal;
+        }
+        let Some(data) = d.get(..arg.end) else {
+            return MergeMode::Normal;
+        };
+        let mut r = self.reader_at(data, arg.off);
+        if r.u32() != Some(0x514) || r.u32() != Some(117) || r.u8() != Some(5) {
+            return MergeMode::Normal;
+        }
+        let body = r.pos - 1;
+        match self.reader_at(data, body + 77).u32() {
+            None | Some(0) => MergeMode::Normal,
+            Some(9) => MergeMode::Multiply,
+            Some(code) => {
+                self.report.warn(format!(
+                    "transparency merge mode {code} not read; object merged as Normal"
+                ));
+                MergeMode::Normal
             }
         }
     }
@@ -7983,7 +8223,7 @@ fn paragraph_spacing(style: &text::RunStyle, base: &ParagraphStyle) -> Paragraph
     }
     // Character and word spacing count in widths of the font's space
     // character, as the paragraph's spacing does (#2586; they were read
-    // as a quarter of the em, which made text wider than in CorelDRAW).
+    // as a quarter of the em, which made text too wide).
     if let Some(cs) = style.char_spacing {
         p.char_spacing_pct = (cs * 100.0).clamp(-100.0, 2000.0);
     }
@@ -11419,6 +11659,76 @@ pub(crate) mod tests {
         (steps, rep)
     }
 
+    /// A version 15 drop shadow is an empty linked group after its object,
+    /// its `loda` of object type 23 holding a record of 119 bytes: the
+    /// offset, the opacity out of 255, the feathering, the colour and the
+    /// merge code (#3222). The ellipse before it gets the shadow; the one
+    /// after it keeps none, and nothing is drawn for the group.
+    #[test]
+    fn version_15_drop_shadow_goes_to_the_object_before_it() {
+        let v = 15u16;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let ellipse = |x: i32| {
+            let mut c = i32s(&[x, -100_000, x + 200_000, 100_000]);
+            c.extend_from_slice(&u32s(&[0]));
+            list(
+                b"obj ",
+                &[
+                    chunk(b"loda", &loda(OBJ_ELLIPSE, &[(ARG_COORDS, c)])),
+                    chunk(b"trfd", &trfd(v, identity)),
+                ]
+                .concat(),
+            )
+        };
+        let record = |merge: u32| {
+            let mut r = u32s(&[0x514, 111]);
+            r.extend_from_slice(&i32s(&[69_478, -31_429]));
+            r.extend_from_slice(&u32s(&[200, 15, 3]));
+            r.extend_from_slice(&[0; 12]);
+            r.extend_from_slice(&1.0f64.to_le_bytes());
+            r.extend_from_slice(&u32s(&[0]));
+            r.extend_from_slice(&[1, 12, 0, 0, 0]);
+            // CMYK black: model 2, palette 5, C M Y K 0 0 0 100.
+            r.extend_from_slice(&[2, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 100]);
+            r.extend_from_slice(&[0; 30]);
+            r.extend_from_slice(&u32s(&[1, merge]));
+            r.extend_from_slice(&[0; 12]);
+            assert_eq!(r.len(), 119);
+            r
+        };
+        let group = |merge: u32| {
+            let args = vec![(3000, record(merge)), (100, u32s(&[0x23c5e88]))];
+            list(b"lnkg", &list(b"lgob", &chunk(b"loda", &loda(23, &args))))
+        };
+        for (merge, mode) in [
+            (9, tracedraw_core::live::MergeMode::Multiply),
+            (0, tracedraw_core::live::MergeMode::Normal),
+        ] {
+            let objects = [ellipse(0), group(merge), ellipse(600_000)].concat();
+            let body = [
+                chunk(b"mcfg", &mcfg(v, 2_540_000, 2_540_000)),
+                list(b"page", &list(b"layr", &objects)),
+            ]
+            .concat();
+            let (doc, _) = parse(&riff(b"CDRD", &body), v);
+            // The layer lists its objects from the top.
+            let shapes = &doc.pages[0].layers[0].shapes;
+            assert_eq!(shapes.len(), 2);
+            assert!(shapes[0].shadow.is_none());
+            let s = shapes[1].shadow.expect("the shadow of the first ellipse");
+            assert!((s.offset.x - 6.9478).abs() < 1e-9, "{:?}", s.offset);
+            assert!((s.offset.y + 3.1429).abs() < 1e-9, "{:?}", s.offset);
+            assert!((s.opacity - 200.0 / 255.0).abs() < 1e-9);
+            assert!((s.blur - 1.5).abs() < 1e-9);
+            assert_eq!(
+                s.color,
+                tracedraw_core::color::Color::cmyk_pct(0.0, 0.0, 0.0, 100.0)
+            );
+            assert_eq!(s.merge, mode);
+            assert!(s.perspective.is_none());
+        }
+    }
+
     /// A step count field holding no count a blend can have (0, or a
     /// value past 999, as another layout would put there) gives the
     /// default 20 steps and a warning naming the value; it was kept to
@@ -11841,6 +12151,97 @@ pub(crate) mod tests {
         let shapes = &doc.pages[0].layers[0].shapes;
         assert_eq!(shapes.len(), 4);
         assert!(shapes.iter().all(|s| s.effects.is_empty()));
+    }
+
+    /// A brush stroke as the version 27 file of #3680 keeps it:
+    /// the guide curve (numbered 2), then a linked group (numbered 1)
+    /// whose `loda` is of object type 28 holding the objects the brush
+    /// repeats, the document's link table pairing the group with the
+    /// guide. The objects stay as drawn; the guide is marked with them by
+    /// the file's identities (`spid`), which they take (#3680).
+    #[test]
+    fn a_brush_stroke_group_marks_its_guide_with_its_objects() {
+        let v = 9u16;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let spid = |n: u8| {
+            let mut b = [0u8; 16];
+            b[0] = n;
+            b[15] = 0xa0;
+            chunk(b"spid", &b)
+        };
+        let obj = |number: u32, id: u8, coords: Vec<u8>| {
+            list(
+                b"obj ",
+                &[
+                    chunk(b"spnd", &u32s(&[number])),
+                    spid(id),
+                    chunk(b"loda", &loda(OBJ_CURVE, &[(ARG_COORDS, coords)])),
+                    chunk(b"trfd", &trfd(v, identity)),
+                ]
+                .concat(),
+            )
+        };
+        let square = |a: i32| {
+            let b = a + 20_000;
+            let mut c = u32s(&[5]);
+            c.extend_from_slice(&i32s(&[a, 0, b, 0, b, 20_000, a, 20_000, a, 0]));
+            c.extend_from_slice(&[0x08, 0x40, 0x40, 0x40, 0x48]);
+            c
+        };
+        let mut guide = u32s(&[2]);
+        guide.extend_from_slice(&i32s(&[0, 10_000, 500_000, 10_000]));
+        guide.extend_from_slice(&[0x08, 0x40]);
+        let read = |kind: u32, linked: bool| {
+            let group = list(
+                b"lnkg",
+                &[
+                    chunk(b"spnd", &u32s(&[1])),
+                    list(b"lgob", &chunk(b"loda", &loda(kind, &[(ARG_BLEND_STEPS, vec![0; 692])]))),
+                    obj(3, 3, square(0)),
+                    obj(4, 4, square(100_000)),
+                    obj(5, 5, square(200_000)),
+                ]
+                .concat(),
+            );
+            let mut lnkt = u32s(&[52, 1, 12, 20, 52, 0x100, 1, 2]);
+            lnkt.resize(52, 0);
+            let body = [
+                chunk(b"mcfg", &mcfg(v, 2_540_000, 2_540_000)),
+                if linked { chunk(b"lnkt", &lnkt) } else { Vec::new() },
+                list(
+                    b"page",
+                    &list(b"layr", &[obj(2, 2, guide.clone()), group].concat()),
+                ),
+            ]
+            .concat();
+            parse(&riff(b"CDRD", &body), v).0
+        };
+        let key = crate::artistic::DATA_KEY;
+        let doc = read(crate::artistic::OBJ_ARTISTIC_GROUP, true);
+        let shapes = &doc.pages[0].layers[0].shapes;
+        assert_eq!(shapes.len(), 4, "the objects stay");
+        let guide = shapes
+            .iter()
+            .find(|s| s.data.iter().any(|(k, _)| k == key))
+            .expect("guide marked");
+        assert!(matches!(guide.kind, ShapeKind::Path { .. }));
+        let uid = |n: u8| {
+            let mut b = [0u8; 16];
+            b[0] = n;
+            b[15] = 0xa0;
+            format!("{:032x}", u128::from_le_bytes(b))
+        };
+        assert_eq!(guide.uid.map(|u| format!("{:032x}", u.0)), Some(uid(2)));
+        let mark = &guide.data.iter().find(|(k, _)| k == key).expect("mark").1;
+        let v: serde_json::Value = serde_json::from_str(mark).expect("json");
+        assert_eq!(v["objects"], serde_json::json!([uid(3), uid(4), uid(5)]));
+        // Another linked group, or no link table: nothing marked.
+        for doc in [read(15, true), read(crate::artistic::OBJ_ARTISTIC_GROUP, false)] {
+            assert!(doc.pages[0].layers[0]
+                .shapes
+                .iter()
+                .all(|s| s.data.iter().all(|(k, _)| k != key)));
+        }
     }
 
     /// A blend starts a rectangle at its corner at the origin, along its
@@ -14187,6 +14588,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// #3222: the uniform transparencies of a version 15 file (0 at byte
+    /// 29 of the record, the amount at 61) opened solid, so its panels
+    /// hid the names behind them; and its merge code at byte 77, 9 on
+    /// two grey panels its reference pictures show darkening the teal
+    /// beneath, merged as Normal (a pale grey).
+    #[test]
+    fn version_15_uniform_transparency_and_its_merge_mode() {
+        use tracedraw_core::live::{Effect, MergeMode};
+        let record = |percent: f64, merge: u32| {
+            let mut b = vec![5u8];
+            b.extend_from_slice(&u32s(&[1]));
+            b.resize(37, 0);
+            // Byte 37 holds 1 in such records too; byte 29 says uniform.
+            b.extend_from_slice(&u16s(&[1]));
+            b.resize(61, 0);
+            b.extend_from_slice(&f64s(&[percent, 100.0]));
+            b.resize(77, 0);
+            b.extend_from_slice(&u32s(&[merge, 2]));
+            b.resize(105, 0);
+            b.extend_from_slice(&u32s(&[3]));
+            b.resize(117, 0);
+            [u32s(&[0x514, 117]), b].concat()
+        };
+        let doc_of = |op: Vec<u8>| {
+            let mut coords = u32s(&[5]);
+            coords.extend_from_slice(&i32s(&[0, 0, 254000, 0, 254000, 254000, 0, 254000, 0, 0]));
+            coords.extend_from_slice(&[0x08, 0x40, 0x40, 0x40, 0x48]);
+            let obj = list(
+                b"obj ",
+                &chunk(
+                    b"loda",
+                    &loda(
+                        OBJ_CURVE,
+                        &[
+                            (ARG_COORDS, coords),
+                            (ARG_FILL, u32s(&[3])),
+                            (ARG_OPACITY, op),
+                        ],
+                    ),
+                ),
+            );
+            let body = [
+                chunk(b"mcfg", &mcfg(15, 2_540_000, 2_540_000)),
+                chunk(b"fild", &solid_fild_v13(3, (190, 190, 190))),
+                list(b"page", &list(b"layr", &obj)),
+            ]
+            .concat();
+            let (doc, rep) = parse(&riff(b"CDRF", &body), 15);
+            assert_eq!(rep.shapes, 1, "{:?}", rep.warnings);
+            (first_shape(&doc).clone(), rep)
+        };
+        // 44 % see-through, merged as Normal: an opacity.
+        let (s, _) = doc_of(record(44.0, 0));
+        assert!((s.opacity - 0.56).abs() < 1e-9, "{}", s.opacity);
+        assert!(s.effects.is_empty(), "{:?}", s.effects);
+        // 50 %, merge code 9: a grey mask of the opacity, multiplied.
+        let (s, _) = doc_of(record(50.0, 9));
+        assert_eq!(s.opacity, 1.0);
+        match s.effects.as_slice() {
+            [Effect::Transparency {
+                mask: Fill::Solid(Color::Gray { v }),
+                merge: MergeMode::Multiply,
+                target: 2,
+            }] => assert!((v - 0.5).abs() < 1e-6, "{v}"),
+            other => panic!("{other:?}"),
+        }
+        // A code not known yet: Normal, named in a warning.
+        let (s, rep) = doc_of(record(50.0, 6));
+        assert!((s.opacity - 0.5).abs() < 1e-9, "{}", s.opacity);
+        assert!(
+            rep.warnings.iter().any(|w| w.contains("merge mode 6")),
+            "{:?}",
+            rep.warnings
+        );
+        // None at all: solid.
+        let (s, _) = doc_of(record(0.0, 0));
+        assert_eq!(s.opacity, 1.0);
+        assert!(s.effects.is_empty());
+    }
+
     /// The shapes of pages 1 and 2 of the reporter's version 13 file
     /// (#1257): argument 8000 holds the same 117-byte record as version
     /// 15, here naming a fountain of greys (colour model 9, 255 to 0). The
@@ -15987,6 +16468,16 @@ pub(crate) mod tests {
     /// (fill `fill` when given), whose `trfl` holds `trfd` and `envds`, in
     /// a group when `grouped` (the group's `lgob` holding them instead).
     fn envelope_file(trfd: Vec<u8>, envds: &[Vec<u8>], grouped: bool) -> (Document, ParseReport) {
+        envelope_file_of(27, trfd, envds, grouped)
+    }
+
+    /// [`envelope_file`] in version `v`.
+    fn envelope_file_of(
+        v: u16,
+        trfd: Vec<u8>,
+        envds: &[Vec<u8>],
+        grouped: bool,
+    ) -> (Document, ParseReport) {
         let mut coords = u32s(&[5]);
         coords.extend_from_slice(&i32s(&[
             0, 0, 0, 100_000, 100_000, 100_000, 100_000, 0, 0, 0,
@@ -16033,11 +16524,12 @@ pub(crate) mod tests {
             None => obj,
         };
         let body = [
-            chunk(b"mcfg", &mcfg(27, 2_540_000, 2_540_000)),
+            chunk(b"mcfg", &mcfg(v, 2_540_000, 2_540_000)),
             list(b"page", &list(b"layr", &layer)),
         ]
         .concat();
-        parse(&riff(b"CDRR", &body), 27)
+        let tag = [b'C', b'D', b'R', b'A' + (v - 10) as u8];
+        parse(&riff(&tag, &body), v)
     }
 
     /// The outline of an envelope over the box (0, 0)-(20, 10) mm whose
@@ -16117,6 +16609,70 @@ pub(crate) mod tests {
             (b.height() - 10.0).abs() < 1e-6 && (b.y0 - (c + 5.0)).abs() < 1e-6,
             "{b:?}"
         );
+    }
+
+    /// #3222: a version 15 file holds its envelopes as version 16 does
+    /// (the dance pads and panels of the reporter's 19-page file, drawn
+    /// flat and out of place before): on an object and on a group.
+    #[test]
+    fn version_15_envelopes_bend_objects_and_groups() {
+        let c = 127.0;
+        // An object: stretched, bent so its right side rises to 20 mm,
+        // then moved 5 mm up.
+        let t = trfd_v16(&[
+            trfd_matrix([2.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            trfd_envelope([0, 100_000, 200_000, 0], [0, 1, 4, 5], 7),
+            trfd_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 50_000.0]),
+        ]);
+        let (doc, rep) = envelope_file_of(15, t, &[raised_envelope()], false);
+        assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+        let b = first_shape(&doc).page_path().bounding_box();
+        for (got, want) in [
+            (b.x0, c),
+            (b.x1, c + 20.0),
+            (b.y0, c + 5.0),
+            (b.y1, c + 25.0),
+        ] {
+            assert!((got - want).abs() < 0.05, "{b:?}");
+        }
+        // A group: the matrix before the envelope is already in its
+        // objects; the envelope and the move after it are the group's.
+        let t = trfd_v16(&[
+            trfd_matrix([3.0, 0.0, 0.0, 0.0, 3.0, 0.0]),
+            trfd_envelope([0, 100_000, 100_000, 0], [0, 1, 4, 5], 7),
+            trfd_matrix([1.0, 0.0, 100_000.0, 0.0, 1.0, 0.0]),
+        ]);
+        let env = envd(
+            &[
+                (0, 0),
+                (0, 100_000),
+                (33_333, 133_333),
+                (66_667, 166_667),
+                (100_000, 200_000),
+                (100_000, 0),
+                (0, 0),
+            ],
+            &[0x0c, 0x44, 0xc0, 0xc0, 0x84, 0x44, 0x48],
+        );
+        let (doc, rep) = envelope_file_of(15, t, &[env], true);
+        assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+        let s = first_shape(&doc);
+        let ShapeKind::Group { children } = &s.kind else {
+            panic!("{:?}", s.kind);
+        };
+        for child in children {
+            let b = s
+                .transform
+                .transform_rect_bbox(child.page_path().bounding_box());
+            for (got, want) in [
+                (b.x0, c + 10.0),
+                (b.x1, c + 20.0),
+                (b.y0, c),
+                (b.y1, c + 20.0),
+            ] {
+                assert!((got - want).abs() < 0.05, "{b:?}");
+            }
+        }
     }
 
     /// A distortion entry (version 16+, type 0x10) as the version 27

@@ -92,6 +92,7 @@ fn detached_shadow_gradients_remain_independent_and_editable() {
                     opacity: 0.8,
                     blur: 2.0,
                     merge,
+                    spread: 0.0,
                 },
                 true,
             );
@@ -318,6 +319,7 @@ fn every_kind_of_shadow_breaks_off_its_object() {
             opacity: 0.8,
             blur: 1.0,
             merge: MergeMode::Multiply,
+            spread: 0.0,
         },
         true,
     );

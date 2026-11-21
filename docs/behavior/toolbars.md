@@ -164,13 +164,34 @@ a click lower on the tab brings the panel to the front
 - A floating panel is a window with a grey border and a shadow: the
   panel's title bar (its name and close; no collapse) over its page,
   resizable at its edges; where it is and how large are kept.
+- Own Window in a panel's tab and title menus (after the places, ticked
+  while it is on) gives the panel a window of the system of its own, to
+  put it on another monitor (#2884, `App::set_docker_own_window`,
+  `dockers::own_window`): a panel in a column floats first. The window is
+  titled "TraceDraw - " and the panel's name and holds the panel's title
+  bar (its menu, close) over its page; it opens where the panel floated
+  (or where its window was last), its place on the desktop and its size
+  are kept with the floating panels (`FloatingSetup::own_window`,
+  `desktop`; preferences without them read as before). Dragging the
+  panel's title there does not start a dock drag; the system's title bar
+  moves the window. Closing the window closes the panel; unticking Own
+  Window brings it back to float in the main window, and choosing a
+  column in its menu docks it. Where the system cannot open more windows
+  (the web, Android) the item is grey and such a panel floats in the main
+  window
+  (`dockers::tests::a_panel_goes_to_a_window_of_its_own_and_back`).
 - A panel brought to the front from a menu, a shortcut or a tool while it
   lies in the other column or floats is put in front where it is, and
   the default column stays as it was; a panel open nowhere joins the
   default column (`App::open_docker`, `App::reconcile_dockers`). Window >
-  Panels and the Help > Hints check show a panel as on when it is in
-  front of an open column or floating (`App::docker_shown`); the plus
-  button of a column opens a ticked panel in front of that column.
+  Dockers (and Object > Properties, Object > Objects and the Effects
+  menu's panels) checks every panel open in an open column, its tab in
+  front or behind another, or floating; choosing a checked one behind
+  another brings it to the front (`menus::effect_docker_open`, #3663:
+  only the panel in front was checked, so the open ones behind looked
+  closed). The Help > Hints check shows Hints as on when it is in front
+  of an open column or floating (`App::docker_shown`); the plus button
+  of a column opens a ticked panel in front of that column.
 - The places are kept in the preferences (`dockers`: `open`, `front`,
   `left`, `left_front`, `left_shown`, `inner`, `inner_front`,
   `inner_shown`, `left_inner`, `left_inner_front`, `left_inner_shown`

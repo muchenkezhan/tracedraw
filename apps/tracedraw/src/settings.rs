@@ -401,6 +401,11 @@ pub struct Settings {
     /// selected curve (node tracking).
     #[serde(default)]
     pub node_tracking: bool,
+    /// Options > Display: while the selection is moved, scaled, turned or
+    /// slanted, the objects themselves are drawn where they would go, not
+    /// only their outline (#3569). Off by default.
+    #[serde(default)]
+    pub live_transform_preview: bool,
     /// Options > Display: Shift, Ctrl, Alt and Delete on the drawing,
     /// where there is a touch screen (#1996).
     #[serde(default = "default_true")]
@@ -520,6 +525,11 @@ pub struct Settings {
     /// Options > Tools > Pick: the Pick tool's pointer is a cross hair.
     #[serde(default)]
     pub crosshair_cursor: bool,
+    /// Options > Tools > Pick: the lines of the cross hair pointer (the
+    /// Pick tool's with the option above, and the drawing tools') run to
+    /// the edges of the drawing window. Off by default (#2996).
+    #[serde(default)]
+    pub crosshair_to_edges: bool,
     /// Options > Display > Ruler calibration: pixels per inch of the
     /// screen at the system's scaling, so that zoom 100% shows real sizes
     /// (96 by default; see `screen_points_per_inch`).
@@ -882,13 +892,18 @@ pub struct StackSetup {
 }
 
 /// A floating docker as it was left: its name key, the window's top left
-/// corner and its size (screen points).
+/// corner and its size (screen points); whether it was in a window of its
+/// own (#2884) and where that window was on the desktop.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FloatingSetup {
     pub tab: String,
     pub pos: [f32; 2],
     pub size: [f32; 2],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub own_window: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<[f32; 2]>,
 }
 
 /// Which bars are shown (Window > Toolbars, the bars' menu). The palette
@@ -1425,6 +1440,10 @@ pub struct PalettePrefs {
     /// title left out): its rows or columns flow from it (see
     /// `ui::palette::floating_flow`).
     pub float_size: [f32; 2],
+    /// The colours' names beside their swatches in the palette opened
+    /// out by a strip's double arrow, a scrolling list (#3512). Off by
+    /// default: the swatches in a grid.
+    pub show_names: bool,
 }
 
 /// The most rows (or columns) a docked palette bar shows.
@@ -1638,6 +1657,7 @@ impl Default for PalettePrefs {
             swatch_size: SWATCH_DEFAULT,
             document_swatch_size: 0,
             float_size: FLOAT_SIZE,
+            show_names: false,
         }
     }
 }
@@ -1730,16 +1750,34 @@ pub struct DocumentDefaults {
     /// default 30 mm).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_spacing: Option<f64>,
+    /// The guidelines of the master page, which every page shows (#3522).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub master_guidelines: Vec<tracedraw_core::document::Guide>,
+    /// The guidelines of the page saved from, which a new drawing's
+    /// first page gets (#3522).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_guidelines: Vec<tracedraw_core::document::Guide>,
 }
 
 impl DocumentDefaults {
+    /// The defaults of `doc`, with the guidelines of its first page.
     pub fn of(doc: &tracedraw_core::Document) -> Self {
+        Self::of_page(doc, doc.pages.first().map(|p| p.id))
+    }
+
+    /// The defaults of `doc`, with the guidelines of `page`.
+    pub fn of_page(doc: &tracedraw_core::Document, page: Option<tracedraw_core::PageId>) -> Self {
         DocumentDefaults {
             grid: doc.metadata.grid,
             rulers: doc.metadata.rulers.clone(),
             guides: doc.metadata.guides,
             objects: doc.defaults.clone(),
             page_spacing: doc.metadata.page_spacing,
+            master_guidelines: doc.master_guides.clone(),
+            page_guidelines: page
+                .and_then(|p| doc.page(p).ok())
+                .map(|p| p.guides.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -1748,6 +1786,15 @@ impl DocumentDefaults {
         doc.metadata.rulers = self.rulers.clone();
         doc.metadata.guides = self.guides;
         doc.metadata.page_spacing = self.page_spacing;
+        // The guidelines saved as the default (#3522).
+        if doc.master_guides.is_empty() {
+            doc.master_guides = self.master_guidelines.clone();
+        }
+        if let Some(first) = doc.pages.first_mut() {
+            if first.guides.is_empty() {
+                first.guides = self.page_guidelines.clone();
+            }
+        }
         doc.defaults = defaults_for(&self.objects, doc.metadata.primary_color_mode);
     }
 }
@@ -1889,6 +1936,8 @@ pub struct ToolPrefs {
     pub smart_outline_color: tracedraw_core::Color,
     /// Smart Fill stops at the outlines' edges, their width (#3321).
     pub smart_outline_edges: bool,
+    /// Smart Fill paints live fills of a group.
+    pub smart_fill_live: bool,
     /// The shaping brushes: nib radius (mm), Roughen's spike size (mm) and
     /// the rest of their bars.
     pub brush_radius: f64,
@@ -2027,6 +2076,7 @@ impl Default for ToolPrefs {
             smart_outline_width: 0.2,
             smart_outline_color: tracedraw_core::Color::BLACK,
             smart_outline_edges: false,
+            smart_fill_live: false,
             brush_radius: 10.0,
             roughen_amount: 2.0,
             brush: Default::default(),
@@ -2377,6 +2427,7 @@ impl Default for Settings {
             tracecut: Default::default(),
             hide_bbox_curve_tools: false,
             node_tracking: false,
+            live_transform_preview: false,
             touch_keys: true,
             touch_selection_bar: true,
             selection_bar_mouse: false,
@@ -2409,6 +2460,7 @@ impl Default for Settings {
             connector_gap: 0.0,
             upgrades: UPGRADES,
             crosshair_cursor: false,
+            crosshair_to_edges: false,
             screen_ppi: default_screen_ppi(),
             zoom_right_click_out: true,
             zoom_relative_1to1: true,
@@ -3534,22 +3586,26 @@ mod tests {
     }
 
     /// Preferences as an older version saved them, migrated as at start.
-    /// A first start snaps to guidelines and the page but not to objects,
-    /// within 10 screen pixels (#1814); a choice saved before is kept,
-    /// either way, and the app takes it.
+    /// A first start snaps to guidelines, the page and objects, within
+    /// 10 screen pixels (objects were off at first from #1814 on); a
+    /// choice saved before is kept, either way, and the app takes it.
     #[test]
-    fn new_installs_do_not_snap_to_objects_and_saved_choices_stay() {
+    fn new_installs_snap_to_objects_and_saved_choices_stay() {
         let s = Settings::default();
-        assert!(!s.snap.objects, "snapping to objects starts off");
+        assert!(s.snap.objects, "snapping to objects starts on");
         assert!(s.snap.guides && s.snap.page && !s.snap.off);
         assert_eq!(s.snap.threshold_px, 10.0);
         let on = migrated(r#"{"upgrades": 5, "snap": {"objects": true, "page": true}}"#);
         assert!(on.snap.objects);
+        let off = migrated(r#"{"upgrades": 5, "snap": {"objects": false, "page": true}}"#);
+        assert!(!off.snap.objects, "a saved choice of off stays");
         let old = migrated(r#"{"snap": {"objects": true, "page": false}}"#);
         assert!(old.snap.objects && !old.snap.page);
         let mut app = crate::app::App::headless();
         app.apply_settings(Settings::default());
-        assert!(!app.snap.objects && app.snap.page && app.snap.guides);
+        assert!(app.snap.objects && app.snap.page && app.snap.guides);
+        app.apply_settings(off);
+        assert!(!app.snap.objects);
         app.apply_settings(on);
         assert!(app.snap.objects);
     }

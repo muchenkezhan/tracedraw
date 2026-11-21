@@ -262,7 +262,9 @@ impl App {
             Tool::Extrude => self.extrude_input(response, p),
             Tool::Distort => self.distort_input(response, p),
             Tool::AreaFill => {
-                if response.clicked_by(PointerButton::Primary) {
+                if response.clicked_by(PointerButton::Primary)
+                    && !(self.area_fill_live && self.live_paint_at(p))
+                {
                     self.area_fill_at(p);
                 }
             }
@@ -315,6 +317,8 @@ impl App {
                     start_angle: 0.0,
                     current_angle: 0.0,
                     grab: None,
+                    start_radius: 0.0,
+                    scale: 1.0,
                 };
                 self.free_transform_last = p;
                 self.free_transform_reflected = false;
@@ -605,6 +609,72 @@ impl App {
         }
     }
 
+    /// Smart Fill with Live on: paint the area the lines of a group close
+    /// off around `p` as a live fill of the group (the selected group, or
+    /// else the topmost one whose bounds hold `p`), in the bar's fill
+    /// colour; with the fill set to none, take the fill there away.
+    /// Whether a group took the click: when none does, the click makes an
+    /// ordinary area as without Live.
+    pub fn live_paint_at(&mut self, p: Point) -> bool {
+        let is_group = |s: &Shape| matches!(s.kind, ShapeKind::Group { .. });
+        let selected = match self.selection[..] {
+            [id] => self.doc().find_shape(id).filter(|s| is_group(s)).cloned(),
+            _ => None,
+        };
+        let group = selected.or_else(|| {
+            self.doc()
+                .layers_for_page(self.page)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .filter(|l| l.visible && !l.locked)
+                .flat_map(|l| l.shapes.iter().rev())
+                .find(|s| is_group(s) && kurbo::Shape::bounding_box(&s.page_path()).contains(p))
+                .cloned()
+        });
+        let Some(group) = group else {
+            return false;
+        };
+        let color = match self.area_fill_mode {
+            1 => Some(self.area_fill_color),
+            2 => None,
+            _ => match self.default_fill() {
+                Fill::Solid(c) => Some(c),
+                _ => Some(self.area_fill_color),
+            },
+        };
+        let mut effects = group.effects.clone();
+        let mut fills = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::LivePaint { fills } => Some(fills.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let parent = self
+            .doc()
+            .parent_transform(group.id)
+            .unwrap_or(Affine::IDENTITY);
+        let local = (parent * group.transform).inverse() * p;
+        if !tracedraw_core::live_paint::paint_at(&group, &mut fills, local, color) {
+            return tracedraw_core::live_paint::region_at(&group, local).is_some();
+        }
+        match effects
+            .iter_mut()
+            .find(|e| matches!(e, Effect::LivePaint { .. }))
+        {
+            Some(e) => *e = Effect::LivePaint { fills },
+            None => effects.insert(0, Effect::LivePaint { fills }),
+        }
+        effects.retain(|e| !matches!(e, Effect::LivePaint { fills } if fills.is_empty()));
+        self.run(Command::SetEffects {
+            shape: group.id,
+            effects,
+        });
+        self.select(vec![group.id]);
+        true
+    }
+
     /// The symmetry object an Area Fill click at `p` falls in, among the
     /// page's top-level `shapes` (the one being edited first), and the
     /// transformation taking the click's copy back to the original's side
@@ -616,7 +686,8 @@ impl App {
                     center,
                     angle,
                     lines,
-                } => Some((*center, *angle, *lines)),
+                    rotate,
+                } => Some((*center, *angle, *lines, *rotate)),
                 _ => None,
             })
         };
@@ -627,7 +698,7 @@ impl App {
             order.sort_by_key(|s| s.id != edit);
         }
         for s in order {
-            let (center, angle, lines) = sym_of(s)?;
+            let (center, angle, lines, rotate) = sym_of(s)?;
             let ev = tracedraw_core::live::evaluate(s);
             let mut whole = ev.main.bounds();
             for part in ev.above.iter().chain(&ev.below) {
@@ -637,7 +708,9 @@ impl App {
                 continue;
             }
             let origin = ev.main.bounds().center();
-            let back = tracedraw_core::live::symmetry_back_to(center, angle, lines, origin, p);
+            let back = tracedraw_core::live::symmetry_back_to_turned(
+                center, angle, lines, rotate, origin, p,
+            );
             return Some((s.id, back));
         }
         None
@@ -667,8 +740,13 @@ impl App {
                     .map(move |(i, q)| ((s.id, i), q))
             })
             .collect();
+        // The Envelope tool takes only a mesh envelope's grid points.
+        let envelope_tool = self.tool == Tool::Envelope;
+        if envelope_tool {
+            points.retain(|((_, i), _)| is_mesh_envelope_node(*i));
+        }
         // After the nodes: a node and a handle as near win the node.
-        if let Some((id, i)) = self.selected_mesh_node() {
+        if let Some((id, i)) = self.selected_mesh_node().filter(|_| !envelope_tool) {
             if let Some(s) = self.doc().find_shape(id) {
                 points.extend(
                     mesh_handle_points(s, i)
@@ -690,7 +768,7 @@ impl App {
         // double-click also is.
         if response.double_clicked() {
             // Double-click on a mesh node: the grid lines through it go,
-            // as with Delete and as in CorelDRAW; a row or column could
+            // as with Delete; a row or column could
             // not be taken out with the mouse (d#2889).
             let on_node = self.effect_node_at(p).filter(|h| {
                 !crate::mesh_tool::is_mesh_handle(h.1)
@@ -707,7 +785,7 @@ impl App {
             if let Some(hit) = self.effect_node_at(p) {
                 // A handle keeps its node selected. Shift+click on a
                 // mesh node adds it to (or takes it out of) the chosen
-                // nodes, as in CorelDRAW (discussion #2387).
+                // nodes (discussion #2387).
                 if !crate::mesh_tool::is_mesh_handle(hit.1) {
                     let shift = response.ctx.input(|i| i.modifiers.shift);
                     match crate::mesh_tool::mesh_node_of(hit.1) {
@@ -746,6 +824,13 @@ impl App {
                     }
                     return true;
                 }
+            }
+            // Double-click inside an object with colour points: a point
+            // there (on the Shape tool, not on its outline, where a
+            // double click adds a node).
+            let on_line = self.tool == Tool::Shape && self.segment_at(p).is_some();
+            if !on_line && self.add_color_point(p) {
+                return true;
             }
         }
         if response.drag_started_by(PointerButton::Primary) {
@@ -823,6 +908,25 @@ impl App {
         };
         let to = self.snap_point(p + self.effect_node_grab);
         let delta = to - at;
+        // A colour point goes where it is dragged, one undo step too.
+        let point = crate::mesh_tool::mesh_node_of(index)
+            .filter(|_| !crate::color_points::point_nodes(&s).is_empty());
+        if let Some(i) = point {
+            if delta.hypot() > 0.0 {
+                if let Some(cmd) = self.move_color_point(id, i, to) {
+                    if self.effect_node_stepped && self.engine.undo_label() == Some("Edit Effect")
+                    {
+                        let _ = self.engine.undo();
+                    }
+                    self.effect_node_stepped = true;
+                    if let Err(e) = self.engine.run_batch("Edit Effect", &[cmd]) {
+                        self.status = e.to_string();
+                    }
+                }
+            }
+            self.drag = Drag::Node { last: p };
+            return;
+        }
         if delta.hypot() > 0.0 {
             let inv = s.transform.inverse();
             let ld = (inv * (Point::ZERO + delta)) - (inv * Point::ZERO);
@@ -923,9 +1027,19 @@ fn mesh_node_near(m: &tracedraw_core::Mesh, p: Point, tol: f64) -> Option<usize>
     })
 }
 
-/// Page-space positions of the editable nodes of a shape's perspective
-/// and mesh fill, with a global index: perspective 100..104, mesh 200 + k
-/// (envelopes have their own editing, see `envelope_edit`).
+/// The grid points of a mesh envelope count from here in the effect node
+/// numbers (at most 81 of them, below the mesh fill's 200).
+pub const MESH_ENVELOPE_BASE: usize = 110;
+
+/// The effect node number is a mesh envelope's grid point.
+pub fn is_mesh_envelope_node(index: usize) -> bool {
+    (MESH_ENVELOPE_BASE..crate::mesh_tool::MESH_NODE_BASE).contains(&index)
+}
+
+/// Page-space positions of the editable nodes of a shape's perspective,
+/// mesh envelope and mesh fill, with a global index: perspective
+/// 100..104, mesh envelope 110 + k (its last one), mesh 200 + k (frame
+/// envelopes have their own editing, see `envelope_edit`).
 pub fn effect_nodes(s: &Shape) -> Vec<(usize, Point)> {
     let mut out = Vec::new();
     for e in &s.effects {
@@ -935,11 +1049,23 @@ pub fn effect_nodes(s: &Shape) -> Vec<(usize, Point)> {
             }
         }
     }
+    if let Some(Effect::MeshEnvelope { points, .. }) = s
+        .effects
+        .iter()
+        .rev()
+        .find(|e| matches!(e, Effect::MeshEnvelope { .. }))
+    {
+        for (k, q) in points.iter().enumerate() {
+            out.push((MESH_ENVELOPE_BASE + k, s.transform * *q));
+        }
+    }
     if let Fill::Mesh(m) = &s.fill {
         for (k, n) in m.nodes.iter().enumerate() {
             out.push((200 + k, s.transform * n.pos));
         }
     }
+    // A colour points gradient's points, numbered as mesh nodes are.
+    out.extend(crate::color_points::point_nodes(s));
     out
 }
 
@@ -984,6 +1110,18 @@ fn move_effect_node(effects: &mut [Effect], fill: &mut Fill, index: usize, d: Ve
     if let Some((i, h)) = crate::mesh_tool::mesh_handle_of(index) {
         if let Fill::Mesh(m) = fill {
             m.move_handle(i, h, d);
+        }
+        return;
+    }
+    if is_mesh_envelope_node(index) {
+        if let Some(Effect::MeshEnvelope { points, .. }) = effects
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e, Effect::MeshEnvelope { .. }))
+        {
+            if let Some(q) = points.get_mut(index - MESH_ENVELOPE_BASE) {
+                *q += d;
+            }
         }
         return;
     }

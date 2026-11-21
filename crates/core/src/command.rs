@@ -331,6 +331,10 @@ pub enum Command {
         shapes: Vec<ShapeId>,
         fills: Vec<Fill>,
         strokes: Vec<Stroke>,
+        /// The further fills' looks of their own (`Shape::fill_looks`);
+        /// `None` keeps them, as many as there are fills.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        looks: Option<Vec<crate::document::FillLook>>,
     },
     SetOverprint {
         shapes: Vec<ShapeId>,
@@ -408,6 +412,10 @@ pub enum Command {
     /// objects follow a colour style that changes (#778).
     ReplaceColors {
         pairs: Vec<(crate::Color, crate::Color)>,
+        /// Only these objects (any depth inside them); empty: the whole
+        /// drawing (#3534).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shapes: Vec<ShapeId>,
     },
     /// Move `shapes` directly in front of (or behind) `reference` in its layer.
     OrderRelative {
@@ -1251,11 +1259,18 @@ impl Command {
                 shapes,
                 fills,
                 strokes,
+                looks,
             } => {
                 for id in shapes {
                     let s = any_mut(doc, *id)?;
                     s.extra_fills = fills.clone();
                     s.extra_strokes = strokes.clone();
+                    let mut l = match looks {
+                        Some(l) => l.clone(),
+                        None => s.fill_looks.as_deref().cloned().unwrap_or_default(),
+                    };
+                    l.truncate(fills.len());
+                    s.fill_looks = (!l.iter().all(|x| x.is_plain())).then(|| Box::new(l));
                 }
             }
             Command::SetOverprint {
@@ -1360,8 +1375,15 @@ impl Command {
             Command::ReplaceFontFamily { from, to } => {
                 doc.replace_font_family(from, to);
             }
-            Command::ReplaceColors { pairs } => {
-                crate::color_convert::replace_colors(doc, pairs);
+            Command::ReplaceColors { pairs, shapes } => {
+                if shapes.is_empty() {
+                    crate::color_convert::replace_colors(doc, pairs);
+                } else {
+                    for id in shapes {
+                        any(doc, *id)?;
+                    }
+                    crate::color_convert::replace_colors_in(doc, shapes, pairs);
+                }
             }
             Command::OrderRelative {
                 shapes,
@@ -1727,11 +1749,11 @@ impl Command {
                     any_mut(doc, *id)?.shadow = *shadow;
                 }
             }
-            Command::AddGuide { page, guide } => doc.page_mut(*page)?.guides.push(*guide),
+            Command::AddGuide { page, guide } => doc.page_mut(*page)?.guides.push(guide.clone()),
             Command::MoveGuide { page, index, guide } => {
                 let p = doc.page_mut(*page)?;
                 if let Some(g) = p.guides.get_mut(*index) {
-                    *g = *guide;
+                    *g = guide.clone();
                 }
             }
             Command::DeleteGuide { page, index } => {
