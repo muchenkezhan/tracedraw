@@ -662,7 +662,23 @@ impl App {
                     continue;
                 }
             }
-            if !skip(s.id) && self.shape_hit(s, p, tol) {
+            if skip(s.id) {
+                continue;
+            }
+            // The cheap reject first, from boxes measured once per change
+            // of the drawing (#3559): `shape_hit` starts with the same
+            // ask but works the box out per object per pointer move. Not
+            // while a symmetry group is edited: its members are picked,
+            // and their boxes are not the group's.
+            if members.is_none() {
+                if let Some(b) = self.plain_bounds_cached(s) {
+                    let half = outline_reach(s, s.transform);
+                    if !b.inflate(tol + half, tol + half).contains(p) {
+                        continue;
+                    }
+                }
+            }
+            if self.shape_hit(s, p, tol) {
                 return Some(self.blend_end_under_steps(s, p, tol, &skip).unwrap_or(s.id));
             }
         }
@@ -1505,6 +1521,8 @@ impl App {
             start_angle: a,
             current_angle: a,
             grab: Some(g),
+            start_radius: (p - c).hypot(),
+            scale: 1.0,
         };
         true
     }
@@ -2202,9 +2220,12 @@ impl App {
                 self.three_point_input(response, p, mods)
             }
             Tool::Freehand => self.freehand_input(response, p, mods),
-            Tool::Bezier | Tool::Pen | Tool::Polyline | Tool::TwoPointLine | Tool::BSpline => {
-                self.curve_input(response, p, mods)
-            }
+            Tool::Bezier
+            | Tool::Pen
+            | Tool::Polyline
+            | Tool::TwoPointLine
+            | Tool::BSpline
+            | Tool::CurvaturePen => self.curve_input(response, p, mods),
             Tool::Text => self.text_input(response, p, mods),
             Tool::ColorEyedropper | Tool::AttributesEyedropper => {
                 // A press let go counts as a click also when the pointer
@@ -2519,6 +2540,8 @@ impl App {
                             start_angle: a,
                             current_angle: a,
                             grab: None,
+                            start_radius: (p - c).hypot(),
+                            scale: 1.0,
                         };
                     } else {
                         self.drag = Drag::Skew {
@@ -3063,6 +3086,8 @@ impl App {
                 center,
                 start_angle,
                 current_angle,
+                start_radius,
+                scale,
                 ..
             } => {
                 let mut a = (snapped_handle - *center).atan2();
@@ -3072,6 +3097,10 @@ impl App {
                     a = *start_angle + ((a - *start_angle) / step).round() * step;
                 }
                 *current_angle = a;
+                // Shift scales while turning, keeping the proportions:
+                // the pointer's distance from the centre against where
+                // the turn started (#3772).
+                *scale = rotate_drag_scale(mods.shift, *start_radius, (p - *center).hypot());
             }
             _ => {}
         }
@@ -3566,7 +3595,10 @@ impl App {
         };
         // B-Spline: each click (or the start of a drag) places a control
         // point; there are no handles to pull.
-        let bspline = self.tool == Tool::BSpline;
+        // The Curvature Pen places its points as the B-Spline tool does;
+        // its curve runs through them.
+        let bspline = matches!(self.tool, Tool::BSpline | Tool::CurvaturePen);
+        let curvature = self.tool == Tool::CurvaturePen;
         let smooth = matches!(self.tool, Tool::Bezier | Tool::Pen);
         if response.double_clicked_by(PointerButton::Primary) {
             self.finish_curve();
@@ -3671,10 +3703,12 @@ impl App {
                 smooth,
                 dragging_handle: false,
                 bspline,
+                curvature,
                 ..Default::default()
             });
             c.smooth = smooth;
             c.bspline = bspline;
+            c.curvature = curvature;
             let drag = response.drag_started_by(PointerButton::Primary);
             // A click places a node without a handle: the segment to it
             // is the one the preview showed, shaped by the handle of the
@@ -3833,6 +3867,8 @@ impl App {
             i.key_down(egui::Key::C)
                 || i.key_down(egui::Key::V)
                 || (c.spline_fix_key && i.modifiers.command)
+                // Curvature Pen: Alt held makes the point a corner.
+                || (c.curvature && i.modifiers.alt)
         })
     }
 
@@ -3857,11 +3893,14 @@ impl App {
                 closed: true,
             },
         ) {
-            if c.bspline {
+            if c.bspline && !c.curvature {
                 let points = c.nodes.iter().map(|n| n.0).collect();
                 self.keep_spline(id, &path, points, c.spline_fixed_flags());
             }
             self.select(vec![id]);
+            if !c.bspline {
+                self.add_parallel_lines(id);
+            }
         }
     }
 
@@ -3992,7 +4031,9 @@ impl App {
         // A mesh fill's nodes are picked and dragged here too, as with the
         // Mesh Fill and Shape tools; a palette colour then goes to the
         // chosen nodes, the fill staying a mesh (#2506).
-        if self.selected_mesh().is_some() && self.effect_node_input(response, p) {
+        if (self.selected_mesh().is_some() || self.has_color_points())
+            && self.effect_node_input(response, p)
+        {
             return;
         }
         // A double click on a colour node removes it; on the line, it adds
@@ -4283,6 +4324,14 @@ impl App {
                 let before_move = self.engine.last_step_id();
                 if total.hypot() > 1e-6 {
                     self.finish_transform(Affine::translate(total));
+                    // Drawing in perspective: onto the active plane, or
+                    // along it (in the move's step).
+                    if to_page.is_none() && self.drop_frame.is_none() {
+                        self.perspective_after_move(total);
+                        self.displace_after_move();
+                        // A circle text let go on a round object fits it.
+                        self.fit_curved_text_to_round();
+                    }
                 }
                 if let Some((idx, r)) = to_page {
                     self.give_selection_to_shown_page(idx, r);
@@ -4408,7 +4457,12 @@ impl App {
                         .zip(self.default_stroke())
                         .map(|(pen, st)| pen.freehand_widths(st.width))
                         .unwrap_or_default();
-                    self.add_drawn_line_with_widths(path, widths);
+                    let joined = self.join_candidate().map(|c| c.id);
+                    if let Some(id) = self.add_drawn_line_with_widths(path, widths) {
+                        if joined != Some(id) {
+                            self.add_parallel_lines(id);
+                        }
+                    }
                 }
             }
             Drag::FillGradient {
@@ -4578,12 +4632,19 @@ impl App {
                 center,
                 start_angle,
                 current_angle,
+                scale,
                 ..
             } => {
                 let a = current_angle - start_angle;
+                let s = if scale.is_finite() && *scale > 0.0 {
+                    *scale
+                } else {
+                    1.0
+                };
                 Some(
                     Affine::translate(center.to_vec2())
                         * Affine::rotate(a)
+                        * Affine::scale(s)
                         * Affine::translate(-center.to_vec2()),
                 )
             }
@@ -4725,6 +4786,9 @@ impl App {
                 self.text_undo_redo(true);
             } else if is(Key::T, cmd | Modifiers::SHIFT) {
                 self.open_edit_text_dialog();
+            } else if is(Key::L, cmd | Modifiers::SHIFT) {
+                // Text > Bullets On/Off at the caret (#3593).
+                self.toggle_bullets();
             } else if is(Key::S, cmd) {
                 self.save(false);
             } else if is(Key::S, cmd | Modifiers::SHIFT) {
@@ -5486,7 +5550,7 @@ impl App {
         // its own F9 and close at once; while it shows, its F9 closes it.
         if !self.fullscreen_preview && first_pressed(Key::F9, Modifiers::NONE) {
             ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F9));
-            self.fullscreen_preview = true;
+            crate::ui::preview::begin(self, ctx, false);
         }
         // F11: the Edit Fill dialog. F3: zoom out.
         if pressed(Key::F11, Modifiers::NONE) {
@@ -5540,6 +5604,10 @@ impl App {
         if pressed(Key::I, cmd | Modifiers::SHIFT) {
             self.invert_selection();
         }
+        // Text > Bullets On/Off (#3593).
+        if pressed(Key::L, cmd | Modifiers::SHIFT) {
+            self.toggle_bullets();
+        }
         // Ctrl+8 and Ctrl+2: selected text one keyboard text increment
         // larger or smaller (Options > Text).
         if self
@@ -5577,6 +5645,11 @@ impl App {
                 && self.selected_mesh_node().is_some()
             {
                 self.delete_mesh_lines();
+            } else if matches!(self.tool, Tool::InteractiveFill | Tool::Shape)
+                && self.selected_color_point().is_some()
+            {
+                // The chosen colour point goes, while two stay.
+                self.delete_color_point();
             } else if matches!(self.tool, Tool::Envelope | Tool::Shape)
                 && self.selected_envelope_node().is_some()
             {
@@ -5981,6 +6054,10 @@ fn text_command_key(key: Key, mods: Modifiers) -> bool {
         return true;
     }
     let ctrl = mods.command && !crate::text_editing::altgr(&mods);
+    // Ctrl+Shift+L turns bullets on or off (#3593); Ctrl+L aligns left.
+    if ctrl && key == Key::L && mods.matches_exact(Modifiers::COMMAND | Modifiers::SHIFT) {
+        return true;
+    }
     ctrl && !matches!(
         key,
         Key::Space
@@ -6098,6 +6175,17 @@ fn drawn_path_of(
         c.transform_by(s.transform);
         drawn_path_of(&c, id, depth + 1)
     })
+}
+
+/// The scale factor of a rotate drag: with Shift, the pointer's distance
+/// from the centre of rotation against its distance when the turn
+/// started, kept away from zero; 1 without Shift or when the turn
+/// started on the centre itself (#3772).
+pub(crate) fn rotate_drag_scale(shift: bool, start_radius: f64, radius: f64) -> f64 {
+    if !shift || !(start_radius > 1e-6) || !radius.is_finite() {
+        return 1.0;
+    }
+    (radius / start_radius).max(0.01)
 }
 
 #[cfg(test)]

@@ -58,6 +58,7 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
         Dialog::PageSpacing { .. } => "pages-layout/multipage-view#page-spacing",
         Dialog::OutlineOffset { .. } => "lines-shapes/shaping#outline-offset",
         Dialog::GatherPages { .. } => "pages-layout/pages",
+        Dialog::ArrangeGrid { .. } => "objects/align-distribute#grid",
         Dialog::MultipagePages { .. } => "pages-layout/multipage-view#choose-pages",
         Dialog::InsertPage { .. } => "pages-layout/pages#insert-page",
         Dialog::DeletePage { .. } => "pages-layout/pages#delete-page",
@@ -71,7 +72,10 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
         Dialog::EditFill(_) => "color/fills#edit-fill",
         Dialog::TableCount(_) => "objects/tables",
         Dialog::OldCdrVersion { .. } => "get-started/open-and-save#save-as",
-        Dialog::RenameLayer { .. } | Dialog::LayerProperties(_) | Dialog::RenameObject { .. } => {
+        Dialog::RenameLayer { .. }
+        | Dialog::LayerProperties(_)
+        | Dialog::RenameObject { .. }
+        | Dialog::RenameGuide { .. } => {
             "objects/objects-and-layers#rename"
         }
         Dialog::DocumentProperties(_) => "pages-layout/document-properties",
@@ -92,9 +96,12 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
         Dialog::CreatePattern { .. } => "color/patterns#create-pattern",
         Dialog::CreateTable { .. } => "objects/tables#create-table",
         Dialog::TextToTable(_) => "objects/tables#convert",
+        Dialog::StretchZones(_) => "objects/stretch-zones",
         Dialog::PasteSpecial(_) => "objects/paste-special",
         Dialog::Barcode(_) => "objects/barcodes",
         Dialog::Formula(_) => "objects/formulas",
+        Dialog::TransformEach(_) => "objects/transforming#transform-each",
+        Dialog::Flare(_) => "objects/light-flare",
         Dialog::ConvertToBitmap(_) => "bitmaps/convert-to-bitmap",
         Dialog::PictureCaptions(_) => "bitmaps/picture-captions",
         Dialog::AiTurn(_) | Dialog::AiSketch(_) | Dialog::AiRemove(_) => "bitmaps/ai-photo",
@@ -134,6 +141,7 @@ pub fn dialog_topic(d: &Dialog, options: OptionsPage) -> &'static str {
         Dialog::MacrosDesktopOnly => "get-started/browser-version#differences",
         Dialog::StorageRefused(_) => "get-started/browser-version",
         Dialog::TimeTracker(_) => "customize/time-tracker",
+        Dialog::Workflow => "customize/scripts#workflow",
         Dialog::Preflight(_) => "printing/preflight",
         Dialog::PublishPdf(_) => "file-formats/publish-pdf",
         Dialog::PdfPassword(_) => "file-formats/publish-pdf#password",
@@ -241,6 +249,7 @@ pub fn docker_topic(t: DockerTab) -> &'static str {
         DockerTab::ShapeGenerator => "objects/shape-generator",
         DockerTab::SymbolScatter => "effects/symbol-scatter",
         DockerTab::FrameGenerator => "effects/frame-generator",
+        DockerTab::Shape3d => "effects/revolve-inflate",
         DockerTab::Shelf => "objects/shelf",
         DockerTab::Export => "web-graphics/export-docker",
         DockerTab::Comments => "objects/comments",
@@ -276,6 +285,7 @@ pub fn tool_topic(t: Tool) -> &'static str {
         Tool::Bezier => "lines-shapes/lines#bezier",
         Tool::Pen => "lines-shapes/lines#pen",
         Tool::BSpline => "lines-shapes/lines#b-spline",
+        Tool::CurvaturePen => "lines-shapes/lines#curvature-pen",
         Tool::Polyline => "lines-shapes/lines#polyline",
         Tool::ThreePointCurve => "lines-shapes/lines#three-point-curve",
         Tool::BrushStrokes => "lines-shapes/artistic-media#brush-strokes",

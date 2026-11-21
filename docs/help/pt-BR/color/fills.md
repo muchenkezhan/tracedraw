@@ -38,8 +38,13 @@ preenchimento do painel [[docker.properties]]:
 
 - O tipo: [[fill.linear]] (ao longo de uma linha), [[fill.radial]] (do centro
   para fora), [[fill.conical]] (em volta do centro), [[fill.square]] (em
-  quadrados crescentes) ou [[fill.shaped]] (seguindo o contorno do objeto, da
-  borda para dentro).
+  quadrados crescentes), [[fill.shaped]] (seguindo o contorno do objeto, da
+  borda para dentro) ou **Pontos de cor** (cada cor num ponto próprio em
+  qualquer lugar do objeto, misturando-se com as outras ao redor). Com a
+  ferramenta Preenchimento interativo ou Forma os pontos de cor aparecem no
+  objeto: arraste um para movê-lo, clique num e depois numa cor da paleta
+  para trocar a cor, clique duas vezes dentro do objeto para adicionar um e
+  pressione Delete para remover o escolhido (dois sempre ficam).
 - [[docker.gradient_presets]]: gradientes prontos para começar.
 - As **paradas**: as cores e onde ficam no gradiente, de 2 a 64. Selecione uma
   parada para mudar a cor ou a posição; [[docker.add_stop]] e
@@ -135,6 +140,14 @@ deles, e linhas que só se tocam pela largura ainda a fecham.
 Dentro de uma [simetria](../objects/symmetry.md), um clique numa cópia preenche
 a mesma área em todas as cópias: o novo objeto passa a fazer parte da simetria.
 
+Com **Ao vivo** ligado, um clique dentro de um grupo pinta a área que as linhas
+dele fecham como um preenchimento ao vivo do grupo (o grupo selecionado, ou
+então o grupo mais acima sob o clique) em vez de criar um objeto novo. Quando
+você move ou remodela as linhas do grupo, os preenchimentos as acompanham.
+Clique de novo numa área pintada para dar a ela a cor de preenchimento da
+barra, ou com o Preenchimento em Nenhum para retirá-la. Cada clique é um passo
+de desfazer.
+
 ## Preenchimentos de malha {#mesh-fill}
 
 Um preenchimento de malha é uma grade de nós sobre um objeto, cada nó com cor e
@@ -168,6 +181,10 @@ mistura, ou desfaça para voltar.
 - Um preenchimento [[docker.fill_texture]] é uma textura gerada, de aparência
   natural: [[texture.clouds]], [[texture.marble]], [[texture.noise]] ou
   [[texture.wood]], com cores e escala.
+- [[texture.holographic]] e [[texture.holo_glitter]] dão um visual fixo de foil holográfico: cores do arco-íris
+  correndo entre manchas escuras e claras (cores A e B), o glitter com
+  grãos brilhantes. Não muda com o ângulo de visão; PDF e SVG levam como
+  imagem.
 
 ## Vários preenchimentos em um objeto {#several-fills}
 
@@ -176,6 +193,16 @@ pinta outro preenchimento sobre o do objeto, começando como uma cópia para
 você mudar. Os preenchimentos extras aparecem como "Preenchimento 2",
 "Preenchimento 3" e assim por diante, cada um com seu editor e um botão para
 removê-lo. A seção de contorno pode acrescentar contornos extras da mesma forma.
+
+As setas ao lado de cada preenchimento ou contorno extra pintam-no uma posição
+antes ou depois; o segundo troca de lugar com o primeiro, então qualquer um
+pode ir para baixo ou para cima.
+
+Sob cada preenchimento extra, Crescer, Mover e Desfocar dão a ele uma
+aparência própria: a área crescida (ou encolhida, abaixo de zero), movida e
+desfocada, enquanto o objeto e os outros preenchimentos ficam como estão. Um
+preenchimento menor de outra cor, movido e um pouco desfocado, faz um brilho
+suave, por exemplo.
 
 Os preenchimentos também podem ser pintados em contornos; veja
 [Definir contornos](../lines-shapes/outlines.md#outline-pen).

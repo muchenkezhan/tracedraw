@@ -24,6 +24,7 @@ pub struct PendingPaste {
     at: Option<Point>,
     center: Point,
     mark: Option<Mark>,
+    above: Option<ShapeId>,
 }
 
 #[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
@@ -230,6 +231,17 @@ impl ClipboardContent {
             .map(|t| t.trim_start().starts_with('<') && t.contains("<svg"))
             .unwrap_or(false)
     }
+}
+
+/// Text that is a DXF drawing: its first two lines, group code 0 and
+/// `SECTION`, as every DXF file starts.
+fn is_dxf_text(t: &str) -> bool {
+    let mut lines = t
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    lines.next() == Some("0") && lines.next() == Some("SECTION")
 }
 
 /// What the system clipboard held when TraceDraw copied, so that a paste
@@ -642,6 +654,10 @@ fn parse_vector_shapes(bytes: &[u8]) -> Option<Vec<tracedraw_core::Shape>> {
         tracedraw_io::svg_import::parse(svg, &mut ids)
             .map(|i| i.shapes)
             .ok()
+    } else if let Some(dxf) = std::str::from_utf8(bytes).ok().filter(|t| is_dxf_text(t)) {
+        tracedraw_io::dxf::parse(dxf, &mut ids)
+            .map(|i| i.shapes)
+            .ok()
     } else if tracedraw_io::pdf_import::is_pdf(bytes) {
         tracedraw_io::pdf_import::parse(bytes, &mut ids)
             .ok()
@@ -739,6 +755,28 @@ pub fn write_text(text: &str) -> bool {
 pub fn write_text(text: &str) -> bool {
     crate::web::copy_text(text);
     true
+}
+
+/// Put a picture on the system clipboard (best effort); whether it went
+/// there.
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+pub fn write_image(img: image::RgbaImage) -> bool {
+    let (w, h) = img.dimensions();
+    with_clipboard(|cb| {
+        cb.set_image(arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: img.into_raw().into(),
+        })
+        .is_ok()
+    })
+    .unwrap_or(false)
+}
+
+/// No picture goes on the clipboard from the browser or Android builds.
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
+pub fn write_image(_img: image::RgbaImage) -> bool {
+    false
 }
 
 /// A file a browser handed over for a paste: a picture or a file copied
@@ -921,6 +959,46 @@ impl App {
         false
     }
 
+    /// What the drawing window shows of the current page and the desktop
+    /// around it, as a picture at the screen's size (one pixel a screen
+    /// point), white where nothing is drawn: for Edit > Copy Visible
+    /// Area (#3527). `None` before the window has a size.
+    pub fn visible_area_image(&self) -> Option<image::RgbaImage> {
+        let r = self.canvas_rect;
+        if !(r.width() >= 1.0 && r.height() >= 1.0) || !r.is_finite() {
+            return None;
+        }
+        let area = self.view.visible_page_rect(r);
+        let dpi = r.width() as f64 / area.width().max(1e-9) * 25.4;
+        let pm = tracedraw_render::render_area_image(self.doc(), self.page, area, dpi)?;
+        let mut img = image::RgbaImage::new(pm.width(), pm.height());
+        for (px, out) in pm.pixels().iter().zip(img.pixels_mut()) {
+            let c = px.demultiply();
+            *out = image::Rgba([c.red(), c.green(), c.blue(), c.alpha()]);
+        }
+        Some(img)
+    }
+
+    /// Edit > Copy Visible Area (#3527): what the drawing window shows,
+    /// as a picture on the system clipboard, for a chat or a mail; the
+    /// copy kept here for Paste stays as it was.
+    pub fn copy_visible_area(&mut self) {
+        let Some(img) = self.visible_area_image() else {
+            return;
+        };
+        let (w, h) = img.dimensions();
+        if write_image(img) {
+            self.status = trf(
+                "status.visible_area_copied",
+                &[("w", &w.to_string()), ("h", &h.to_string())],
+            );
+            // The system clipboard no longer holds the last copy made here.
+            self.mark_system_clipboard(None);
+        } else {
+            self.status = tr("status.visible_area_not_copied");
+        }
+    }
+
     /// Remember what the system clipboard holds right after a copy here
     /// (`written`: the text the copy put there), so that a paste can tell
     /// whether something was copied elsewhere since. What was written is
@@ -1097,6 +1175,65 @@ impl App {
         self.paste_with_event_text_at(None, at);
     }
 
+    /// Edit > Paste Above Selection: paste, then lay what came just in
+    /// front of the topmost selected object, in its layer or group,
+    /// instead of at the top of the active layer (#3673). One Undo takes
+    /// the paste back. With nothing selected it pastes as Paste does.
+    pub fn paste_above_selection(&mut self) {
+        let reference = self.topmost_selected();
+        let before = self.selection.clone();
+        let was_pending = self.clipboard_paste.is_some();
+        self.paste_with_event_text(None);
+        let Some(reference) = reference else {
+            return;
+        };
+        if !was_pending {
+            if let Some(pending) = self.clipboard_paste.as_mut() {
+                pending.above = Some(reference);
+                return;
+            }
+        }
+        self.place_pasted_above(&before, reference);
+    }
+
+    fn place_pasted_above(&mut self, before: &[ShapeId], reference: ShapeId) {
+        if self.selection.is_empty() || self.selection == before {
+            return;
+        }
+        if self.doc().find_shape(reference).is_none() {
+            return;
+        }
+        let shapes: Vec<ShapeId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|s| *s != reference)
+            .collect();
+        let cmd = Command::PlaceBeside {
+            shapes,
+            reference,
+            in_front: true,
+        };
+        if let Err(e) = self.engine.amend_batch("Paste", &[cmd]) {
+            self.status = e.to_string();
+        }
+    }
+
+    /// The selected object drawn on top of the others: on the highest
+    /// layer, then the latest in it.
+    fn topmost_selected(&self) -> Option<ShapeId> {
+        let doc = self.doc();
+        let layers: Vec<_> = doc.all_layers().map(|l| l.id).collect();
+        self.selection
+            .iter()
+            .filter_map(|&id| {
+                let (layer, i) = doc.locate(id).ok()?;
+                Some((layers.iter().position(|l| *l == layer)?, i, id))
+            })
+            .max_by_key(|&(l, i, _)| (l, i))
+            .map(|(_, _, id)| id)
+    }
+
     /// Centre what a paste selected on `at`, when given and the paste
     /// selected something new.
     fn move_pasted_to(&mut self, before: &[ShapeId], at: Option<Point>) {
@@ -1266,6 +1403,7 @@ impl App {
             at,
             center: at.unwrap_or_else(|| self.page_rect().center()),
             mark: self.clipboard.as_ref().map(|cb| cb.system),
+            above: None,
         };
         match std::thread::Builder::new()
             .name("clipboard-paste".into())
@@ -1282,6 +1420,18 @@ impl App {
 
     pub fn clipboard_paste_busy(&self) -> bool {
         self.clipboard_paste.is_some() || handed_awaited()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_internal_paste_for_test(&mut self) {
+        if let Some(pending) = self.clipboard_paste.as_mut() {
+            // Keep the request's destination, but make the result independent
+            // of the desktop clipboard available to a test runner.
+            let (send, ready) = std::sync::mpsc::channel();
+            pending.ready = ready;
+            send.send(Ok(PreparedPaste::Internal)).expect("paste result");
+            self.poll_clipboard_paste();
+        }
     }
 
     fn clipboard_paste_failed(&mut self, error: &str) {
@@ -1323,10 +1473,10 @@ impl App {
         {
             return false;
         }
+        let before = self.selection.clone();
         match result {
             Err(error) => self.clipboard_paste_failed(&error),
             Ok(PreparedPaste::Vector(shapes)) => {
-                let before = self.selection.clone();
                 if self.paste_vector_shapes(shapes) {
                     self.move_pasted_to(&before, pending.at);
                 }
@@ -1335,13 +1485,11 @@ impl App {
                 // A copy made while the worker was reading must not replace the
                 // snapshot that this request decided to paste.
                 if self.clipboard.as_ref().map(|cb| cb.system) == pending.mark {
-                    let before = self.selection.clone();
                     self.paste();
                     self.move_pasted_to(&before, pending.at);
                 }
             }
             Ok(PreparedPaste::External { content, image }) => {
-                let before = self.selection.clone();
                 let image = match image {
                     Ok(image) => image,
                     Err(error) => {
@@ -1362,6 +1510,9 @@ impl App {
                     self.move_pasted_to(&before, pending.at);
                 }
             }
+        }
+        if let Some(reference) = pending.above {
+            self.place_pasted_above(&before, reference);
         }
         false
     }
@@ -1466,6 +1617,12 @@ impl App {
             for path in &content.files {
                 self.import_path(path);
             }
+            return;
+        }
+        // A drawing a CAD program copied as DXF text (Cadcraft, #3544):
+        // its objects, not a text of its codes.
+        let dxf = content.text.as_deref().filter(|t| is_dxf_text(t));
+        if dxf.is_some_and(|t| self.paste_vector(t.as_bytes())) {
             return;
         }
         if content.is_svg() {
@@ -1918,6 +2075,33 @@ mod tests {
         assert!(svg_text_beside(false));
     }
 
+    /// Copy Visible Area (#3527) takes the picture the drawing window
+    /// shows, at the window's size, with the shapes in it drawn.
+    #[test]
+    fn the_visible_area_is_a_picture_the_size_of_the_window() {
+        use tracedraw_core::document::ShapeKind;
+        use tracedraw_core::style::Fill;
+        let mut app = App::headless();
+        app.canvas_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let page = app.page_rect();
+        app.view.fit(page, app.canvas_rect);
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: page,
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("a layer");
+        app.select(vec![id]);
+        app.apply_fill(Fill::Solid(tracedraw_core::color::Color::BLACK));
+        let img = app.visible_area_image().expect("a picture");
+        let (w, h) = img.dimensions();
+        assert!((399..=401).contains(&w) && (299..=301).contains(&h), "{w}x{h}");
+        assert!(img.pixels().any(|p| p.0[3] == 255 && p.0[0] < 20), "the rectangle shows");
+        app.canvas_rect = egui::Rect::NOTHING;
+        assert!(app.visible_area_image().is_none());
+    }
+
     /// Text another program copied pastes as one step to undo: the text,
     /// its fill and its outline were three, so the first two Undos took
     /// off only colours.
@@ -2070,6 +2254,29 @@ mod tests {
             cb.system = system.mark(None);
         }
         app
+    }
+
+    /// #3544: a drawing a CAD program copied as DXF text (as Cadcraft
+    /// does, lines ended by CR LF and codes indented) pastes as its
+    /// objects, not as a text of its codes.
+    #[test]
+    fn dxf_text_pastes_as_objects() {
+        let mut app = App::headless();
+        let dxf = "  0\r\nSECTION\r\n  2\r\nENTITIES\r\n  0\r\nLINE\r\n  8\r\n0\r\n 10\r\n0.0\r\n 20\r\n0.0\r\n 11\r\n10.0\r\n 21\r\n5.0\r\n  0\r\nENDSEC\r\n  0\r\nEOF\r\n";
+        assert!(is_dxf_text(dxf));
+        assert!(!is_dxf_text("0 SECTION is not a drawing"));
+        app.paste_from(ClipboardContent {
+            text: Some(dxf.into()),
+            ..Default::default()
+        });
+        let shapes: Vec<&tracedraw_core::Shape> =
+            app.doc().all_layers().flat_map(|l| &l.shapes).collect();
+        assert_eq!(shapes.len(), 1);
+        assert!(
+            !matches!(shapes[0].kind, ShapeKind::Text { .. }),
+            "{:?}",
+            shapes[0].kind
+        );
     }
 
     fn svg_text() -> ClipboardContent {
@@ -2294,6 +2501,57 @@ mod tests {
         let b = app.selection_bounds().expect("pasted");
         let c = app.view_center();
         assert!((b.center() - c).hypot() < 1e-6, "{:?} at {c:?}", b.center());
+    }
+
+    /// Paste Above Selection lays the copy just in front of the topmost
+    /// selected object, not at the top of the layer, in one Undo step
+    /// (#3673).
+    #[test]
+    fn paste_above_selection_lands_in_front_of_the_selection() {
+        let mut app = App::headless();
+        let rect = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(x, 10.0, x + 20.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect")
+        };
+        let (a, b, c) = (
+            rect(&mut app, 0.0),
+            rect(&mut app, 30.0),
+            rect(&mut app, 60.0),
+        );
+        app.select(vec![c]);
+        app.copy();
+        // Pasted with A and B selected: between B and C.
+        app.select(vec![b, a]);
+        let steps = app.engine.history_labels().0.len();
+        app.paste_above_selection();
+        app.complete_internal_paste_for_test();
+        let pasted = app.selection.clone();
+        assert_eq!(pasted.len(), 1);
+        assert!(pasted[0] != c);
+        let order: Vec<ShapeId> = app
+            .doc()
+            .all_layers()
+            .flat_map(|l| l.shapes.iter().map(|s| s.id))
+            .collect();
+        let at = |id| order.iter().position(|x| *x == id).expect("on a layer");
+        assert_eq!(at(pasted[0]), at(b) + 1, "just in front of B");
+        assert!(at(pasted[0]) < at(c), "behind C, which was on top");
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1, "one step");
+        // With nothing selected it pastes as Paste does: on top.
+        app.select(vec![]);
+        app.paste_above_selection();
+        app.complete_internal_paste_for_test();
+        let top = app.selection[0];
+        let order: Vec<ShapeId> = app
+            .doc()
+            .all_layers()
+            .flat_map(|l| l.shapes.iter().map(|s| s.id))
+            .collect();
+        assert_eq!(order.last(), Some(&top));
     }
 
     fn png_file(name: &str) -> PastedFile {
@@ -2550,8 +2808,41 @@ mod tests {
             at,
             center: at.unwrap_or_else(|| app.page_rect().center()),
             mark: app.clipboard.as_ref().map(|cb| cb.system),
+            above: None,
         });
         send
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[test]
+    fn paste_above_selection_places_a_prepared_vector_above_the_captured_object() {
+        let mut app = App::headless();
+        let mut rect = |x| {
+            app.new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(x, 0.0, x + 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rectangle")
+        };
+        let reference = rect(0.0);
+        let top = rect(20.0);
+        let shape = app.doc().find_shape(top).expect("source").clone();
+        let send = pending_paste(&mut app, None);
+        app.clipboard_paste.as_mut().expect("pending").above = Some(reference);
+        app.select(vec![top]);
+        let steps = app.engine.history_labels().0.len();
+        send.send(Ok(PreparedPaste::Vector(vec![shape])))
+            .expect("finished paste");
+        assert!(!app.poll_clipboard_paste());
+        let pasted = app.selection[0];
+        let order: Vec<_> = app
+            .doc()
+            .all_layers()
+            .flat_map(|l| l.shapes.iter().map(|s| s.id))
+            .collect();
+        assert_eq!(order, vec![reference, pasted, top]);
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1);
     }
 
     #[test]

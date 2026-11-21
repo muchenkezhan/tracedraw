@@ -1183,6 +1183,17 @@ impl PageWriter<'_> {
         {
             self.drop_shadow(shape, parent);
         }
+        if let (ShapeKind::Group { .. }, Some(look)) = (&shape.kind, shape.group_look) {
+            // A knockout, or a see-through group drawn as one, has no
+            // plain PDF form here: it goes in as a picture with its
+            // transparency, as the canvas draws it.
+            if look.knockout || (look.as_one && shape.opacity < 1.0) {
+                if let Some(raster) = raster_of(shape, parent, self.symbols, MASK_DPI) {
+                    self.shape(&raster, Affine::IDENTITY);
+                }
+                return;
+            }
+        }
         if let ShapeKind::Group { children } = &shape.kind {
             for c in children {
                 // The group's uniform transparency goes on each member.
@@ -1651,7 +1662,32 @@ impl PageWriter<'_> {
         use tracedraw_core::geometry::Shape as _;
         let (drawn, scale) = crate::svg::drawn_stroke(s, transform);
         self.stroke_state(&drawn);
-        if let Some(brush) = &s.painterly {
+        let along = if s.painterly.is_none()
+            && tracedraw_core::shaping::outline_band(&shape.page_path(), s, scale).is_none()
+        {
+            tracedraw_core::shaping::along_slices(&shape.page_path(), s, drawn.width)
+        } else {
+            None
+        };
+        if let Some(pieces) = along {
+            // A gradient along the line: each piece filled in its colour.
+            for (piece, color, alpha) in pieces {
+                self.content.push_str("q\n");
+                if self.pdf.allow_alpha && alpha < 1.0 {
+                    let a = f64::from(alpha.max(0.0));
+                    let name = format!("GS{}", self.gstates.len());
+                    let id = self
+                        .pdf
+                        .add_str(format!("<< /Type /ExtGState /CA {} /ca {} >>", f(a), f(a)));
+                    self.gstates.push((name.clone(), id));
+                    let _ = writeln!(self.content, "/{name} gs");
+                }
+                let op = self.color_op(color, true);
+                let _ = writeln!(self.content, "{op}");
+                self.path_ops(&(parent * piece));
+                self.content.push_str("f\nQ\n");
+            }
+        } else if let Some(brush) = &s.painterly {
             // Painterly brush: the marks, one filled path per opacity.
             for (alpha, marks) in tracedraw_core::painterly::marks_by_opacity_along(
                 &shape.page_path(),
@@ -2489,7 +2525,7 @@ fn pdf_blend_mode(merge: tracedraw_core::live::MergeMode) -> &'static str {
 /// `shape` (placed by `parent`) drawn on its own as a bitmap object with
 /// its transparency, covering its bounds; the resolution drops so the
 /// picture stays within 40 million pixels.
-fn raster_of(
+pub(crate) fn raster_of(
     shape: &Shape,
     parent: Affine,
     symbols: &[tracedraw_core::Symbol],
@@ -4129,6 +4165,40 @@ mod tests {
         assert!(!text.contains("/Separation"));
         assert_eq!(pdf_name("A/B c"), "/A#2FB#20c");
         assert_eq!(pdf_name(""), "/Spot");
+    }
+
+    #[test]
+    fn knockout_groups_go_in_as_pictures() {
+        use tracedraw_core::document::GroupLook;
+        let pdf_of = |look: Option<GroupLook>| {
+            let mut doc = Document::default();
+            let layer = doc.pages[0].layers[0].id;
+            let mut kids = Vec::new();
+            for x in [10.0, 20.0] {
+                let mut r = Shape::new(
+                    doc.ids_mut().shape(),
+                    ShapeKind::Rect {
+                        rect: tracedraw_core::geometry::Rect::new(x, 10.0, x + 20.0, 30.0),
+                        radius: 0.0,
+                        corners: None,
+                    },
+                );
+                r.fill = Fill::Solid(Color::rgb8(200, 0, 0));
+                r.opacity = 0.5;
+                kids.push(r);
+            }
+            let mut g = Shape::new(doc.ids_mut().shape(), ShapeKind::Group { children: kids });
+            g.group_look = look;
+            doc.layer_mut(layer).unwrap().shapes.push(g);
+            String::from_utf8_lossy(&document_to_pdf(&doc)).into_owned()
+        };
+        let ko = pdf_of(Some(GroupLook {
+            as_one: false,
+            knockout: true,
+        }));
+        assert!(ko.contains("/Subtype /Image"), "a picture");
+        let plain = pdf_of(None);
+        assert!(!plain.contains("/Subtype /Image"), "vector members");
     }
 
     #[test]

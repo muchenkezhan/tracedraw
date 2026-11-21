@@ -390,6 +390,32 @@ fn write_unlinked(
         return;
     }
     let transform = parent * shape.transform;
+    if let (ShapeKind::Group { children }, Some(look)) = (&shape.kind, shape.group_look) {
+        if look.knockout {
+            // No knockout in SVG: the group goes in as a picture with its
+            // transparency, as the canvas draws it.
+            // Page space: the flip undone (it is its own inverse).
+            if let Some(raster) = crate::pdf::raster_of(shape, ctx.flip * parent, symbols, 300.0)
+            {
+                write_shape(&raster, symbols, ctx.flip, out, defs, ctx, indent);
+            }
+            return;
+        }
+        if look.as_one {
+            // A group's opacity in SVG goes on the group drawn as one.
+            let opacity = if shape.opacity < 1.0 {
+                format!(" opacity=\"{}\"", fmt(shape.opacity))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(out, "{pad}<g id=\"{}\"{opacity}>", shape.id.raw());
+            for c in children {
+                write_shape(c, symbols, transform, out, defs, ctx, indent + 1);
+            }
+            let _ = writeln!(out, "{pad}</g>");
+            return;
+        }
+    }
     if let ShapeKind::Group { children } = &shape.kind {
         let _ = writeln!(out, "{pad}<g id=\"{}\">", shape.id.raw());
         for c in children {
@@ -567,9 +593,16 @@ fn write_unlinked(
                 (band, paint)
             })
         });
+    // A gradient along the line: pieces of the outline, each in its colour.
+    let along = drawn
+        .as_ref()
+        .filter(|_| calligraphic.is_none())
+        .and_then(|(s, _)| tracedraw_core::shaping::along_slices(&shape.page_path(), s, s.width));
     let stroke_attr = match drawn.as_ref().map(|(s, _)| s) {
         None => "stroke=\"none\"".to_string(),
-        Some(s) if calligraphic.is_some() || s.painterly.is_some() => "stroke=\"none\"".to_string(),
+        Some(s) if calligraphic.is_some() || s.painterly.is_some() || along.is_some() => {
+            "stroke=\"none\"".to_string()
+        }
         Some(s) => {
             let cap = match s.cap {
                 LineCap::Butt => "butt",
@@ -612,6 +645,7 @@ fn write_unlinked(
         && matches!(shape.kind, ShapeKind::Text { .. })
         && calligraphic.is_none()
         && !drawn.as_ref().is_some_and(|(s, _)| s.painterly.is_some())
+        && along.is_none()
         && plain_paint(&fill_attr)
         && plain_paint(&stroke_attr)
     {
@@ -651,7 +685,8 @@ fn write_unlinked(
         .unwrap_or_default();
     let painterly = drawn.as_ref().is_some_and(|(s, _)| s.painterly.is_some());
     let see_through = shape.opacity < 1.0;
-    let wrapped = see_through && (calligraphic.is_some() || painterly || !heads.is_empty());
+    let wrapped = see_through
+        && (calligraphic.is_some() || painterly || along.is_some() || !heads.is_empty());
     let opacity = if see_through && !wrapped {
         format!(" opacity=\"{}\"", fmt(shape.opacity.max(0.0)))
     } else {
@@ -671,6 +706,19 @@ fn write_unlinked(
             out,
             "{pad}<path d=\"{}\" fill=\"{paint}\" stroke=\"none\"/>",
             path_data(&band)
+        );
+    }
+    for (piece, color, alpha) in along.unwrap_or_default() {
+        let opacity = if alpha < 1.0 {
+            format!(" fill-opacity=\"{}\"", fmt(f64::from(alpha.max(0.0))))
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "{pad}<path d=\"{}\" fill=\"{}\"{opacity} stroke=\"none\"/>",
+            path_data(&(parent * piece)),
+            color.to_hex()
         );
     }
     // A painterly outline: its marks, one path per opacity step.
@@ -1040,7 +1088,9 @@ fn paint_value(
                     );
                     let _ = writeln!(defs, "    <linearGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\">\n{stop_xml}    </linearGradient>");
                 }
-                tracedraw_core::FountainKind::Radial => {
+                tracedraw_core::FountainKind::Radial | tracedraw_core::FountainKind::Points => {
+                    // Colour points have no SVG gradient: a radial one
+                    // with the same colours.
                     let cx = bounds.center().x + f.offset.x * bounds.width() / 2.0;
                     let cy = bounds.center().y - f.offset.y * bounds.height() / 2.0;
                     let r = bounds.width().max(bounds.height()) / 2.0 * std::f64::consts::SQRT_2;
@@ -1058,7 +1108,30 @@ fn paint_value(
         }
         Fill::Pattern(p) => pattern_paint(p, object, symbols, defs, ctx),
         Fill::Texture(t) => {
-            // Approximate with the average of the two colours.
+            // A holographic texture is its look, so it goes in as the
+            // renderer's picture (150 dpi, as in PDF) over the object's
+            // bounds; other textures, and a picture too large to make,
+            // are approximated with the average of the two colours.
+            if t.kind.is_holographic() && bounds.width() > 0.0 && bounds.height() > 0.0 {
+                if let Some(png) = tracedraw_render::render_fill_image(fill, bounds, 150.0)
+                    .and_then(|pm| pm.encode_png().ok())
+                {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+                    let id = ctx.next("pat");
+                    let (x, y, w, h) = (
+                        fmt(bounds.x0),
+                        fmt(bounds.y0),
+                        fmt(bounds.width()),
+                        fmt(bounds.height()),
+                    );
+                    let _ = writeln!(
+                        defs,
+                        "    <pattern id=\"{id}\" patternUnits=\"userSpaceOnUse\" x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\">\n      <image width=\"{w}\" height=\"{h}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"/>\n    </pattern>"
+                    );
+                    return format!("url(#{id})");
+                }
+            }
             tracedraw_core::style::lerp_color(t.color_a, t.color_b, 0.5).to_hex()
         }
         Fill::Procedural(p) => {
@@ -1384,6 +1457,48 @@ pub(crate) mod tests {
         assert!(svg.contains(&format!("mask=\"url(#mask{id})\"")));
         assert!(svg.contains("feColorMatrix"), "inverted");
         assert!(!svg.contains("clip-path"));
+    }
+
+    /// A group drawn as one carries its opacity on the group; a knockout
+    /// group goes in as a picture where the group lies.
+    #[test]
+    fn group_looks_are_written() {
+        use tracedraw_core::document::GroupLook;
+        let svg_of = |look: GroupLook| {
+            let mut doc = Document::default();
+            let layer = doc.pages[0].layers[0].id;
+            let mut kids = Vec::new();
+            for x in [10.0, 20.0] {
+                let mut r = Shape::new(
+                    doc.ids_mut().shape(),
+                    ShapeKind::Rect {
+                        rect: Rect::new(x, 10.0, x + 20.0, 30.0),
+                        radius: 0.0,
+                        corners: None,
+                    },
+                );
+                r.fill = Fill::Solid(Color::rgb8(200, 0, 0));
+                r.opacity = 0.5;
+                kids.push(r);
+            }
+            let mut g = Shape::new(doc.ids_mut().shape(), ShapeKind::Group { children: kids });
+            g.opacity = 0.5;
+            g.group_look = Some(look);
+            doc.layer_mut(layer).unwrap().shapes.push(g);
+            page_to_svg(&doc, 0)
+        };
+        let one = svg_of(GroupLook {
+            as_one: true,
+            knockout: false,
+        });
+        assert!(one.contains("opacity=\"0.5\">"), "{one}");
+        assert!(!one.contains("<image"));
+        let ko = svg_of(GroupLook {
+            as_one: false,
+            knockout: true,
+        });
+        assert!(ko.contains("<image"), "{ko}");
+        assert!(!ko.contains("<rect") && !ko.contains("<path"), "{ko}");
     }
 
     /// An object's uniform transparency is written: SVG export left it
@@ -1822,6 +1937,56 @@ pub(crate) mod tests {
         let pdf = crate::pdf::document_to_pdf(&doc);
         let text = String::from_utf8_lossy(&pdf);
         assert!(text.contains("/ca "));
+    }
+
+    #[test]
+    fn a_gradient_along_the_line_is_written_as_pieces_in_its_colours() {
+        let mut doc = Document::default();
+        let layer = doc.pages[0].layers[0].id;
+        let id = doc.ids_mut().shape();
+        let mut path = tracedraw_core::geometry::BezPath::new();
+        path.move_to(tracedraw_core::Point::new(10.0, 50.0));
+        path.line_to(tracedraw_core::Point::new(110.0, 50.0));
+        let mut s = Shape::new(
+            id,
+            ShapeKind::Path {
+                path,
+                closed: false,
+            },
+        );
+        let mut st = Stroke::new(Color::BLACK, 6.0);
+        let mut f = tracedraw_core::Fountain::two(
+            tracedraw_core::FountainKind::Linear,
+            Color::rgb8(255, 0, 0),
+            Color::rgb8(0, 0, 255),
+            90.0,
+        );
+        // Fading to half at the end.
+        f.stops[1].opacity = 0.5;
+        st.fill = Some(Box::new(tracedraw_core::Fill::Fountain(f)));
+        st.fill_along = true;
+        s.stroke = Some(st);
+        doc.layer_mut(layer).unwrap().shapes.push(s);
+        let svg = page_to_svg(&doc, 0);
+        assert!(!svg.contains("stroke-width=\"6\""));
+        // The pieces' colours, in order: red at the start, blue at the end.
+        let fills: Vec<[u8; 3]> = svg
+            .split("fill=\"#")
+            .skip(1)
+            .filter_map(|t| {
+                let h = t.get(..6)?;
+                let v = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+                Some([v(0)?, v(2)?, v(4)?])
+            })
+            .collect();
+        assert!(fills.len() >= 8, "{svg}");
+        let (first, last) = (fills[0], fills[fills.len() - 1]);
+        assert!(first[0] > 200 && first[2] < 50, "{first:?}");
+        assert!(last[2] > 200 && last[0] < 50, "{last:?}");
+        let pdf = crate::pdf::document_to_pdf(&doc);
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(svg.contains("fill-opacity=\"0.5"), "{svg}");
+        assert!(text.contains("/ca 0.5"), "{text}");
     }
 
     /// A line from (10, 50) to (60, 50), 2 mm wide, with a custom
@@ -2313,5 +2478,30 @@ pub(crate) mod tests {
         // A plain gradient keeps its two stops.
         let svg = one_shape_svg(Fill::linear(red, blue, 0.0), None);
         assert_eq!(svg.matches("<stop ").count(), 2, "{svg}");
+    }
+
+    /// A holographic texture is written as its picture over the object,
+    /// not as a flat colour; the other textures stay a colour.
+    #[test]
+    fn holographic_texture_goes_in_as_a_picture() {
+        let holo = |kind| {
+            Fill::Texture(tracedraw_core::Texture {
+                kind,
+                color_a: Color::rgb8(28, 30, 44),
+                color_b: Color::rgb8(236, 238, 242),
+                scale: 20.0,
+                seed: 3,
+            })
+        };
+        for kind in [
+            tracedraw_core::TextureKind::Holographic,
+            tracedraw_core::TextureKind::HoloGlitter,
+        ] {
+            let svg = one_shape_svg(holo(kind), None);
+            assert!(svg.contains("fill=\"url(#pat"), "{svg}");
+            assert!(svg.contains("<image ") && svg.contains("data:image/png;base64,"));
+        }
+        let svg = one_shape_svg(holo(tracedraw_core::TextureKind::Clouds), None);
+        assert!(!svg.contains("<image "), "{svg}");
     }
 }
