@@ -7,7 +7,7 @@
 //! horizontal or vertical;
 //! Esc cancels it. Let go over another object with Shift held, that
 //! object takes the outline of the selection without the menu, with Alt
-//! the fill and with Ctrl fill and outline, as in CorelDRAW. A move with
+//! the fill and with Ctrl fill and outline. A move with
 //! the left button let go over another object with Alt held copies the
 //! fill there without a menu, with Alt+Shift the outline
 //! (`App::copy_style_onto`, discussion #2066).
@@ -328,7 +328,7 @@ impl App {
                 else {
                     return;
                 };
-                let Some(mut kind) = crate::text_path::fit_kind(&text, &path, Some(at)) else {
+                let Some((mut kind, transform)) = crate::text_path::fit(&text, &path, Some(at)) else {
                     return;
                 };
                 // The drop locates the text along the path, not away from it.
@@ -343,10 +343,19 @@ impl App {
                         uid,
                     });
                 }
-                self.run(Command::SetShapeKind {
+                let mut commands = vec![Command::SetShapeKind {
                     shape: source,
                     kind,
-                });
+                }];
+                if transform != text.transform {
+                    commands.push(Command::TransformShapes {
+                        shapes: vec![source],
+                        transform: transform * text.transform.inverse(),
+                    });
+                }
+                if let Err(error) = self.engine.run_batch("Fit Text to Path", &commands) {
+                    self.status = error.to_string();
+                }
             }
             DropAction::Cancel => {}
         }
@@ -642,7 +651,7 @@ mod tests {
 
     /// Discussion #2066: a right-button drag let go over another object
     /// with Shift held copies the outline there without the menu, with
-    /// Alt the fill and with Ctrl both, as in CorelDRAW; without keys the
+    /// Alt the fill and with Ctrl both; without keys the
     /// menu opens.
     #[test]
     fn right_drop_with_shift_alt_or_ctrl_copies_without_the_menu() {

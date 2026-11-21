@@ -238,7 +238,7 @@ pub fn for_key(key: &str) -> Option<Glyph> {
         | "menu.object.symbol" => Symbol,
         "menu.effects.blend" => Blend,
         "menu.effects.contour" => Contour,
-        "menu.effects.extrude" => Extrude,
+        "menu.effects.extrude" | "menu.effects.shape3d" => Extrude,
         "menu.effects.lens" => Lens,
         "menu.effects.bevel" => Bevel,
         "menu.effects.brush_strokes" => BrushStrokes,

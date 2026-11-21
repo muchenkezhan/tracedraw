@@ -11,7 +11,7 @@ use egui::{vec2, Button, Color32, Painter, Rect, Shape, Stroke, Ui};
 use tracedraw_core::document::{PathTextOrientation, PathTextVertical, TextAlign};
 use tracedraw_core::geometry::{Point, Vec2};
 
-const ORIENTATIONS: [(PathTextOrientation, &str); 4] = [
+const ORIENTATIONS: [(PathTextOrientation, &str); 5] = [
     (PathTextOrientation::Rotate, "toolbar.path_rotate"),
     (
         PathTextOrientation::VerticalSkew,
@@ -22,6 +22,7 @@ const ORIENTATIONS: [(PathTextOrientation, &str); 4] = [
         "toolbar.path_horizontal_skew",
     ),
     (PathTextOrientation::Upright, "toolbar.path_upright"),
+    (PathTextOrientation::Radial, "toolbar.path_radial"),
 ];
 
 const VERTICALS: [(PathTextVertical, &str); 4] = [
@@ -111,10 +112,14 @@ impl Preview {
         let at = |x: f64, y: f64| rect.center() + vec2(x as f32, y as f32 - 15.0) * scale;
         let guide_stroke = Stroke::new((1.1 * scale).max(0.85), ink.gamma_multiply(0.75));
         let ink_stroke = Stroke::new((2.2 * scale).max(1.0), ink);
-        let letter = |glyph: &[&[(f64, f64)]], x, y, size, orientation, slope: f64| {
+        let letter = |glyph: &[&[(f64, f64)]], x, y: f64, size, orientation, slope: f64| {
             // Text uses upward Y. The preview guide uses screen coordinates.
-            let frame =
-                tracedraw_text::path_letter_frame(orientation, Vec2::new(1., -slope).normalize());
+            let frame = tracedraw_text::path_letter_frame(
+                orientation,
+                Vec2::new(1., -slope).normalize(),
+                Point::new(x, -y),
+                Point::new(0., -39.), // The sample arc's centre.
+            );
             for line in glyph {
                 let points = line.iter().map(|&(gx, gy)| {
                     let p = frame * Point::new(gx * size, -gy * size);
@@ -355,6 +360,17 @@ pub fn text_path_bar(app: &mut App, ui: &mut Ui) {
         app.mirror_fitted_text(h, !v);
     }
     sep(ui);
+    // Follow Path (#3571): the text fitted again whenever its path
+    // changes. Shown while the path it was fitted to is in the drawing.
+    if let Some(link) = app.fitted_text_link() {
+        if ui
+            .selectable_label(link.follow, tr("toolbar.path_follow"))
+            .rich_tip(tr("toolbar.path_follow_tip"))
+            .clicked()
+        {
+            app.set_text_follows_path(!link.follow);
+        }
+    }
     if ui
         .button(tr("menu.text.straighten_text"))
         .rich_tip(tr("toolbar.path_straighten_tip"))
@@ -610,6 +626,10 @@ mod tests {
         assert!(app.fitted_text().is_some());
         let fitted = bar_texts(&mut app);
         assert!(fitted.contains(&straighten), "{fitted:?}");
+        // Follow Path is there, off, for a text fitted to a path that is
+        // in the drawing (#3571).
+        assert!(fitted.contains(&tr("toolbar.path_follow")), "{fitted:?}");
+        assert!(!app.fitted_text_link().expect("link").follow);
         // The placement list shows where the text is: Top after fitting.
         assert!(fitted.contains(&tr("toolbar.path_place_top")), "{fitted:?}");
         // Bottom from the list: centred there, both mirrors, and the bar

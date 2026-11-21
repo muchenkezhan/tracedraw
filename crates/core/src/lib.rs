@@ -31,18 +31,23 @@ pub mod jpeg_source;
 pub mod join;
 pub mod linked_text;
 pub mod live;
+pub mod live_paint;
 pub mod nodes;
 pub mod painterly;
 pub mod paragraphs;
+pub mod parallel;
 pub mod patch;
 pub mod picture_inks;
 mod press;
 pub mod procedural;
+pub mod rough;
 pub mod recolor;
+pub mod scale_grid;
 pub mod shadow;
 pub mod shaping;
 pub mod spreads;
 pub mod style;
+pub mod surface_map;
 pub mod table;
 pub mod text_flow;
 pub mod text_path;
@@ -60,9 +65,10 @@ pub use document::{
     FollowBlack, FontVariation, Layer, LeadingUnit, LineStyle, MasterScope, Metadata, Numbering,
     ObjectDefaults, ObjectStyle, Page, ParagraphStyle, PathTextOrientation, PathTextVertical,
     QrCode, QrKind, Shadow, Shape, ShapeKind, StyleParts, Symbol, TabKind, TabStop, Table,
-    TableCell, TextAlign, TextDirection, TextOnPath, TextPosition, TextSpan, TimeTracker,
+    TableCell, TextAlign, TextDirection, TextOnPath, CurvePreset, TextPosition, TextSpan, TimeTracker,
     TrackedTask, VerticalAlign, VerticalColumns, DEFAULT_TAB_STEP,
 };
+pub use document::{BulletPart, MAX_LIST_LEVEL};
 pub use engine::Engine;
 pub use geometry::{Affine, BezPath, Point, Rect, Size, Vec2};
 pub use icc::{Intent as RenderingIntent, Profile as IccProfile, Transform as IccTransform};
@@ -102,6 +108,8 @@ pub enum Error {
     SelectionGroup(u8),
     #[error("object {0:?} is not a clip frame")]
     NotClipFrame(ShapeId),
+    #[error("object {0:?} is not a group")]
+    NotGroup(ShapeId),
     #[error("object {0:?} is not a bitmap")]
     NotBitmap(ShapeId),
     #[error("object {0:?} is not a text")]

@@ -38,11 +38,13 @@ objects/index
   objects/objects-and-layers
   objects/properties-docker
   objects/clip-frames
+  objects/group-looks
   objects/symmetry
   objects/focus-mode
   objects/symbols
   objects/object-data
   objects/links
+  objects/stretch-zones
   objects/paste-special
   objects/shelf
   objects/find-replace
@@ -51,6 +53,7 @@ objects/index
   objects/tables
   objects/barcodes
   objects/formulas
+  objects/light-flare
   objects/tracecut
   objects/shape-generator
 color/index
@@ -82,6 +85,7 @@ effects/index
   effects/mosaics
   effects/symbol-scatter
   effects/frame-generator
+  effects/revolve-inflate
   effects/bitmap-effects
 text/index
   text/adding-text
