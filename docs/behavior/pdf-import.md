@@ -148,7 +148,10 @@ the dialog keeps what was read until OK or Cancel.
   subset prefix (`Arial-BoldMT` becomes Arial, bold); a part after the
   dash that holds a number stays, so `Raj-01` keeps its
   whole name in the missing fonts list (#3554,
-  `pdf_import::tests::a_numbered_font_keeps_its_number`). Bold and italic
+  `pdf_import::tests::a_numbered_font_keeps_its_number`). Only the parts
+  that name a style go: a word of the family's own name stays, its dash
+  read as a space, so `Lohit-Devanagari` is Lohit Devanagari, not Lohit,
+  while `Khand-Bold` is Khand, bold (#3651). Bold and italic
   come from the name, the descriptor flags and StemV. Characters decode
   through ToUnicode CMaps (bfchar, bfrange), then the font's Encoding
   (WinAnsi, MacRoman, Standard, Differences with glyph names), then
@@ -385,6 +388,12 @@ their own crypt filter and signature contents are left alone.
   rest in typed order showed निदेशालय, विभाग and अनिल as नदिेशालय, वभिाग
   and अनलि (#3177,
   `pdf_import::tests::hindi_typed_after_an_actual_text_letter_keeps_its_i_signs`).
+  A text that begins with tabs or spaces (a list item's tab after its
+  bullet, drawn as a space glyph, then the letters moved on with `Td`)
+  comes in without them and starts where its first letter was drawn:
+  the tab was kept, so in another font the letters slid back over the
+  bullet, as डॉ. did in a Hindi list (#3718,
+  `pdf_import::tests::leading_tab_or_space_is_left_out_and_text_starts_at_its_first_letter`).
 - Hindi written by Export as PDF with its font comes back as the typed
   words, shaped to the glyphs of the original: all 59 words of the
   Devanagari corpus (35 came back wrong before, with letters doubled,

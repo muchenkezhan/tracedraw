@@ -96,6 +96,7 @@ mod file_hold;
 mod file_presence;
 mod files;
 mod fill_page;
+mod shape3d;
 mod shape_gen;
 mod shape_gen_cells;
 mod shape_gen_curves;
@@ -155,6 +156,9 @@ mod mcp;
 mod mcp_link;
 mod media;
 mod mesh_tool;
+mod color_points;
+mod text_curve;
+mod trace_sketch;
 mod mixed;
 #[cfg(test)]
 mod mockup_tests;
@@ -175,15 +179,19 @@ mod page_names;
 mod painterly_tool;
 mod palette;
 mod palm;
+mod parallel_lines;
 mod pen;
 mod pen_look;
 mod perspective_draw;
+mod pieces;
+mod cut_tools;
 #[cfg(test)]
 mod pick_drag_tests;
 mod picture_mosaic;
 mod picture_plates;
 mod pixel_edit;
 mod pixel_edit_app;
+mod pixel_light;
 mod placeholder;
 mod plugins;
 mod pmd_open;
@@ -233,6 +241,7 @@ mod builtin_looks;
 mod style_presets;
 mod styles;
 mod symbol_paste;
+mod separation_view;
 mod symmetry_edit;
 mod system_chars;
 mod system_locale;
@@ -247,6 +256,7 @@ mod templates;
 mod text_editing;
 #[cfg(test)]
 mod text_effect_tests;
+mod text_follow;
 mod text_frames;
 mod text_nodes;
 mod text_path;
@@ -258,6 +268,7 @@ mod theme;
 mod thesaurus;
 mod thumbnails;
 mod time_tracker;
+mod flow;
 #[cfg(any(target_os = "linux", test))]
 mod title_bar;
 mod tools;
@@ -1201,6 +1212,8 @@ impl eframe::App for Shell {
         app.refresh_blends();
         // Live fits follow their paths and objects.
         app.refresh_live_fits();
+        // Texts set to follow their paths are fitted again (#3571).
+        app.refresh_text_follow();
         // The window's state is kept once it has settled; until then it
         // is maximized when it should start so, and checked (#787).
         #[cfg(not(target_arch = "wasm32"))]

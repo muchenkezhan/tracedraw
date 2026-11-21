@@ -53,6 +53,17 @@ impl ClipboardContent {
     }
 }
 
+/// Text that is a DXF drawing: its first two lines, group code 0 and
+/// `SECTION`, as every DXF file starts.
+fn is_dxf_text(t: &str) -> bool {
+    let mut lines = t
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    lines.next() == Some("0") && lines.next() == Some("SECTION")
+}
+
 /// What the system clipboard held when TraceDraw copied, so that a paste
 /// can tell whether something was copied elsewhere since (#183). Where
 /// the system counts clipboard changes (Windows) the count decides and
@@ -818,6 +829,10 @@ impl App {
             tracedraw_io::svg_import::parse(svg, &mut ids)
                 .map(|i| i.shapes)
                 .ok()
+        } else if let Some(dxf) = std::str::from_utf8(bytes).ok().filter(|t| is_dxf_text(t)) {
+            tracedraw_io::dxf::parse(dxf, &mut ids)
+                .map(|i| i.shapes)
+                .ok()
         } else if tracedraw_io::pdf_import::is_pdf(bytes) {
             tracedraw_io::pdf_import::parse(bytes, &mut ids)
                 .ok()
@@ -889,6 +904,51 @@ impl App {
         let before = self.selection.clone();
         self.paste_with_event_text(None);
         self.move_pasted_to(&before, at);
+    }
+
+    /// Edit > Paste Above Selection: paste, then lay what came just in
+    /// front of the topmost selected object, in its layer or group,
+    /// instead of at the top of the active layer (#3673). One Undo takes
+    /// the paste back. With nothing selected it pastes as Paste does.
+    pub fn paste_above_selection(&mut self) {
+        let reference = self.topmost_selected();
+        let before = self.selection.clone();
+        self.paste_with_event_text(None);
+        let Some(reference) = reference else {
+            return;
+        };
+        if self.selection.is_empty() || self.selection == before {
+            return;
+        }
+        let shapes: Vec<ShapeId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|s| *s != reference)
+            .collect();
+        let cmd = Command::PlaceBeside {
+            shapes,
+            reference,
+            in_front: true,
+        };
+        if let Err(e) = self.engine.amend_batch("Paste", &[cmd]) {
+            self.status = e.to_string();
+        }
+    }
+
+    /// The selected object drawn on top of the others: on the highest
+    /// layer, then the latest in it.
+    fn topmost_selected(&self) -> Option<ShapeId> {
+        let doc = self.doc();
+        let layers: Vec<_> = doc.all_layers().map(|l| l.id).collect();
+        self.selection
+            .iter()
+            .filter_map(|&id| {
+                let (layer, i) = doc.locate(id).ok()?;
+                Some((layers.iter().position(|l| *l == layer)?, i, id))
+            })
+            .max_by_key(|&(l, i, _)| (l, i))
+            .map(|(_, _, id)| id)
     }
 
     /// Centre what a paste selected on `at`, when given and the paste
@@ -1103,6 +1163,12 @@ impl App {
             for path in &content.files {
                 self.import_path(path);
             }
+            return;
+        }
+        // A drawing a CAD program copied as DXF text (Cadcraft, #3544):
+        // its objects, not a text of its codes.
+        let dxf = content.text.as_deref().filter(|t| is_dxf_text(t));
+        if dxf.is_some_and(|t| self.paste_vector(t.as_bytes())) {
             return;
         }
         if content.is_svg() {
@@ -1709,6 +1775,29 @@ mod tests {
         app
     }
 
+    /// #3544: a drawing a CAD program copied as DXF text (as Cadcraft
+    /// does, lines ended by CR LF and codes indented) pastes as its
+    /// objects, not as a text of its codes.
+    #[test]
+    fn dxf_text_pastes_as_objects() {
+        let mut app = App::headless();
+        let dxf = "  0\r\nSECTION\r\n  2\r\nENTITIES\r\n  0\r\nLINE\r\n  8\r\n0\r\n 10\r\n0.0\r\n 20\r\n0.0\r\n 11\r\n10.0\r\n 21\r\n5.0\r\n  0\r\nENDSEC\r\n  0\r\nEOF\r\n";
+        assert!(is_dxf_text(dxf));
+        assert!(!is_dxf_text("0 SECTION is not a drawing"));
+        app.paste_from(ClipboardContent {
+            text: Some(dxf.into()),
+            ..Default::default()
+        });
+        let shapes: Vec<&tracedraw_core::Shape> =
+            app.doc().all_layers().flat_map(|l| &l.shapes).collect();
+        assert_eq!(shapes.len(), 1);
+        assert!(
+            !matches!(shapes[0].kind, ShapeKind::Text { .. }),
+            "{:?}",
+            shapes[0].kind
+        );
+    }
+
     fn svg_text() -> ClipboardContent {
         ClipboardContent {
             text: Some("<svg xmlns=\"http://www.w3.org/2000/svg\"/>".into()),
@@ -1931,6 +2020,55 @@ mod tests {
         let b = app.selection_bounds().expect("pasted");
         let c = app.view_center();
         assert!((b.center() - c).hypot() < 1e-6, "{:?} at {c:?}", b.center());
+    }
+
+    /// Paste Above Selection lays the copy just in front of the topmost
+    /// selected object, not at the top of the layer, in one Undo step
+    /// (#3673).
+    #[test]
+    fn paste_above_selection_lands_in_front_of_the_selection() {
+        let mut app = App::headless();
+        let rect = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(x, 10.0, x + 20.0, 30.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect")
+        };
+        let (a, b, c) = (
+            rect(&mut app, 0.0),
+            rect(&mut app, 30.0),
+            rect(&mut app, 60.0),
+        );
+        app.select(vec![c]);
+        app.copy();
+        // Pasted with A and B selected: between B and C.
+        app.select(vec![b, a]);
+        let steps = app.engine.history_labels().0.len();
+        app.paste_above_selection();
+        let pasted = app.selection.clone();
+        assert_eq!(pasted.len(), 1);
+        assert!(pasted[0] != c);
+        let order: Vec<ShapeId> = app
+            .doc()
+            .all_layers()
+            .flat_map(|l| l.shapes.iter().map(|s| s.id))
+            .collect();
+        let at = |id| order.iter().position(|x| *x == id).expect("on a layer");
+        assert_eq!(at(pasted[0]), at(b) + 1, "just in front of B");
+        assert!(at(pasted[0]) < at(c), "behind C, which was on top");
+        assert_eq!(app.engine.history_labels().0.len(), steps + 1, "one step");
+        // With nothing selected it pastes as Paste does: on top.
+        app.select(vec![]);
+        app.paste_above_selection();
+        let top = app.selection[0];
+        let order: Vec<ShapeId> = app
+            .doc()
+            .all_layers()
+            .flat_map(|l| l.shapes.iter().map(|s| s.id))
+            .collect();
+        assert_eq!(order.last(), Some(&top));
     }
 
     fn png_file(name: &str) -> PastedFile {

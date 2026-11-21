@@ -435,8 +435,7 @@ thread_local! {
 
 /// A right-click on the menu row `id`, greyed or not, closes the menu and
 /// asks for the row's properties: Options > Customization > Commands at
-/// that command, on its Shortcut Keys tab, as CorelDRAW's Customize >
-/// Menu Item Properties does (#2504).
+/// that command, on its Shortcut Keys tab (#2504).
 fn row_properties(ui: &mut Ui, r: &egui::Response, id: &str, enabled: bool) {
     #[cfg(test)]
     ROWS.with(|rows| rows.borrow_mut().push((id.to_string(), r.rect)));
@@ -781,6 +780,7 @@ fn menu_pic(key: &str) -> Option<crate::ui::propbar::Pic> {
         "menu.text.tabs" => Pic::Tabs,
         "menu.text.columns" => Pic::Columns,
         "menu.text.bullets" => Pic::Bullets,
+        "menu.text.toggle_bullets" => Pic::Bullets,
         "menu.text.drop_cap" => Pic::DropCap,
         "menu.text.text_statistics" => Pic::TextStatistics,
         "menu.text.edit_text" => Pic::EditText,
@@ -1833,6 +1833,27 @@ mod tests {
             shapes
         );
         assert!(!invoke::active());
+    }
+
+    /// Window > Dockers checks every open docker, its tab in front or
+    /// behind another; choosing one behind brings it to the front, and
+    /// a closed column's dockers are unchecked (#3663).
+    #[test]
+    fn the_dockers_menu_checks_every_open_tab() {
+        let mut app = App::headless();
+        for tab in [DockerTab::Hints, DockerTab::Properties, DockerTab::Objects] {
+            app.open_docker(tab);
+        }
+        assert_eq!(app.docker_tab, DockerTab::Objects);
+        for tab in [DockerTab::Hints, DockerTab::Properties, DockerTab::Objects] {
+            assert!(effect_docker_open(&app, tab), "{tab:?}");
+        }
+        assert!(!effect_docker_open(&app, DockerTab::Blend));
+        app.open_docker(DockerTab::Hints);
+        assert_eq!(app.docker_tab, DockerTab::Hints);
+        assert!(effect_docker_open(&app, DockerTab::Objects));
+        app.show_dockers = false;
+        assert!(!effect_docker_open(&app, DockerTab::Objects));
     }
 
     /// The Effects menu: Flatten Effects, the bitmap groups, then the
@@ -3036,6 +3057,10 @@ fn edit_menu(app: &mut App, ui: &mut Ui) {
     if item(ui, "menu.edit.paste_in_view", "Ctrl+Shift+V", true) {
         app.paste_in_view();
     }
+    // Pasted just in front of the topmost selected object (#3673).
+    if item(ui, "menu.edit.paste_above_selection", "", true) {
+        app.paste_above_selection();
+    }
     if item(ui, "menu.edit.paste_special", "", true) {
         app.dialog = Dialog::PasteSpecial(Default::default());
     }
@@ -3127,7 +3152,7 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
     }
     sep(ui);
     if item(ui, "menu.view.fullscreen_preview", "F9", true) {
-        app.fullscreen_preview = true;
+        super::preview::begin(app, ui.ctx(), false);
     }
     if item(
         ui,
@@ -3135,8 +3160,7 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
         "",
         !app.selection.is_empty(),
     ) {
-        app.preview_selected_only = true;
-        app.fullscreen_preview = true;
+        super::preview::begin(app, ui.ctx(), true);
     }
     if check(ui, "menu.view.page_sorter", "", app.page_sorter) {
         app.page_sorter = !app.page_sorter;
@@ -3197,6 +3221,23 @@ fn view_menu(app: &mut App, ui: &mut Ui) {
         app.simulate_overprints = !app.simulate_overprints;
         app.raster.borrow_mut().invalidate();
     }
+    // One ink at a time in the drawing window, in its colour.
+    sub(ui, "menu.view.separations", |ui| {
+        if radio(
+            ui,
+            "menu.view.separations_composite",
+            "",
+            app.view_plate.is_none(),
+        ) {
+            app.set_view_plate(None);
+        }
+        for (i, name) in app.separation_names().into_iter().enumerate() {
+            let id = format!("menu.view.separations.{i}");
+            if check_label(ui, &name, &id, app.view_plate == Some(i)) {
+                app.set_view_plate(Some(i));
+            }
+        }
+    });
     if check(
         ui,
         "menu.view.rasterize_complex_effects",
@@ -3470,6 +3511,12 @@ fn node_items(app: &mut App, ui: &mut Ui) {
             app.run_node_command(key);
         }
     }
+    // With any tool, on the whole of each selected curve.
+    sep(ui);
+    let every = app.can_add_node_every_segment();
+    if item(ui, "menu.object.node_add_every", "", every) {
+        app.add_node_every_segment();
+    }
 }
 
 fn object_menu(app: &mut App, ui: &mut Ui) {
@@ -3552,6 +3599,9 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         // A formula; with one selected, the same item edits it (#2183).
         if item(ui, "menu.object.insert_formula", "", true) {
             app.open_formula_dialog();
+        }
+        if item(ui, "menu.object.insert_flare", "", true) {
+            app.open_flare_dialog();
         }
         if item(ui, "menu.object.insert_qr", "", true) {
             app.insert_qr_code();
@@ -3755,6 +3805,15 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         if item(ui, "menu.object.symbol_revert", "", has_instance) {
             app.revert_symbol_instances();
         }
+        // Corners that keep their size when an instance is stretched.
+        if item(
+            ui,
+            "menu.object.symbol_stretch_zones",
+            "",
+            app.can_edit_stretch_zones(),
+        ) {
+            app.open_stretch_zones_dialog();
+        }
         if item(ui, "menu.object.symbol_manager", "Ctrl+F3", true) {
             app.show_dockers = true;
             app.docker_tab = DockerTab::Symbols;
@@ -3789,6 +3848,10 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         if item(ui, "menu.object.rotate_by_lines", "", has) {
             app.start_rotate_by_lines();
         }
+        // Each object by the same (or random) amounts about its own centre.
+        if item(ui, "menu.object.transform_each", "", has) {
+            app.open_transform_each();
+        }
     });
     if item(ui, "menu.object.clear_transformations", "", has) {
         app.clear_transformations();
@@ -3804,6 +3867,15 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         }
         if item(ui, "menu.object.copy_envelope_from", "", has) {
             app.start_copy_envelope();
+        }
+        // The top object's outline as the others' envelope.
+        if item(
+            ui,
+            "menu.object.envelope_from_top",
+            "",
+            app.selection.len() >= 2,
+        ) {
+            app.envelope_from_top_object();
         }
         for kind in CopyKind::LIVE {
             if item(ui, kind.key(), "", has) {
@@ -3824,6 +3896,26 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
     });
     if item(ui, "menu.object.clear_effect", "", has) {
         app.clear_effects();
+    }
+    // Commands a shortcut can be given to (#3622).
+    if item(ui, "menu.object.transparency_apply", "", has) {
+        app.apply_uniform_transparency();
+    }
+    if item(
+        ui,
+        "menu.object.transparency_remove",
+        "",
+        app.can_clear_transparency(),
+    ) {
+        app.clear_transparency();
+    }
+    if item(
+        ui,
+        "menu.object.flatten_transparency",
+        "",
+        app.can_clear_transparency(),
+    ) {
+        app.flatten_transparency();
     }
     sep(ui);
     sub(ui, "menu.object.align_distribute", |ui| {
@@ -3927,6 +4019,22 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         if item(ui, "menu.object.group_ungroup_all", "", has) {
             app.ungroup_all();
         }
+        // How the selected groups put their members together.
+        let looks: Vec<_> = app
+            .selected_shapes()
+            .iter()
+            .filter(|s| matches!(s.kind, ShapeKind::Group { .. }))
+            .map(|s| s.group_look.unwrap_or_default())
+            .collect();
+        let any_group = !looks.is_empty();
+        let as_one = any_group && looks.iter().all(|l| l.as_one);
+        if check(ui, "menu.object.group_as_one", "", as_one) && any_group {
+            app.set_group_looks(Some(!as_one), None);
+        }
+        let knockout = any_group && looks.iter().all(|l| l.knockout);
+        if check(ui, "menu.object.group_knockout", "", knockout) && any_group {
+            app.set_group_looks(None, Some(!knockout));
+        }
     });
     sep(ui);
     sub(ui, "menu.object.hide", |ui| {
@@ -3972,6 +4080,31 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
             if item(ui, key, "", on) {
                 app.shaping(op);
             }
+        }
+        sep(ui);
+        // Pieces of overlapping objects, and the live combine.
+        for op in crate::pieces::Pieces::ALL {
+            if item(ui, op.key(), "", app.pieces_ready(op)) {
+                app.pieces(op);
+            }
+        }
+        let can_live = app.selection.len() >= 2
+            || app
+                .selected_shapes()
+                .first()
+                .is_some_and(|s| app.selection.len() == 1 && matches!(s.kind, ShapeKind::Group { .. }));
+        if item(ui, "menu.object.combine_live", "", can_live) {
+            app.combine_live();
+        }
+        sep(ui);
+        if item(ui, "menu.object.cut_below", "", app.cut_below_ready()) {
+            app.cut_objects_below();
+        }
+        if item(ui, "menu.object.cut_grid", "", app.grid_cut_ready()) {
+            app.grid_cut.open = true;
+        }
+        if item(ui, "menu.object.remove_strays", "", true) {
+            app.remove_strays();
         }
         sep(ui);
         if item(ui, "menu.object.shaping_docker", "", true) {
@@ -4075,7 +4208,7 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         ui,
         "menu.object.properties",
         "Alt+Enter",
-        app.docker_shown(DockerTab::Properties),
+        effect_docker_open(app, DockerTab::Properties),
     ) {
         app.open_docker(DockerTab::Properties);
     }
@@ -4083,7 +4216,7 @@ fn object_menu(app: &mut App, ui: &mut Ui) {
         ui,
         "menu.object.objects",
         "",
-        app.docker_shown(DockerTab::Objects),
+        effect_docker_open(app, DockerTab::Objects),
     ) {
         app.open_docker(DockerTab::Objects);
     }
@@ -4166,6 +4299,7 @@ fn effects_menu(app: &mut App, ui: &mut Ui) {
         ("menu.effects.vector_mosaic", "", DockerTab::VectorMosaic),
         ("menu.effects.symbol_scatter", "", DockerTab::SymbolScatter),
         ("menu.effects.frame_generator", "", DockerTab::FrameGenerator),
+        ("menu.effects.shape3d", "", DockerTab::Shape3d),
     ] {
         if check(ui, key, shortcut, effect_docker_open(app, tab)) {
             app.open_docker(tab);
@@ -4173,7 +4307,8 @@ fn effects_menu(app: &mut App, ui: &mut Ui) {
     }
 }
 
-/// An effect panel's tab is in an open docker column, or floating.
+/// A docker's tab is in an open docker column (in front or behind
+/// another tab), or floating: what the menus check it for (#3663).
 pub(crate) fn effect_docker_open(app: &App, tab: DockerTab) -> bool {
     match app.docker_place(tab) {
         Some(crate::app::DockerPlace::Right) => app.show_dockers,
@@ -4441,6 +4576,17 @@ fn text_menu(app: &mut App, ui: &mut Ui) {
     }
     if item(ui, "menu.text.bullets", "", true) {
         app.dialog = Dialog::TextBullets;
+    }
+    // Bullets on or off without the dialog (#3593).
+    if item(ui, "menu.text.toggle_bullets", "Ctrl+Shift+L", is_para) {
+        app.toggle_bullets();
+    }
+    // List levels (#3685).
+    if item(ui, "menu.text.list_level_down", "", is_para) {
+        app.change_list_level(true);
+    }
+    if item(ui, "menu.text.list_level_up", "", is_para) {
+        app.change_list_level(false);
     }
     if item(ui, "menu.text.drop_cap", "", true) {
         app.dialog = Dialog::TextDropCap;
@@ -4855,6 +5001,9 @@ fn tools_menu(app: &mut App, ui: &mut Ui) {
     if item(ui, "menu.tools.ai_generate", "", true) {
         app.open_ai_generate();
     }
+    if item(ui, "menu.tools.workflow", "", true) {
+        app.open_workflow();
+    }
     if item(ui, "menu.tools.sizes_areas", "", true) {
         app.dialog = Dialog::SizesAreas(Default::default());
     }
@@ -4955,7 +5104,15 @@ fn panels_menu(app: &mut App, ui: &mut Ui) {
         let pic = pic
             .as_ref()
             .map(|f| f as &dyn Fn(&egui::Painter, egui::Rect));
-        if check_pic(ui, tab.key(), tab.shortcut(), app.docker_shown(tab), pic) {
+        // Checked while open, its tab in front or behind another in an
+        // open column, or floating (#3663).
+        if check_pic(
+            ui,
+            tab.key(),
+            tab.shortcut(),
+            effect_docker_open(app, tab),
+            pic,
+        ) {
             app.open_docker(tab);
         }
     };
@@ -5108,7 +5265,13 @@ fn window_menu(app: &mut App, ui: &mut Ui) {
             }
         }
         let doc_open = app.extra_palettes.iter().any(|r| r.document);
-        let doc_name = app.document_palette_name();
+        // The entry above shows the document palette in the default
+        // palette's row under the same name; this one is its bar of its
+        // own, so an unrenamed palette is not listed twice alike.
+        let mut doc_name = app.document_palette_name();
+        if doc_name == tr("palette.show_document") {
+            doc_name = tr("palette.document_bar");
+        }
         if check_label(ui, &doc_name, "palette.document_bar", doc_open) {
             match app.extra_palettes.iter().position(|r| r.document) {
                 Some(k) => crate::ui::palette_bars::close_bar(app, k),
@@ -5139,6 +5302,20 @@ fn window_menu(app: &mut App, ui: &mut Ui) {
             !app.selection.is_empty(),
         ) {
             app.palette_from_selection();
+        }
+        // The document palette's eyedropper as a command, so it can take a
+        // shortcut (#3621); Esc or a right-click cancels it.
+        if check(
+            ui,
+            "menu.window.palette_sample",
+            "",
+            app.pending_palette_sample,
+        ) && app.drawing_shown()
+        {
+            app.pending_palette_sample = !app.pending_palette_sample;
+            if app.pending_palette_sample {
+                app.status = tr("status.palette_sample");
+            }
         }
     });
     sep(ui);

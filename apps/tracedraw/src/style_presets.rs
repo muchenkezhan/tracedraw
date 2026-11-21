@@ -54,7 +54,9 @@ pub fn portable(e: &Effect) -> bool {
             | Effect::ColorOverlay { .. }
             | Effect::GradientOverlay { .. }
             | Effect::GaussianBlur { .. }
+            | Effect::Halftone { .. }
             | Effect::FillOpacity { .. }
+            | Effect::BlendIf { .. }
             | Effect::Lens(_)
             | Effect::Transparency { .. }
     )
