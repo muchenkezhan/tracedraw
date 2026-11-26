@@ -48,9 +48,9 @@ section of the [[docker.properties]] panel.
   it and choose [[menu.object > menu.object.create > menu.object.create_arrowhead]].
 - The [[docker.nib_stretch]] (0.1 to 1) and [[docker.nib_angle_lc]] make a
   calligraphic outline: thinner across the nib than along it, like a flat pen.
-  In the [[docker.properties]] panel they sit with the
-  [[docker.miter_limit]] under the [[docker.outline_advanced]] header after
-  the common settings, closed at first unless one of them is set.
+  In the [[docker.properties]] panel they sit under the
+  [[docker.outline_advanced]] header after the common settings, closed at
+  first unless one of them is set.
 - [[docker.behind_fill]] draws the outline under the fill, so only its outer
   half shows.
 - [[docker.scale_with_object]]: the width grows and shrinks when you resize
@@ -62,6 +62,8 @@ Curves stay curves: the new object has about as many nodes as the path the
 outline was drawn along, and round ends and corners become arcs.
 The settings of new objects are explained in
 [Object styles and defaults](../templates-styles/object-styles.md#document-defaults).
+
+![An outline whose gradient runs along the line](../../img/lines-shapes-outlines-along-the-line.png)
 
 ## Outline Color {#outline-color}
 

@@ -154,6 +154,15 @@ change marked `TraceDraw:` in a comment.
   counted as a new drag and the file was imported again at every
   restore. `apps/tracedraw/src/lib.rs` includes the file so that its
   test runs (`eframe_pending_input::tests`).
+- Change: `native/glow_integration.rs`'s `change_gl_context` moves a
+  context that is already current to the window's surface in place
+  (`PossiblyCurrentContext::make_current`) instead of making it not
+  current and then current again, and returns whether that worked
+  instead of unwrapping (#3687). Waking from sleep, Windows refused the
+  switch once with os error 0 and the unwrap closed the program while
+  nobody used it; the failed call had also consumed the context. A
+  refused switch now skips that frame (its textures kept) and asks for
+  the next one; the resize and immediate-viewport paths skip theirs.
 - Drop the copy and the `[patch.crates-io]` entry when the workspace moves
   to egui/eframe 0.37 or later: what holds that back is the egui 0.37
   API migration across the app. The fixed-function painter has no
@@ -476,3 +485,14 @@ change marked `TraceDraw:` in a comment.
   carry them: move `drop_files` onto those) and file drops on Wayland,
   and check that egui-winit
   still maps `Touch` forces the same way.
+- Change: macOS, an event that arrives while another is being handled
+  is left out with a line in the log instead of a panic
+  (`platform_impl/macos/event_handler.rs`, `handle_event`). winit queues
+  an event that comes while the handler is in use and delivers it from
+  the run loop; when the system runs its own loop inside the handler (a
+  dialog of the system held open), the queued event reaches the handler
+  while it is still in use. winit panicked there, and a panic cannot
+  unwind through the AppKit block that delivers the event, so the
+  program was ended at once with "panic in a function that cannot
+  unwind" and the drawing was lost (#4017, #4042). One event left out
+  (a redraw, a pointer move) costs nothing next to that.

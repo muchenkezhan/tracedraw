@@ -408,6 +408,20 @@ fn colors_of(app: &App, which: Row) -> Vec<(String, Color)> {
     }
 }
 
+/// The value the palette itself holds at `i` when an RGB drawing shows
+/// its bar `which` in RGB; `None` otherwise (#4128).
+fn palette_value(app: &App, which: Row, i: usize) -> Option<Color> {
+    if !rgb_drawing(app) || which == Row::Document || shows_document(app, which) {
+        return None;
+    }
+    let own = match which {
+        Row::Main => &app.palette,
+        Row::Extra(k) => &app.extra_palettes.get(k)?.colors,
+        Row::Document => return None,
+    };
+    own.get(i).map(|(_, c)| *c)
+}
+
 /// `palette` as an RGB drawing shows it: the default palette's colours
 /// take the RGB default palette's values, defined directly, found by name
 /// and colour so a palette edited in the Palette Editor keeps them (#620);
@@ -1069,7 +1083,26 @@ fn swatch(
     }
     let resp = match entry {
         None => resp.rich_tip(tr("palette.no_color_tip")),
-        Some((name, c)) => resp.on_hover_ui(|ui| swatch_tip_ui(ui, name, *c)),
+        Some((name, c)) => {
+            let source = color_index.and_then(|i| palette_value(app, which, i));
+            resp.on_hover_ui(|ui| {
+                swatch_tip_ui(ui, name, *c);
+                // A CMYK palette in an RGB drawing applies RGB: the
+                // palette's own values show too, so it is seen as the
+                // palette chosen (#4128).
+                if let Some(p) = source.filter(|p| p != c) {
+                    let size = ui.style().text_styles[&egui::TextStyle::Small].size;
+                    ui.label(
+                        egui::RichText::new(crate::i18n::trf(
+                            "palette.rgb_drawing_source",
+                            &[("v", &color_values(p))],
+                        ))
+                        .size(size)
+                        .color(Tokens::text_dim()),
+                    );
+                }
+            })
+        }
     };
 
     // Dragging the colour: inside an object it fills it, on its outline
@@ -1156,6 +1189,7 @@ fn swatch(
             app.doc_palette_current = color_index;
         }
         match entry {
+            None if app.pixel_edit.is_some() => {}
             None => app.apply_fill(Fill::None),
             Some((_, c)) => {
                 if ui.input(|i| i.modifiers.ctrl) {
@@ -1234,6 +1268,14 @@ fn swatch(
 /// tenth of the colour into the outline, as Ctrl+click mixes into the
 /// fill; otherwise the outline takes the colour (#2132).
 fn right_click_outline(app: &mut App, ui: &Ui, entry: Option<&(String, Color)>) {
+    // The image editing mode: the outline colour of the shapes.
+    if let Some(pe) = app.pixel_edit.as_mut() {
+        if let Some((_, c)) = entry {
+            let [r, g, b] = c.to_rgb8();
+            pe.opts.outline_color = [r, g, b, 255];
+        }
+        return;
+    }
     match entry {
         Some((_, c)) if ui.input(|i| i.modifiers.ctrl) => app.mix_into_outline(*c),
         _ => app.apply_outline_color(entry.map(|(_, c)| *c)),
@@ -2857,6 +2899,13 @@ mod tests {
         assert_eq!(rgb[0].0, "Cyan");
         assert_eq!(rgb[0].1, Color::rgb8(0, 255, 255));
         assert_eq!(rgb[1].1, Color::rgb8(10, 20, 30));
+        // The tooltip names the palette's own CMYK value beside the RGB
+        // one applied (#4128); none for the document palette.
+        assert_eq!(
+            palette_value(&app, Row::Main, 0),
+            Some(Color::cmyk_pct(100.0, 0.0, 0.0, 0.0))
+        );
+        assert_eq!(palette_value(&app, Row::Document, 0), None);
     }
 
     /// The default palette in an RGB drawing holds clean RGB values: black

@@ -3,6 +3,7 @@
 //! through a command (SetMetadata for the settings, the guideline commands
 //! for guidelines).
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::{App, Units};
 use crate::guides::GuidePreset;
 use crate::i18n::tr;
@@ -246,6 +247,15 @@ pub struct PresetForm {
     pub margin_bottom: f64,
     pub margin_left: f64,
     pub margin_right: f64,
+    /// Which margins follow another (#3916).
+    pub margin_mirror: EdgeMirror,
+    /// Guidelines outside the page edges, at these distances (#3916).
+    pub bleed: bool,
+    pub bleed_top: f64,
+    pub bleed_bottom: f64,
+    pub bleed_left: f64,
+    pub bleed_right: f64,
+    pub bleed_mirror: EdgeMirror,
     pub columns: bool,
     pub column_count: u32,
     pub column_gutter: f64,
@@ -264,6 +274,13 @@ impl Default for PresetForm {
             margin_bottom: 12.7,
             margin_left: 12.7,
             margin_right: 12.7,
+            margin_mirror: EdgeMirror::None,
+            bleed: false,
+            bleed_top: 3.0,
+            bleed_bottom: 3.0,
+            bleed_left: 3.0,
+            bleed_right: 3.0,
+            bleed_mirror: EdgeMirror::None,
             columns: false,
             column_count: 2,
             column_gutter: 6.35,
@@ -272,6 +289,86 @@ impl Default for PresetForm {
             grid_columns: 4,
         }
     }
+}
+
+/// Which of four edge distances follow another one (#3916): none, the
+/// bottom the top, the right the left, or all four the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMirror {
+    None,
+    TopBottom,
+    LeftRight,
+    All,
+}
+
+impl EdgeMirror {
+    pub const ALL: [EdgeMirror; 4] = [
+        EdgeMirror::None,
+        EdgeMirror::TopBottom,
+        EdgeMirror::LeftRight,
+        EdgeMirror::All,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            EdgeMirror::None => "guides.mirror_none",
+            EdgeMirror::TopBottom => "guides.mirror_top_bottom",
+            EdgeMirror::LeftRight => "guides.mirror_left_right",
+            EdgeMirror::All => "guides.mirror_all",
+        }
+    }
+
+    /// The distances (top, bottom, left, right) with the followers set
+    /// from the ones they follow.
+    pub fn apply(self, [top, bottom, left, right]: [f64; 4]) -> [f64; 4] {
+        match self {
+            EdgeMirror::None => [top, bottom, left, right],
+            EdgeMirror::TopBottom => [top, top, left, right],
+            EdgeMirror::LeftRight => [top, bottom, left, left],
+            EdgeMirror::All => [top, top, top, top],
+        }
+    }
+}
+
+/// The four edge distance fields of a preset (top, bottom, left, right),
+/// with a Mirror choice; a field that follows another is greyed (#3916).
+fn edge_fields(ui: &mut Ui, id: &str, units: Units, v: &mut [f64; 4], mirror: &mut EdgeMirror) {
+    let mode = *mirror;
+    let follows = |i: usize| match mode {
+        EdgeMirror::None => false,
+        EdgeMirror::TopBottom => i == 1,
+        EdgeMirror::LeftRight => i == 3,
+        EdgeMirror::All => i != 0,
+    };
+    egui::Grid::new(id)
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for row in [[0, 2], [1, 3]] {
+                for i in row {
+                    let key = ["guides.top", "guides.bottom", "guides.left", "guides.right"][i];
+                    row_label(ui, key);
+                    ui.add_enabled_ui(!follows(i), |ui| {
+                        if let Some(n) = paper_field(ui, key, units, v[i], 0.1) {
+                            v[i] = n;
+                        }
+                    });
+                }
+                ui.end_row();
+            }
+            row_label(ui, "guides.mirror");
+            egui::ComboBox::from_id_salt((id, "mirror"))
+                .selected_text(tr(mirror.key()))
+                .show_ui(ui, |ui| {
+                    for m in EdgeMirror::ALL {
+                        ui.selectable_value(mirror, m, tr(m.key()));
+                    }
+                })
+                .response
+                .rich_tip(crate::ui::tips::pair("guides.mirror", "guides.mirror_tip"));
+            ui.end_row();
+        });
+    *v = mirror.apply(*v);
 }
 
 fn set_metadata(app: &mut App, metadata: Metadata) {
@@ -425,6 +522,29 @@ pub fn rulers_page(app: &mut App, ui: &mut Ui) {
                 meta.rulers.origin_y = v;
             }
             ui.end_row();
+            // Which way the vertical ruler counts (#3872).
+            row_label(ui, "options.vertical_direction");
+            crate::ui::keynav::ComboBox::from_id_salt("vertical_ruler_direction")
+                .selected_text(tr(if meta.rulers.vertical_from_top {
+                    "options.top_to_bottom"
+                } else {
+                    "options.bottom_to_top"
+                }))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut meta.rulers.vertical_from_top,
+                        false,
+                        tr("options.bottom_to_top"),
+                    );
+                    ui.selectable_value(
+                        &mut meta.rulers.vertical_from_top,
+                        true,
+                        tr("options.top_to_bottom"),
+                    );
+                })
+                .response
+                .rich_tip(crate::ui::tips::keyed("options.vertical_direction"));
+            ui.end_row();
         });
     section(ui, "options.tick_divisions");
     ui.horizontal(|ui| {
@@ -491,7 +611,7 @@ pub fn rulers_page(app: &mut App, ui: &mut Ui) {
             "options.show_rulers_tip",
         ));
     if ui
-        .button(tr("options.reset_origin"))
+        .ibutton("options.reset_origin")
         .rich_tip(crate::ui::tips::pair(
             "options.reset_origin",
             "options.reset_origin_tip",
@@ -878,32 +998,19 @@ pub fn guidelines_page(app: &mut App, ui: &mut Ui) {
                 "guides.margins_tip",
             ));
         ui.add_enabled_ui(form.margins, |ui| {
-            egui::Grid::new("preset_margins")
-                .num_columns(4)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    row_label(ui, "guides.top");
-                    if let Some(v) = paper_field(ui, "guides.top", units, form.margin_top, 0.1) {
-                        form.margin_top = v;
-                    }
-                    row_label(ui, "guides.left");
-                    if let Some(v) = paper_field(ui, "guides.left", units, form.margin_left, 0.1) {
-                        form.margin_left = v;
-                    }
-                    ui.end_row();
-                    row_label(ui, "guides.bottom");
-                    if let Some(v) =
-                        paper_field(ui, "guides.bottom", units, form.margin_bottom, 0.1)
-                    {
-                        form.margin_bottom = v;
-                    }
-                    row_label(ui, "guides.right");
-                    if let Some(v) = paper_field(ui, "guides.right", units, form.margin_right, 0.1)
-                    {
-                        form.margin_right = v;
-                    }
-                    ui.end_row();
-                });
+            let mut v = [
+                form.margin_top,
+                form.margin_bottom,
+                form.margin_left,
+                form.margin_right,
+            ];
+            edge_fields(ui, "preset_margins", units, &mut v, &mut form.margin_mirror);
+            [
+                form.margin_top,
+                form.margin_bottom,
+                form.margin_left,
+                form.margin_right,
+            ] = v;
         });
         ui.checkbox(&mut form.columns, tr("guides.columns"))
             .rich_tip(crate::ui::tips::pair(
@@ -981,6 +1088,23 @@ pub fn guidelines_page(app: &mut App, ui: &mut Ui) {
                     ui.end_row();
                 });
         });
+        ui.checkbox(&mut form.bleed, tr("guides.bleed"))
+            .rich_tip(crate::ui::tips::pair("guides.bleed", "guides.bleed_tip"));
+        ui.add_enabled_ui(form.bleed, |ui| {
+            let mut v = [
+                form.bleed_top,
+                form.bleed_bottom,
+                form.bleed_left,
+                form.bleed_right,
+            ];
+            edge_fields(ui, "preset_bleed", units, &mut v, &mut form.bleed_mirror);
+            [
+                form.bleed_top,
+                form.bleed_bottom,
+                form.bleed_left,
+                form.bleed_right,
+            ] = v;
+        });
     } else {
         for p in NamedPreset::ALL {
             let mut on = form.named.contains(&p);
@@ -998,7 +1122,7 @@ pub fn guidelines_page(app: &mut App, ui: &mut Ui) {
         }
     }
     if ui
-        .button(tr("guides.apply_presets"))
+        .ibutton("guides.apply_presets")
         .rich_tip(crate::ui::tips::pair(
             "guides.apply_presets",
             "guides.apply_presets_tip",
@@ -1021,12 +1145,36 @@ pub fn apply_presets(app: &mut App, form: &PresetForm) {
     let mut lines: Vec<GuideLine> = Vec::new();
     if form.user_defined {
         if form.margins {
+            let [top, bottom, left, right] = form.margin_mirror.apply([
+                form.margin_top,
+                form.margin_bottom,
+                form.margin_left,
+                form.margin_right,
+            ]);
             lines.extend(
                 GuidePreset::Margins {
-                    top: form.margin_top,
-                    bottom: form.margin_bottom,
-                    left: form.margin_left,
-                    right: form.margin_right,
+                    top,
+                    bottom,
+                    left,
+                    right,
+                }
+                .lines(size),
+            );
+        }
+        if form.bleed {
+            // Margins of minus the bleed: the lines stand outside the page.
+            let [top, bottom, left, right] = form.bleed_mirror.apply([
+                form.bleed_top,
+                form.bleed_bottom,
+                form.bleed_left,
+                form.bleed_right,
+            ]);
+            lines.extend(
+                GuidePreset::Margins {
+                    top: -top.max(0.0),
+                    bottom: -bottom.max(0.0),
+                    left: -left.max(0.0),
+                    right: -right.max(0.0),
                 }
                 .lines(size),
             );
@@ -1178,9 +1326,9 @@ fn shift_range(shown: &[usize], selected: &[usize], clicked: usize, ctrl: bool) 
 /// Add and Modify, the list, delete and lock, colour and style.
 pub fn guidelines_docker(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        ui.toggle_value(&mut app.show_guides, tr("guides.show"))
+        ui.itoggle(&mut app.show_guides, "guides.show")
             .rich_tip(tr("guides.show_tip"));
-        ui.toggle_value(&mut app.snap.guides, tr("guides.snap"))
+        ui.itoggle(&mut app.snap.guides, "guides.snap")
             .rich_tip(tr("guides.snap_tip"));
     });
     ui.add_space(4.0);
@@ -1281,7 +1429,7 @@ pub fn guidelines_docker(app: &mut App, ui: &mut Ui) {
     }
     ui.horizontal(|ui| {
         if ui
-            .button(tr("guides.add"))
+            .ibutton("guides.add")
             .rich_tip(crate::ui::tips::pair("guides.add", "guides.add_desc"))
             .clicked()
         {
@@ -1296,7 +1444,7 @@ pub fn guidelines_docker(app: &mut App, ui: &mut Ui) {
             _ => None,
         };
         if ui
-            .add_enabled(single.is_some(), egui::Button::new(tr("guides.modify")))
+            .add_enabled(single.is_some(), crate::ui::btn_icons::Ib::new("guides.modify"))
             .rich_tip(crate::ui::tips::pair("guides.modify", "guides.modify_desc"))
             .rich_disabled_tip(crate::ui::tips::pair("guides.modify", "guides.modify_desc"))
             .clicked()
@@ -1320,7 +1468,7 @@ pub fn guidelines_docker(app: &mut App, ui: &mut Ui) {
     let any = !app.selected_guides.is_empty();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(any, egui::Button::new(tr("guides.delete")))
+            .add_enabled(any, crate::ui::btn_icons::Ib::new("guides.delete"))
             .rich_tip(crate::ui::tips::pair("guides.delete", "guides.delete_desc"))
             .rich_disabled_tip(crate::ui::tips::pair("guides.delete", "guides.delete_desc"))
             .clicked()
@@ -1330,7 +1478,7 @@ pub fn guidelines_docker(app: &mut App, ui: &mut Ui) {
         }
         // Copies of the selected guidelines, moved by the duplicate offset.
         if ui
-            .add_enabled(any, egui::Button::new(tr("guides.duplicate")))
+            .add_enabled(any, crate::ui::btn_icons::Ib::new("guides.duplicate"))
             .rich_tip(tr("guides.duplicate_tip"))
             .clicked()
         {
@@ -1342,7 +1490,7 @@ pub fn guidelines_docker(app: &mut App, ui: &mut Ui) {
             .iter()
             .any(|g| GuideKind::of(&g.line) == form.kind);
         if ui
-            .add_enabled(of_kind, egui::Button::new(tr("guides.clear")))
+            .add_enabled(of_kind, crate::ui::btn_icons::Ib::new("guides.clear"))
             .rich_tip(tr("guides.clear_tip"))
             .clicked()
         {
@@ -1355,13 +1503,13 @@ pub fn guidelines_docker(app: &mut App, ui: &mut Ui) {
                 .iter()
                 .all(|i| guides.get(*i).is_some_and(|g| g.locked));
         let label = if all_locked {
-            tr("guides.unlock")
+            "guides.unlock"
         } else {
-            tr("guides.lock")
+            "guides.lock"
         };
         let lock_tip = crate::ui::tips::pair("guides.lock_tip", "guides.lock_desc");
         if ui
-            .add_enabled(any, egui::Button::new(label))
+            .add_enabled(any, crate::ui::btn_icons::Ib::new(label))
             .rich_tip(&lock_tip)
             .rich_disabled_tip(&lock_tip)
             .clicked()
@@ -1518,5 +1666,50 @@ mod tests {
         let n = app.page_guides().len();
         apply_presets(&mut app, &form);
         assert_eq!(app.page_guides().len(), n);
+    }
+
+    /// User-defined bleed guidelines stand outside the page edges, and
+    /// Mirror makes the followers take the value they follow (#3916).
+    #[test]
+    fn user_defined_bleed_guides_stand_outside_the_page_and_mirror() {
+        let mut app = App::headless();
+        let size = app.page_size();
+        let form = PresetForm {
+            user_defined: true,
+            margins: true,
+            margin_top: 10.0,
+            margin_bottom: 99.0,
+            margin_left: 20.0,
+            margin_right: 99.0,
+            margin_mirror: EdgeMirror::TopBottom,
+            bleed: true,
+            bleed_top: 3.5,
+            bleed_bottom: 1.0,
+            bleed_left: 2.0,
+            bleed_right: 2.0,
+            bleed_mirror: EdgeMirror::All,
+            ..PresetForm::default()
+        };
+        apply_presets(&mut app, &form);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for g in app.page_guides() {
+            match g.line {
+                GuideLine::Vertical { x } => xs.push(x),
+                GuideLine::Horizontal { y } => ys.push(y),
+                _ => {}
+            }
+        }
+        let has = |v: &[f64], want: f64| v.iter().any(|x| (x - want).abs() < 1e-9);
+        // Margins: the bottom follows the top, the right is its own.
+        assert!(has(&ys, size.height - 10.0) && has(&ys, 10.0), "{ys:?}");
+        assert!(has(&xs, 20.0) && has(&xs, size.width - 99.0), "{xs:?}");
+        // Bleed: 3.5 mm outside every edge.
+        assert!(has(&ys, size.height + 3.5) && has(&ys, -3.5), "{ys:?}");
+        assert!(has(&xs, -3.5) && has(&xs, size.width + 3.5), "{xs:?}");
+        assert_eq!(xs.len() + ys.len(), 8);
+        assert_eq!(
+            EdgeMirror::LeftRight.apply([1.0, 2.0, 3.0, 4.0]),
+            [1.0, 2.0, 3.0, 3.0]
+        );
     }
 }

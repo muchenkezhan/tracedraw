@@ -22,7 +22,7 @@ fn timed_frame(
 
 fn has_exit_hint(output: &egui::FullOutput) -> bool {
     output.shapes.iter().any(|shape| {
-        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == tr("preview.exit_hint"))
+        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().starts_with(&tr("preview.exit_hint")))
     })
 }
 
@@ -326,7 +326,7 @@ fn escape_still_leaves_preview_after_tapping_alt() {
 fn a_hidpi_preview_is_sharp_without_enlarging_its_logical_picture() {
     let (ctx, mut app) = setup();
     let screen = egui::vec2(1920.0, 1080.0);
-    let mut raw = input(screen, false, Vec::new());
+    let mut raw = input(screen, true, Vec::new());
     raw.max_texture_side = Some(8192);
     raw.viewports
         .get_mut(&ViewportId::ROOT)
@@ -367,10 +367,51 @@ fn a_hidpi_preview_is_sharp_without_enlarging_its_logical_picture() {
     output.textures_delta.clear();
 }
 
+/// F9 draws the drawing once, when the window fills the screen (#3830):
+/// not first in the window as it was and again in the whole screen, which
+/// jumped and flickered. A window that never says so gets it in a moment.
+#[test]
+fn the_preview_waits_for_the_full_screen_before_drawing() {
+    let has_picture = |app: &App| {
+        app.preview_session
+            .as_ref()
+            .is_some_and(|s| s.texture.is_some())
+    };
+    let (ctx, mut app) = setup();
+    timed_frame(&ctx, &mut app, 10.0, WINDOW, vec![key(Key::F9, true)]);
+    assert!(app.fullscreen_preview);
+    assert!(!has_picture(&app), "the window is not full screen yet");
+    let screen = egui::vec2(1920.0, 1080.0);
+    let mut raw = input(screen, true, vec![key(Key::F9, false)]);
+    raw.time = Some(10.1);
+    let mut output = ctx.run_ui(raw, |ui| crate::ui::root(&mut app, ui));
+    output.textures_delta.clear();
+    let session = app.preview_session.as_ref().expect("session");
+    let pixels = session.texture.as_ref().expect("picture").1.size();
+    let ppp = ctx.pixels_per_point();
+    let wide = pixels[0] as f32 - screen.x * ppp;
+    assert!(wide.abs() <= 1.0, "the whole screen: {pixels:?}");
+
+    // A window that stays as it was says nothing of full screen.
+    let windowed = |ctx: &egui::Context, app: &mut App, time: f64, events: Vec<Event>| {
+        let mut raw = input(WINDOW, false, events);
+        raw.time = Some(time);
+        let mut output = ctx.run_ui(raw, |ui| crate::ui::root(app, ui));
+        output.textures_delta.clear();
+    };
+    let (ctx, mut app) = setup();
+    windowed(&ctx, &mut app, 10.0, vec![key(Key::F9, true)]);
+    windowed(&ctx, &mut app, 10.2, vec![key(Key::F9, false)]);
+    assert!(!has_picture(&app));
+    windowed(&ctx, &mut app, 10.5, Vec::new());
+    assert!(has_picture(&app), "drawn after a moment anyway");
+}
+
 #[test]
 fn idle_preview_frames_reuse_the_picture_without_uploading_it_again() {
     let (ctx, mut app) = setup();
     frame(&ctx, &mut app, WINDOW, false, vec![key(Key::F9, true)]);
+    frame(&ctx, &mut app, WINDOW, true, vec![key(Key::F9, false)]);
     let texture = app
         .preview_session
         .as_ref()
@@ -411,7 +452,7 @@ fn idle_preview_frames_reuse_the_picture_without_uploading_it_again() {
 fn entering_preview_stops_view_inertia_and_returning_does_not_resume_it() {
     let (ctx, mut app) = setup();
     app.settings.pan_inertia = true;
-    app.zoom_glide.add(2.0, 1.15, app.canvas_rect.center(), 1.0);
+    app.zoom_glide.add(2.0, 1.15, app.canvas_rect.center(), 1.0, &app.view);
     app.pan_inertia
         .track(egui::vec2(24.0, 12.0), 1.0 / 60.0, 1.0);
     app.pan_inertia.tick(1.0 / 60.0, 1.01, false, true);
@@ -490,4 +531,83 @@ fn fullscreen_reveals_nearby_objects_outside_the_editor_without_fitting_distant_
         "nearby object appears at the original scale: {color:?}"
     );
     output.textures_delta.clear();
+}
+
+/// In the full-screen preview, + and - zoom about the middle, Page Down
+/// and Page Up show the next and previous page fitted to the screen, and
+/// the colour round the page is the one chosen in the options (#3930).
+#[test]
+fn preview_keys_zoom_and_turn_the_pages() {
+    let (ctx, mut app) = setup();
+    app.add_page();
+    app.goto_page(0);
+    let first = app.page;
+    app.settings.preview_background = [30, 30, 30];
+    frame(&ctx, &mut app, WINDOW, false, vec![key(Key::F9, true)]);
+    let zoom = app.preview_session.as_ref().expect("preview").zoom;
+    frame(&ctx, &mut app, WINDOW, true, vec![key(Key::Plus, true)]);
+    let zoomed = app.preview_session.as_ref().expect("preview").zoom;
+    assert!((zoomed / zoom - 1.25).abs() < 1e-9, "{zoom} -> {zoomed}");
+    frame(&ctx, &mut app, WINDOW, true, vec![key(Key::Minus, true)]);
+    let back = app.preview_session.as_ref().expect("preview").zoom;
+    assert!((back - zoom).abs() < 1e-9, "{zoom} -> {back}");
+    frame(&ctx, &mut app, WINDOW, true, vec![key(Key::PageDown, true)]);
+    assert!(app.fullscreen_preview, "the keys keep the preview open");
+    assert_ne!(app.page, first, "Page Down shows the next page");
+    let session = app.preview_session.as_ref().expect("preview");
+    assert_eq!(session.bounds, app.page_rect(), "fitted to the page");
+    frame(&ctx, &mut app, WINDOW, true, vec![key(Key::PageDown, true)]);
+    assert_ne!(app.page, first, "no page after the last");
+    frame(&ctx, &mut app, WINDOW, true, vec![key(Key::PageUp, true)]);
+    assert_eq!(app.page, first, "Page Up goes back");
+    let mut out = ctx.run_ui(input(WINDOW, true, Vec::new()), |ui| crate::ui::root(&mut app, ui));
+    out.textures_delta.clear();
+    let dark = egui::Color32::from_rgb(30, 30, 30);
+    assert!(out.shapes.iter().any(|s| matches!(&s.shape,
+        egui::Shape::Rect(r) if r.fill == dark && r.rect.width() > 1000.0)));
+}
+
+/// The full-screen preview's colour round the page follows the drawing
+/// window's while none is picked (#4027: a dark theme's grey turned
+/// white); a picked colour, white too, stays.
+#[test]
+fn the_preview_background_follows_the_desktop_until_one_is_picked() {
+    let (_ctx, mut app) = setup();
+    app.settings.desktop_rgb = [61, 61, 61];
+    app.settings.desktop_custom = true;
+    assert_eq!(app.preview_background_color(), egui::Color32::from_rgb(61, 61, 61));
+    app.settings.preview_background_custom = true;
+    assert_eq!(app.preview_background_color(), egui::Color32::WHITE);
+    app.settings.preview_background = [30, 30, 30];
+    assert_eq!(app.preview_background_color(), egui::Color32::from_rgb(30, 30, 30));
+}
+
+/// Options > Display > Full-screen preview > Fit the page to the screen
+/// (#4239): F9 shows the whole page as large as the screen lets it, its
+/// middle in the screen's, whatever the zoom in the window; a zoom in
+/// the preview takes over from there. Off, the zoom of the window stays.
+#[test]
+fn the_preview_can_fill_the_screen_with_the_page() {
+    let (ctx, mut app) = setup();
+    app.settings.preview_fit_page = true;
+    app.view.zoom = 9.0;
+    let screen = egui::vec2(1920.0, 1080.0);
+    frame(&ctx, &mut app, WINDOW, false, vec![key(Key::F9, true)]);
+    frame(&ctx, &mut app, screen, true, vec![key(Key::F9, false)]);
+    let page = app.page_rect();
+    let session = app.preview_session.as_ref().expect("previewing");
+    let fit = (1920.0 / page.width()).min(1080.0 / page.height());
+    assert!((session.zoom - fit).abs() < 1e-9, "{} {fit}", session.zoom);
+    let shown = frame_bounds(&app, screen);
+    assert!((shown.center() - page.center()).hypot() < 1e-9);
+    assert!(shown.width() >= page.width() - 1e-9 && shown.height() >= page.height() - 1e-9);
+    assert!(
+        (shown.width() - page.width()).abs() < 1e-6 || (shown.height() - page.height()).abs() < 1e-6,
+        "the page touches two edges of the screen"
+    );
+    // A zoom in the preview keeps on from the fitted page.
+    apply_preview_keys(&mut app, &[PreviewInput::Zoom(2.0)], screen);
+    frame(&ctx, &mut app, screen, true, Vec::new());
+    let session = app.preview_session.as_ref().expect("previewing");
+    assert!((session.zoom - fit * 2.0).abs() < 1e-9);
 }

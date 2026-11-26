@@ -228,6 +228,7 @@ pub fn document_to_cdr_version_with(doc: &Document, version: u16, previews: &Pre
 /// every page on that layer.
 fn on_master_desktop(l: &tracedraw_core::document::Layer) -> bool {
     l.scope == tracedraw_core::MasterScope::All
+        && l.page_range.is_none()
         && !l.in_front
         && !l.shapes.iter().any(Shape::holds_page_number)
 }
@@ -243,6 +244,10 @@ fn on_master_desktop(l: &tracedraw_core::document::Layer) -> bool {
 /// new ones. The master layers behind every page stay (see
 /// [`on_master_desktop`]).
 fn master_objects_on_pages(doc: &Document) -> Option<Document> {
+    if doc.master.iter().any(|l| l.page_range.is_some()) {
+        let indexes: Vec<_> = (0..doc.pages.len()).collect();
+        return Some(doc.with_master_layers_on_pages(&indexes));
+    }
     use tracedraw_core::id::IdSource;
     fn reid(s: &Shape, ids: &mut IdSource) -> Shape {
         let mut c = s.clone();
@@ -291,6 +296,7 @@ fn master_objects_on_pages(doc: &Document) -> Option<Document> {
             copy.id = ids.layer();
             copy.in_front = false;
             copy.scope = tracedraw_core::MasterScope::All;
+            copy.page_range = None;
             if !first {
                 copy.shapes = copy.shapes.iter().map(|s| reid(s, &mut ids)).collect();
             }
@@ -3685,7 +3691,7 @@ fn run_style_json(v: Ver, sp: &TextSpan, fill: Option<&Fill>, tech: &fonts::Face
     format!(
         r#"{{"character":{{{}"angle":"0","outline":{},"RTL":{},"latin":{},"h_shift":"0","v_shift":"0","farEast":{}}}}}"#,
         fill,
-        character_outline_json(v),
+        character_outline_json(v, sp.outline.as_ref()),
         font_json(v, Some(sp), 178, tech),
         font_json(v, Some(sp), 0, tech),
         font_json(v, Some(sp), 128, tech)
@@ -3700,15 +3706,43 @@ const BLACK_SPEC: &str = "CMYK,USER,0,0,0,100,100,00000000-0000-0000-0000-000000
 /// every text of the files of versions 19 and 22 to 27 the program's
 /// recent releases save holds it (#1698; its 2019 release leaves it out
 /// up to 21).
-fn character_outline_json(v: Ver) -> String {
+///
+/// A run with an outline of its own (`outline`, #4055) writes its
+/// width, colour, joins, ends, mitre limit and whether it is drawn
+/// behind the fill; one without writes width 0, which leaves the
+/// object's outline on its characters.
+fn character_outline_json(v: Ver, outline: Option<&Stroke>) -> String {
+    use tracedraw_core::{LineCap, LineJoin};
     let screen = "0,0,45000000,60,0";
     let variable = if v.0 >= 19 {
         r#""variableAttributes":"0|0","#
     } else {
         ""
     };
+    let own = outline.filter(|s| s.width.is_finite() && s.width > 0.0);
+    let flag = |on: bool| if on { "1" } else { "0" };
+    let (color, width, behind, scale, caps, join, mitre) = match own {
+        Some(s) => (
+            colour_spec(s.color),
+            units(s.width).max(1),
+            flag(s.behind_fill),
+            flag(s.scale_with_object),
+            match s.cap {
+                LineCap::Butt => 0,
+                LineCap::Round => 1,
+                LineCap::Square => 2,
+            },
+            match s.join {
+                LineJoin::Miter => 0,
+                LineJoin::Round => 1,
+                LineJoin::Bevel => 2,
+            },
+            Stroke::miter_angle_from_ratio(s.miter_ratio()).to_string(),
+        ),
+        None => (BLACK_SPEC.to_string(), 0, "0", "0", 0, 0, "5".to_string()),
+    };
     format!(
-        r#"{{"overprint":"0","angle":"0","aspect":"100","dashDotSpec":"0","behindFill":"0","miterLimit":"5","justification":"0","dashAdjust":"0","rightArrow":"|0","screenSpec":"{screen}","overlapArrow":"0","shareArrow":"0","dotLength":"0","scaleWithObject":"0","matrix":"1,0,0,0,1,0","color":"{BLACK_SPEC}","leftArrow":"|0","projectMatrix":"1,0,0,0,1,0","leftArrowAttributes":"0|0|0|0|0|0|0","endCaps":"0","rightArrowAttributes":"0|0|0|0|0|0|0","joinType":"0",{variable}"width":"0"}}"#
+        r#"{{"overprint":"0","angle":"0","aspect":"100","dashDotSpec":"0","behindFill":"{behind}","miterLimit":"{mitre}","justification":"0","dashAdjust":"0","rightArrow":"|0","screenSpec":"{screen}","overlapArrow":"0","shareArrow":"0","dotLength":"0","scaleWithObject":"{scale}","matrix":"1,0,0,0,1,0","color":"{color}","leftArrow":"|0","projectMatrix":"1,0,0,0,1,0","leftArrowAttributes":"0|0|0|0|0|0|0","endCaps":"{caps}","rightArrowAttributes":"0|0|0|0|0|0|0","joinType":"{join}",{variable}"width":"{width}"}}"#
     )
 }
 
@@ -3887,7 +3921,7 @@ fn full_text_style(
         ),
         tabs = tabs,
         fill = fill_json(&colour),
-        outline = character_outline_json(v),
+        outline = character_outline_json(v, sp.and_then(|s| s.outline.as_ref())),
         rtl = font_json(v, sp, 178, tech),
         latin = font_json(v, sp, 0, tech),
         far = font_json(v, sp, 128, tech),
@@ -4169,7 +4203,7 @@ struct Writer<'a> {
 /// a real version 9 file, two version 13 files of other releases and the
 /// version 7 to 13 saves of the program that reads them all list the same
 /// layers in the same order on both).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LayerSlot {
     name: String,
     nth: usize,
@@ -4193,9 +4227,11 @@ fn slots_of(page: &tracedraw_core::document::Page) -> Vec<LayerSlot> {
         .collect()
 }
 
-/// The slots of every page of the document in one order: the first page's
-/// front to back, then those later pages add.
+/// The slots of every page in a shared front-to-back order. The order
+/// respects each page's own layers, including layers present on only
+/// some pages. Unconstrained slots retain their first-seen order.
 fn layer_slots(doc: &Document) -> Vec<LayerSlot> {
+    use std::collections::HashSet;
     let mut slots: Vec<LayerSlot> = Vec::new();
     for page in &doc.pages {
         for slot in slots_of(page) {
@@ -4204,7 +4240,35 @@ fn layer_slots(doc: &Document) -> Vec<LayerSlot> {
             }
         }
     }
-    slots
+    let mut pending: Vec<(LayerSlot, HashSet<LayerSlot>)> = slots
+        .iter()
+        .cloned()
+        .map(|slot| (slot, HashSet::new()))
+        .collect();
+    for page in &doc.pages {
+        let page_slots = slots_of(page);
+        for pair in page_slots.windows(2) {
+            let [before, after] = pair else {
+                continue;
+            };
+            if let Some((_, earlier)) = pending.iter_mut().find(|(slot, _)| slot == after) {
+                earlier.insert(before.clone());
+            }
+        }
+    }
+    let mut ordered = Vec::with_capacity(slots.len());
+    while !pending.is_empty() {
+        let Some(next) = pending.iter().position(|(_, earlier)| earlier.is_empty()) else {
+            log::warn!("legacy layer orders conflict. Keeping the first-page order");
+            return slots;
+        };
+        let (slot, _) = pending.remove(next);
+        for (_, earlier) in &mut pending {
+            earlier.remove(&slot);
+        }
+        ordered.push(slot);
+    }
+    ordered
 }
 
 /// The master page's layers, in the order of `Writer::master_guids`.
@@ -4515,7 +4579,11 @@ impl<'a> Writer<'a> {
             .find(|l| on_master_desktop(l) && !l.shapes.is_empty())
             .map(|l| l.name.clone());
         // Pages first: they fill the tables.
-        self.layer_slots = layer_slots(doc);
+        self.layer_slots = if self.v.zip() {
+            Vec::new()
+        } else {
+            layer_slots(doc)
+        };
         let mut pages = Vec::new();
         let mut content: Option<Rect> = None;
         for (index, page) in doc.pages.iter().enumerate() {
@@ -5220,10 +5288,29 @@ impl<'a> Writer<'a> {
         body.extend(inner.nodes);
         self.clip_groups.push(list(b"grp ", body));
         self.clip_container = Some(number);
+        let usdn_before = self.next_usdn;
+        let kept_before = self.effects.len();
         let placed = self.object(&f, centre, depth);
         if self.clip_container.take().is_some() {
             // The frame became no object: the group would name nothing.
             self.clip_groups.pop();
+        } else if self.v.zip()
+            && self.drawing_effects == 0
+            && self.clip_depth == 0
+            && placed.nodes.len() == 1
+            && self.next_usdn > usdn_before
+            && crate::kept_effects::clip_contents_kept(contents)
+        {
+            // The contents carry no static id, so the package's member
+            // keeps the clip frame whole by the frame's (#3804); it holds
+            // what the frame itself kept.
+            self.effects.truncate(kept_before);
+            self.effects.push(crate::kept_effects::Written {
+                objects: vec![self.next_usdn - 1],
+                main: 0,
+                bounds: s.bounds(),
+                source: s.clone(),
+            });
         }
         placed
     }
@@ -5952,6 +6039,7 @@ impl<'a> Writer<'a> {
         let [e @ Effect::Envelope {
             keep_lines: false,
             mapping: Mapping::Putty,
+            reference: None,
             ..
         }] = s.effects.as_slice()
         else {

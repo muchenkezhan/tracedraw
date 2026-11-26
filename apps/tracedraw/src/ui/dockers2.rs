@@ -4,12 +4,13 @@
 //! Extrude, Bevel, Brush Strokes, Color Mask, Object Data, Links,
 //! Symbols, Pages, Guidelines, Fonts.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::{App, DockerTab};
 use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
 use crate::ui::tips::RichTip;
 use egui::Ui;
-use tracedraw_core::{document::ShapeKind, live::Effect, Color, Command, Fill, ShapeId};
+use tracedraw_core::{document::ShapeKind, geometry::Affine, live::Effect, Color, Command, Fill, ShapeId};
 
 /// The colour picker every colour of the drawing uses (#442).
 fn color_button(ui: &mut Ui, c: &mut Color) -> bool {
@@ -69,6 +70,14 @@ pub fn show(app: &mut App, ui: &mut Ui, tab: DockerTab) {
         DockerTab::Effects => crate::ui::effects_docker::effects_docker(app, ui),
         DockerTab::Macros => crate::ui::macros_ui::manager(app, ui),
         DockerTab::PrintMerge => crate::ui::print_merge_docker::print_merge(app, ui),
+        DockerTab::PixelLayers
+        | DockerTab::PixelSelection
+        | DockerTab::PixelRetouch
+        | DockerTab::PixelDistort
+        | DockerTab::PixelEffects
+        | DockerTab::PixelImage
+        | DockerTab::PixelHistogram
+        | DockerTab::PixelHints => crate::ui::pixel_mode::docker_body(app, ui, tab),
         _ => {}
     }
 }
@@ -125,7 +134,7 @@ fn step_and_repeat(app: &mut App, ui: &mut Ui) {
         "docker.sr_apply_desc"
     };
     if ui
-        .add_enabled(has && can_apply, egui::Button::new(tr("docker.apply")))
+        .add_enabled(has && can_apply, crate::ui::btn_icons::Ib::new("docker.apply"))
         .rich_tip(crate::ui::tips::pair("docker.apply", desc))
         .clicked()
     {
@@ -533,7 +542,7 @@ fn default_properties(app: &mut App, ui: &mut Ui) {
                 let from = ui
                     .add_enabled(
                         first.is_some(),
-                        egui::Button::new(tr("docker.from_selection")).small(),
+                        crate::ui::btn_icons::Ib::new("docker.from_selection").small(),
                     )
                     .rich_tip(tr("defaults.from_selection_hint"));
                 if from.clicked() {
@@ -568,7 +577,7 @@ fn styles_list(app: &mut App, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     !app.selection.is_empty(),
-                    egui::Button::new(tr("docker.new_style_from_selection")).small(),
+                    crate::ui::btn_icons::Ib::new("docker.new_style_from_selection").small(),
                 )
                 .rich_tip(crate::ui::tips::keyed("docker.new_style_from_selection"))
                 .clicked()
@@ -622,7 +631,7 @@ fn styles_list(app: &mut App, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     !app.selection.is_empty(),
-                    egui::Button::new(tr("docker.apply")).small(),
+                    crate::ui::btn_icons::Ib::new("docker.apply").small(),
                 )
                 .rich_tip(tr("docker.style_apply_hint"))
                 .clicked()
@@ -632,7 +641,7 @@ fn styles_list(app: &mut App, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     first.is_some(),
-                    egui::Button::new(tr("docker.update_from_selection")).small(),
+                    crate::ui::btn_icons::Ib::new("docker.update_from_selection").small(),
                 )
                 .rich_tip(tr("docker.style_update_hint"))
                 .clicked()
@@ -665,7 +674,7 @@ fn styles_list(app: &mut App, ui: &mut Ui) {
     }
     let linked = !app.styled_selection().is_empty();
     if ui
-        .add_enabled(linked, egui::Button::new(tr("docker.break_style_link")))
+        .add_enabled(linked, crate::ui::btn_icons::Ib::new("docker.break_style_link"))
         .rich_tip(crate::ui::tips::keyed("docker.break_style_link"))
         .clicked()
     {
@@ -712,7 +721,7 @@ fn find_field(ui: &mut Ui, text: &mut String, name: &str, spaces: bool) -> egui:
     response.context_menu(|ui| {
         let picked: String = text.chars().skip(from).take(to - from).collect();
         if ui
-            .add_enabled(from < to, egui::Button::new(tr("menu.edit.cut")))
+            .add_enabled(from < to, crate::ui::btn_icons::Ib::new("menu.edit.cut"))
             .clicked()
         {
             ui.ctx().copy_text(picked.clone());
@@ -720,25 +729,25 @@ fn find_field(ui: &mut Ui, text: &mut String, name: &str, spaces: bool) -> egui:
             ui.close();
         }
         if ui
-            .add_enabled(from < to, egui::Button::new(tr("menu.edit.copy")))
+            .add_enabled(from < to, crate::ui::btn_icons::Ib::new("menu.edit.copy"))
             .clicked()
         {
             ui.ctx().copy_text(picked);
             ui.close();
         }
-        if ui.button(tr("menu.edit.paste")).clicked() {
+        if ui.ibutton("menu.edit.paste").clicked() {
             if let Some(t) = crate::clipboard::system_text() {
                 // One line: the field has no room for line ends.
                 put = Some((from, to, t.replace(['\r', '\n'], " ")));
             }
             ui.close();
         }
-        if ui.button(tr("menu.edit.select_all")).clicked() {
+        if ui.ibutton("menu.edit.select_all").clicked() {
             select_all = true;
             ui.close();
         }
         ui.separator();
-        ui.menu_button(tr("find.special_character"), |ui| {
+        ui.imenu_button("find.special_character", |ui| {
             for (key, code) in FIND_CODES {
                 if code == "^w" && !spaces {
                     continue;
@@ -827,7 +836,7 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
     }
     ui.horizontal_wrapped(|ui| {
         if ui
-            .button(tr("dialog.find_next"))
+            .ibutton("dialog.find_next")
             .rich_tip(crate::ui::tips::pair(
                 "dialog.find_next",
                 "docker.find_next_desc",
@@ -843,7 +852,7 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
             }
         }
         if ui
-            .button(tr("dialog.find_all"))
+            .ibutton("dialog.find_all")
             .rich_tip(crate::ui::tips::pair(
                 "dialog.find_all",
                 "docker.find_all_desc",
@@ -856,7 +865,7 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
         }
         if st.kind == 0 {
             if ui
-                .button(tr("dialog.replace"))
+                .ibutton("dialog.replace")
                 .rich_tip(crate::ui::tips::pair(
                     "dialog.replace",
                     "docker.replace_desc",
@@ -873,7 +882,7 @@ fn find_replace(app: &mut App, ui: &mut Ui) {
                 );
             }
             if ui
-                .button(tr("dialog.replace_all"))
+                .ibutton("dialog.replace_all")
                 .rich_tip(crate::ui::tips::pair(
                     "dialog.replace_all",
                     "docker.replace_all_desc",
@@ -1023,7 +1032,7 @@ fn find_properties(app: &mut App, ui: &mut Ui, st: &mut crate::ui::dialogs::Find
         if ui
             .add_enabled(
                 first.is_some(),
-                egui::Button::new(tr("find.from_selection")),
+                crate::ui::btn_icons::Ib::new("find.from_selection"),
             )
             .rich_tip(crate::ui::tips::pair(
                 "find.from_selection",
@@ -1036,7 +1045,7 @@ fn find_properties(app: &mut App, ui: &mut Ui, st: &mut crate::ui::dialogs::Find
             }
         }
         if ui
-            .button(tr("find.reset"))
+            .ibutton("find.reset")
             .rich_tip(crate::ui::tips::pair("find.reset", "find.reset_desc"))
             .clicked()
         {
@@ -1110,7 +1119,7 @@ fn find_properties(app: &mut App, ui: &mut Ui, st: &mut crate::ui::dialogs::Find
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(can_find, egui::Button::new(tr("find.previous")))
+            .add_enabled(can_find, crate::ui::btn_icons::Ib::new("find.previous"))
             .rich_tip(crate::ui::tips::pair("find.previous", "find.previous_desc"))
             .clicked()
         {
@@ -1118,7 +1127,7 @@ fn find_properties(app: &mut App, ui: &mut Ui, st: &mut crate::ui::dialogs::Find
             st.results = st.props.hits.iter().map(|h| h.id).collect();
         }
         if ui
-            .add_enabled(can_find, egui::Button::new(tr("dialog.find_next")))
+            .add_enabled(can_find, crate::ui::btn_icons::Ib::new("dialog.find_next"))
             .rich_tip(crate::ui::tips::pair(
                 "dialog.find_next",
                 "docker.find_next_desc",
@@ -1129,7 +1138,7 @@ fn find_properties(app: &mut App, ui: &mut Ui, st: &mut crate::ui::dialogs::Find
             st.results = st.props.hits.iter().map(|h| h.id).collect();
         }
         if ui
-            .add_enabled(can_find, egui::Button::new(tr("dialog.find_all")))
+            .add_enabled(can_find, crate::ui::btn_icons::Ib::new("dialog.find_all"))
             .rich_tip(crate::ui::tips::pair(
                 "dialog.find_all",
                 "docker.find_all_desc",
@@ -1147,7 +1156,7 @@ fn find_properties(app: &mut App, ui: &mut Ui, st: &mut crate::ui::dialogs::Find
             );
         }
         if ui
-            .add_enabled(can_replace, egui::Button::new(tr("dialog.replace_all")))
+            .add_enabled(can_replace, crate::ui::btn_icons::Ib::new("dialog.replace_all"))
             .rich_tip(crate::ui::tips::pair(
                 "dialog.replace_all",
                 "find.replace_all_desc",
@@ -1189,7 +1198,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
     let vba = app.macros.scripts_vba;
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(!debugging, egui::Button::new(tr("docker.run")))
+            .add_enabled(!debugging, crate::ui::btn_icons::Ib::new("docker.run"))
             .rich_tip(crate::ui::tips::pair(
                 "docker.run",
                 "docker.run_script_desc",
@@ -1205,7 +1214,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
         }
         if app.macros.run.is_some()
             && ui
-                .button(tr("docker.stop"))
+                .ibutton("docker.stop")
                 .rich_tip(crate::ui::tips::pair(
                     "docker.stop",
                     "docker.stop_script_desc",
@@ -1219,7 +1228,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
             && ui
                 .add_enabled(
                     !debugging && !crate::files::WEB,
-                    egui::Button::new(tr("docker.debug")),
+                    crate::ui::btn_icons::Ib::new("docker.debug"),
                 )
                 .rich_tip(tr("docker.debug_hint"))
                 .rich_disabled_tip(if crate::files::WEB {
@@ -1232,7 +1241,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
             app.start_script_debug();
         }
         if ui
-            .selectable_label(app.recording.is_some(), tr("docker.record"))
+            .iselectable(app.recording.is_some(), "docker.record")
             .rich_tip(crate::ui::tips::pair("docker.record", "docker.record_desc"))
             .clicked()
         {
@@ -1244,7 +1253,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
             ("JavaScript", "js")
         };
         if ui
-            .button(tr("docker.load"))
+            .ibutton("docker.load")
             .rich_tip(crate::ui::tips::pair(
                 "docker.load",
                 "docker.load_script_desc",
@@ -1260,7 +1269,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
                 });
         }
         if ui
-            .button(tr("docker.save"))
+            .ibutton("docker.save")
             .rich_tip(crate::ui::tips::pair(
                 "docker.save",
                 "docker.save_script_desc",
@@ -1276,7 +1285,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
                 .save_bytes(app, source);
         }
         if ui
-            .button(tr("docker.clear"))
+            .ibutton("docker.clear")
             .rich_tip(crate::ui::tips::pair(
                 "docker.clear",
                 "docker.clear_output_desc",
@@ -1287,7 +1296,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
         }
         if !vba
             && ui
-                .button(tr("docker.install_filter"))
+                .ibutton("docker.install_filter")
                 .rich_tip(tr("docker.install_filter_hint"))
                 .clicked()
         {
@@ -1298,7 +1307,7 @@ fn scripts(app: &mut App, ui: &mut Ui) {
         // Tools > Plugins (#1802).
         if !vba
             && ui
-                .button(tr("docker.install_plugin"))
+                .ibutton("docker.install_plugin")
                 .rich_tip(crate::ui::tips::keyed("docker.install_plugin"))
                 .clicked()
         {
@@ -1379,18 +1388,18 @@ fn script_debug_bar(app: &mut App, ui: &mut Ui) {
     let paused = app.debug_paused;
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(paused.is_some(), egui::Button::new(tr("docker.continue")))
+            .add_enabled(paused.is_some(), crate::ui::btn_icons::Ib::new("docker.continue"))
             .clicked()
         {
             app.debug_control(DebugCtl::Continue);
         }
         if ui
-            .add_enabled(paused.is_some(), egui::Button::new(tr("docker.step")))
+            .add_enabled(paused.is_some(), crate::ui::btn_icons::Ib::new("docker.step"))
             .clicked()
         {
             app.debug_control(DebugCtl::Step);
         }
-        if ui.button(tr("docker.stop")).clicked() {
+        if ui.ibutton("docker.stop").clicked() {
             app.debug_control(DebugCtl::Stop);
         }
         match paused {
@@ -1406,7 +1415,7 @@ fn script_debug_bar(app: &mut App, ui: &mut Ui) {
                     .desired_width(ui.available_width() - 80.0),
             );
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button(tr("docker.evaluate")).clicked() || enter)
+            if (ui.ibutton("docker.evaluate").clicked() || enter)
                 && !app.debug_expr.trim().is_empty()
             {
                 let e = app.debug_expr.trim().to_string();
@@ -1694,7 +1703,7 @@ fn lens(app: &mut App, ui: &mut Ui) {
     let has = !app.selection.is_empty();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(has, egui::Button::new(tr("docker.apply")))
+            .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.apply"))
             .rich_tip(crate::ui::tips::pair(
                 "docker.apply",
                 "docker.lens_apply_desc",
@@ -1716,7 +1725,7 @@ fn lens(app: &mut App, ui: &mut Ui) {
             }
         }
         if ui
-            .add_enabled(has, egui::Button::new(tr("docker.remove")))
+            .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.remove"))
             .rich_tip(crate::ui::tips::pair(
                 "docker.remove",
                 "docker.lens_remove_desc",
@@ -1967,7 +1976,7 @@ fn blend(app: &mut App, ui: &mut Ui) {
     // straight again.
     if opt.bend.is_some()
         && ui
-            .button(tr("docker.blend_straighten"))
+            .ibutton("docker.blend_straighten")
             .rich_tip(crate::ui::tips::keyed("docker.blend_straighten"))
             .clicked()
     {
@@ -2036,7 +2045,7 @@ fn blend(app: &mut App, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     accel_o != 0.0 || accel_c != 0.0,
-                    egui::Button::new(tr("docker.reset")).min_size(egui::vec2(90.0, 22.0)),
+                    crate::ui::btn_icons::Ib::new("docker.reset").min_size(egui::vec2(90.0, 22.0)),
                 )
                 .rich_tip(crate::ui::tips::pair(
                     "docker.reset",
@@ -2111,7 +2120,7 @@ fn blend(app: &mut App, ui: &mut Ui) {
             |ui| {
                 ui.add_enabled(
                     two,
-                    egui::Button::new(tr("docker.apply")).min_size(egui::vec2(90.0, 22.0)),
+                    crate::ui::btn_icons::Ib::new("docker.apply").min_size(egui::vec2(90.0, 22.0)),
                 )
                 .rich_tip(crate::ui::tips::pair(
                     "docker.apply",
@@ -2157,7 +2166,7 @@ fn blend(app: &mut App, ui: &mut Ui) {
         section(ui, None);
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button(tr("docker.new_path"))
+                .ibutton("docker.new_path")
                 .rich_tip(crate::ui::tips::keyed("docker.new_path"))
                 .clicked()
             {
@@ -2166,21 +2175,21 @@ fn blend(app: &mut App, ui: &mut Ui) {
             }
             if has_path
                 && ui
-                    .button(tr("docker.detach_path"))
+                    .ibutton("docker.detach_path")
                     .rich_tip(crate::ui::tips::keyed("docker.detach_path"))
                     .clicked()
             {
                 app.detach_blend_path();
             }
             if ui
-                .button(tr("docker.clear_blend"))
+                .ibutton("docker.clear_blend")
                 .rich_tip(crate::ui::tips::keyed("docker.clear_blend"))
                 .clicked()
             {
                 app.clear_blend();
             }
             if ui
-                .button(tr("docker.break_apart"))
+                .ibutton("docker.break_apart")
                 .rich_tip(crate::ui::tips::pair(
                     "docker.break_apart",
                     "toolbar.effect_break_apart_desc",
@@ -2193,7 +2202,7 @@ fn blend(app: &mut App, ui: &mut Ui) {
     } else {
         let two = app.selection.len() == 2;
         let tip = crate::ui::tips::pair("docker.apply", "docker.blend_apply_desc");
-        if crate::ui::docker_form::wide_button(ui, &tr("docker.apply"), two, &tip) {
+        if crate::ui::docker_form::wide_button(ui, "docker.apply", two, &tip) {
             app.blend_selection(steps, accel_o, accel_c, rot);
         }
         if !two {
@@ -2203,8 +2212,8 @@ fn blend(app: &mut App, ui: &mut Ui) {
 }
 
 fn contour(app: &mut App, ui: &mut Ui) {
-    crate::ui::contour_bar::contour_controls(app, ui);
-    crate::ui::contour_bar::contour_actions(app, ui);
+    crate::ui::contour_bar::contour_controls_in(app, ui, true);
+    crate::ui::contour_bar::contour_actions_in(app, ui, true);
 }
 
 fn extrude(app: &mut App, ui: &mut Ui) {
@@ -2362,7 +2371,7 @@ fn bevel(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
         if cur.is_none()
             && ui
-                .add_enabled(has, egui::Button::new(tr("docker.apply")))
+                .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.apply"))
                 .rich_tip(crate::ui::tips::pair(
                     "docker.apply",
                     "docker.bevel_apply_desc",
@@ -2373,7 +2382,7 @@ fn bevel(app: &mut App, ui: &mut Ui) {
         }
         if cur.is_some()
             && ui
-                .button(tr("docker.remove"))
+                .ibutton("docker.remove")
                 .rich_tip(crate::ui::tips::pair(
                     "docker.remove",
                     "docker.bevel_remove_desc",
@@ -2497,7 +2506,7 @@ fn brush_strokes(app: &mut App, ui: &mut Ui) {
         .iter()
         .any(|s| matches!(s.kind, ShapeKind::Path { .. }));
     if ui
-        .add_enabled(has_curve, egui::Button::new(tr("docker.apply_to_curve")))
+        .add_enabled(has_curve, crate::ui::btn_icons::Ib::new("docker.apply_to_curve"))
         .rich_tip(crate::ui::tips::keyed("docker.apply_to_curve"))
         .rich_disabled_tip(crate::ui::tips::keyed("docker.apply_to_curve"))
         .clicked()
@@ -2711,7 +2720,7 @@ fn bitmap_mask(app: &mut App, ui: &mut Ui) {
     if ui
         .add_enabled(
             can,
-            egui::Button::new(tr("docker.apply")).min_size(egui::vec2(ui.available_width(), 26.0)),
+            crate::ui::btn_icons::Ib::new("docker.apply").min_size(egui::vec2(ui.available_width(), 26.0)),
         )
         .rich_tip(crate::ui::tips::pair(
             "docker.apply",
@@ -2731,6 +2740,23 @@ fn bitmap_mask(app: &mut App, ui: &mut Ui) {
 }
 
 fn object_data(app: &mut App, ui: &mut Ui) {
+    // The fields of many objects at once, as a table (#3084).
+    let sheet_open = egui::Id::new("object_data_sheet_open");
+    let mut open = ui.data(|d| d.get_temp::<bool>(sheet_open)).unwrap_or(false);
+    if ui
+        .ibutton("docker.data_sheet")
+        .rich_tip(crate::ui::tips::pair(
+            "docker.data_sheet",
+            "docker.data_sheet_tip",
+        ))
+        .clicked()
+    {
+        open = !open;
+    }
+    if open {
+        data_sheet_window(app, ui.ctx(), &mut open);
+    }
+    ui.data_mut(|d| d.insert_temp(sheet_open, open));
     let Some(s) = app.selected_shapes().into_iter().next() else {
         dim(ui, tr("docker.select_one_object"));
         return;
@@ -2784,7 +2810,7 @@ fn object_data(app: &mut App, ui: &mut Ui) {
     }
     ui.horizontal(|ui| {
         if ui
-            .button(tr("docker.add_field"))
+            .ibutton("docker.add_field")
             .rich_tip(crate::ui::tips::keyed("docker.add_field"))
             .clicked()
         {
@@ -2809,7 +2835,7 @@ fn object_data(app: &mut App, ui: &mut Ui) {
     // Copy the fields to the other selected objects (#3262).
     if app.selected_shapes().len() > 1
         && ui
-            .button(tr("docker.data_copy_to_selection"))
+            .ibutton("docker.data_copy_to_selection")
             .rich_tip(crate::ui::tips::pair(
                 "docker.data_copy_to_selection",
                 "docker.data_copy_to_selection_tip",
@@ -2831,6 +2857,192 @@ fn object_data(app: &mut App, ui: &mut Ui) {
         .sum();
     if total > 0.0 {
         ui.label(trf("docker.total_cost", &[("v", &format!("{total:.2}"))]));
+    }
+}
+
+/// One row of the object data sheet: an object, how deep in groups it
+/// lies under the objects listed, and its fields.
+#[derive(Debug, Clone, PartialEq)]
+struct SheetRow {
+    id: ShapeId,
+    depth: usize,
+    data: Vec<(String, String)>,
+}
+
+/// The rows of the data sheet for `roots` (the objects selected, else
+/// those of the page): each object, then the objects of its groups down
+/// to `levels` levels deeper.
+fn sheet_rows(roots: &[tracedraw_core::Shape], levels: usize) -> Vec<SheetRow> {
+    fn walk(s: &tracedraw_core::Shape, depth: usize, levels: usize, out: &mut Vec<SheetRow>) {
+        out.push(SheetRow {
+            id: s.id,
+            depth,
+            data: s.data.clone(),
+        });
+        if depth < levels {
+            if let ShapeKind::Group { children } = &s.kind {
+                for c in children {
+                    walk(c, depth + 1, levels, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for s in roots {
+        walk(s, 0, levels, &mut out);
+    }
+    out
+}
+
+/// A field a person keeps on an object (not one TraceDraw keeps for
+/// itself, named with a dot, such as `fill.rule`).
+fn user_field(name: &str) -> bool {
+    !name.contains('.')
+}
+
+/// The columns of the sheet: every field the rows hold, the usual ones
+/// first, then the others in the order they first come.
+fn sheet_columns(rows: &[SheetRow]) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::new();
+    for k in ["Name", "Cost", "Comments"] {
+        if rows.iter().any(|r| r.data.iter().any(|(f, _)| f == k)) {
+            cols.push(k.to_string());
+        }
+    }
+    for r in rows {
+        for (k, _) in &r.data {
+            if user_field(k) && !cols.contains(k) {
+                cols.push(k.clone());
+            }
+        }
+    }
+    cols
+}
+
+/// A value as a number, with a currency sign, spaces or thousands
+/// commas around it allowed ("$1,250.50").
+fn sheet_number(v: &str) -> Option<f64> {
+    let t: String = v
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '$' | '€' | '£' | '¥' | ',' | ' '))
+        .collect();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// The total of column `col` over the top rows (depth 0, so a group and
+/// its objects are not counted twice): `None` unless some value is a
+/// number and every filled one is.
+fn sheet_total(rows: &[SheetRow], col: &str) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut any = false;
+    for r in rows.iter().filter(|r| r.depth == 0) {
+        let Some((_, v)) = r.data.iter().find(|(k, _)| k == col) else {
+            continue;
+        };
+        if v.trim().is_empty() {
+            continue;
+        }
+        sum += sheet_number(v)?;
+        any = true;
+    }
+    any.then_some(sum)
+}
+
+/// The object data sheet: the fields of the selected objects (or of the
+/// page's objects) as a table to read and edit, with the objects of
+/// their groups to the levels asked and a total under the number columns.
+fn data_sheet_window(app: &mut App, ctx: &egui::Context, open: &mut bool) {
+    let levels_id = egui::Id::new("object_data_sheet_levels");
+    let mut levels = ctx.data(|d| d.get_temp::<usize>(levels_id)).unwrap_or(0);
+    let roots: Vec<tracedraw_core::Shape> = {
+        let sel = app.selected_shapes();
+        if sel.is_empty() {
+            app.page_layers()
+                .iter()
+                .flat_map(|l| l.shapes.iter().cloned())
+                .collect()
+        } else {
+            sel
+        }
+    };
+    let rows = sheet_rows(&roots, levels);
+    let cols = sheet_columns(&rows);
+    let mut edit: Option<(ShapeId, String, String)> = None;
+    egui::Window::new(tr("docker.data_sheet"))
+        .id(egui::Id::new("object_data_sheet"))
+        .open(open)
+        .default_size([640.0, 280.0])
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(tr("docker.data_sheet_levels"));
+                ui.add(egui::DragValue::new(&mut levels).range(0..=9));
+            });
+            ui.separator();
+            egui::ScrollArea::both().show(ui, |ui| {
+                egui::Grid::new("object_data_sheet_grid")
+                    .striped(true)
+                    .num_columns(cols.len() + 1)
+                    .show(ui, |ui| {
+                        ui.label("");
+                        for c in &cols {
+                            ui.strong(c);
+                        }
+                        ui.end_row();
+                        let mut n = 0;
+                        for r in &rows {
+                            if r.depth == 0 {
+                                n += 1;
+                            }
+                            let num = if r.depth == 0 {
+                                n.to_string()
+                            } else {
+                                format!("{}-", "  ".repeat(r.depth))
+                            };
+                            ui.label(num);
+                            for (ci, c) in cols.iter().enumerate() {
+                                let stored = r
+                                    .data
+                                    .iter()
+                                    .find(|(k, _)| k == c)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_default();
+                                let field = egui::Id::new(("object_data_sheet_cell", ci));
+                                let (_, typed) =
+                                    kept_text(ui, field, (r.id, ci), &stored, |ui, text| {
+                                        ui.add(egui::TextEdit::singleline(text).desired_width(80.0))
+                                    });
+                                if let Some(v) = typed {
+                                    edit = Some((r.id, c.clone(), v));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                        ui.strong(tr("docker.data_sheet_total"));
+                        for c in &cols {
+                            match sheet_total(&rows, c) {
+                                Some(t) => ui.strong(format!("{t:.2}")),
+                                None => ui.label(""),
+                            };
+                        }
+                        ui.end_row();
+                    });
+            });
+        });
+    ctx.data_mut(|d| d.insert_temp(levels_id, levels));
+    if let Some((id, field, value)) = edit {
+        if let Some(s) = app.doc().find_shape(id) {
+            let mut data = s.data.clone();
+            match data.iter_mut().find(|(k, _)| *k == field) {
+                Some((_, v)) => *v = value,
+                None => data.push((field, value)),
+            }
+            app.run(Command::SetObjectData { shape: id, data });
+        }
     }
 }
 
@@ -2980,15 +3192,25 @@ fn symbols(app: &mut App, ui: &mut Ui) {
     let has = !app.selection.is_empty();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(has, egui::Button::new(tr("docker.new_symbol")))
+            .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.new_symbol"))
             .rich_tip(crate::ui::tips::keyed("docker.new_symbol"))
             .rich_disabled_tip(crate::ui::tips::keyed("docker.new_symbol"))
             .clicked()
         {
             app.create_symbol_from_selection();
         }
+        // Every group copying the selected one becomes an instance where
+        // it stood, labels staying text (#2343).
         if ui
-            .button(tr("docker.revert_to_objects"))
+            .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.symbolize_similar"))
+            .rich_tip(tr("docker.symbolize_similar_tip"))
+            .rich_disabled_tip(tr("docker.symbolize_similar_tip"))
+            .clicked()
+        {
+            app.symbolize_similar();
+        }
+        if ui
+            .ibutton("docker.revert_to_objects")
             .rich_tip(crate::ui::tips::keyed("docker.revert_to_objects"))
             .clicked()
         {
@@ -3003,6 +3225,7 @@ fn symbols(app: &mut App, ui: &mut Ui) {
         .map(|(i, s)| (i, s.name.clone()))
         .collect();
     let editing = app.symbol_edit_index();
+    let count = syms.len();
     let mut thumbs = std::mem::take(&mut app.symbol_thumbs);
     thumbs.begin_frame();
     let drawing = (app.engine.instance(), app.engine.revision());
@@ -3010,7 +3233,31 @@ fn symbols(app: &mut App, ui: &mut Ui) {
         ui.horizontal(|ui| {
             // What the symbol draws, beside its name (#3249).
             symbol_picture(app, ui, &mut thumbs, drawing, i);
-            ui.label(&name);
+            // A double click on the name renames the symbol in place.
+            let renaming = app
+                .symbol_rename
+                .as_ref()
+                .filter(|(idx, _)| *idx == i)
+                .map(|(_, s)| s.clone());
+            if let Some(mut text) = renaming {
+                let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(90.0));
+                if !resp.has_focus() && !resp.lost_focus() {
+                    resp.request_focus();
+                }
+                if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                    app.symbol_rename = None;
+                } else if resp.lost_focus() || ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                    app.rename_symbol(i, text.clone());
+                    app.symbol_rename = None;
+                } else {
+                    app.symbol_rename = Some((i, text));
+                }
+            } else {
+                let resp = ui.label(&name).rich_tip(tr("docker.rename_symbol_tip"));
+                if resp.double_clicked() {
+                    app.symbol_rename = Some((i, name.clone()));
+                }
+            }
             if ui
                 .small_button(tr("docker.insert"))
                 .rich_tip(crate::ui::tips::pair(
@@ -3043,7 +3290,7 @@ fn symbols(app: &mut App, ui: &mut Ui) {
             } else if ui
                 .add_enabled(
                     app.clip_frame_edit.is_none(),
-                    egui::Button::new(tr("docker.edit_symbol")).small(),
+                    crate::ui::btn_icons::Ib::new("docker.edit_symbol").small(),
                 )
                 .rich_tip(crate::ui::tips::pair(
                     "docker.edit_symbol",
@@ -3057,12 +3304,40 @@ fn symbols(app: &mut App, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     app.clip_frame_edit.is_none(),
-                    egui::Button::new(tr("docker.duplicate_symbol")).small(),
+                    crate::ui::btn_icons::Ib::new("docker.duplicate_symbol").small(),
                 )
                 .rich_tip(tr("docker.duplicate_symbol_tip"))
                 .clicked()
             {
                 app.duplicate_symbol(i);
+            }
+            // Replace: merge this symbol into another. The first press
+            // picks the source, a press on another symbol's button merges
+            // the source into it.
+            let picking = app.symbol_replace_source;
+            let label = if picking == Some(i) {
+                tr("dialog.cancel")
+            } else if picking.is_some() {
+                tr("docker.replace_target")
+            } else {
+                tr("docker.replace_symbol")
+            };
+            if ui
+                .add_enabled(
+                    count > 1 && app.clip_frame_edit.is_none(),
+                    egui::Button::new(label).small(),
+                )
+                .rich_tip(tr("docker.replace_symbol_tip"))
+                .clicked()
+            {
+                match picking {
+                    Some(src) if src == i => app.symbol_replace_source = None,
+                    Some(src) => {
+                        app.merge_symbols(src, i);
+                        app.symbol_replace_source = None;
+                    }
+                    None => app.symbol_replace_source = Some(i),
+                }
             }
             let uses = symbol_uses(app.doc(), i);
             dim(ui, trf("docker.instances_n", &[("n", &uses.to_string())]));
@@ -3075,6 +3350,15 @@ fn symbols(app: &mut App, ui: &mut Ui) {
     app.symbol_thumbs = thumbs;
     if app.doc().symbols.is_empty() {
         dim(ui, tr("docker.symbols_hint"));
+    }
+    if app.symbol_replace_source.is_some() {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.symbol_replace_source = None;
+        }
+        dim(ui, tr("docker.replace_pick"));
+    }
+    if let Some(r) = app.symbolize_report.clone() {
+        dim(ui, r);
     }
 }
 
@@ -3105,6 +3389,13 @@ fn symbol_picture(
         ShapeId(u64::MAX - index as u64),
         ShapeKind::SymbolInstance { index },
     );
+    // Centre the definition in the tile: definitions saved by older files
+    // may sit away from the origin, which left their preview blank.
+    let mut shape = shape;
+    if let Some(sym) = app.doc().symbols.get(index) {
+        let c = sym.shape.bounds().center();
+        shape.transform = Affine::translate((-c.x, -c.y));
+    }
     let ppp = ui.ctx().pixels_per_point().max(0.5);
     let inner = r.shrink(2.0);
     let px = (inner.width() * ppp).round().max(4.0) as u32;
@@ -3134,16 +3425,18 @@ fn pages(app: &mut App, ui: &mut Ui) {
         .map(|p| (p.id, p.name.clone(), p.size))
         .collect();
     let n = pages.len();
-    ui.horizontal(|ui| {
+    // Rows wrap when the panel is narrowed, buttons and page details
+    // going onto the next line instead of past the edge (#4148).
+    ui.horizontal_wrapped(|ui| {
         if ui
-            .button(tr("menu.layout.insert_page"))
+            .ibutton("menu.layout.insert_page")
             .rich_tip(crate::ui::tips::keyed("menu.layout.insert_page"))
             .clicked()
         {
             app.add_page();
         }
         if ui
-            .add_enabled(n > 1, egui::Button::new(tr("menu.layout.delete_page")))
+            .add_enabled(n > 1, crate::ui::btn_icons::Ib::new("menu.layout.delete_page"))
             .rich_tip(crate::ui::tips::keyed("menu.layout.delete_page"))
             .rich_disabled_tip(crate::ui::tips::keyed("menu.layout.delete_page"))
             .clicked()
@@ -3151,14 +3444,14 @@ fn pages(app: &mut App, ui: &mut Ui) {
             app.ask_delete_page();
         }
         if ui
-            .button(tr("menu.layout.duplicate_page"))
+            .ibutton("menu.layout.duplicate_page")
             .rich_tip(crate::ui::tips::keyed("menu.layout.duplicate_page"))
             .clicked()
         {
             app.dialog = crate::ui::dialogs::Dialog::duplicate_page();
         }
         if ui
-            .selectable_label(app.page_sorter, tr("menu.view.page_sorter"))
+            .iselectable(app.page_sorter, "menu.view.page_sorter")
             .rich_tip(crate::ui::tips::keyed("menu.view.page_sorter"))
             .clicked()
         {
@@ -3167,7 +3460,7 @@ fn pages(app: &mut App, ui: &mut Ui) {
     });
     let revision = app.engine.revision();
     for (i, (id, name, size)) in pages.iter().enumerate() {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let active = *id == app.page;
             // The page's miniature, so a page is found by what it shows,
             // not by its number alone (#2932).
@@ -3387,7 +3680,7 @@ fn corners(app: &mut App, ui: &mut Ui) {
     };
     ui.add_space(8.0);
     if ui
-        .add_enabled(valid, egui::Button::new(tr("docker.apply")))
+        .add_enabled(valid, crate::ui::btn_icons::Ib::new("docker.apply"))
         .rich_tip(crate::ui::tips::pair(
             "docker.apply",
             "docker.corners_apply_desc",
@@ -3469,7 +3762,7 @@ fn join_curves(app: &mut App, ui: &mut Ui) {
         .any(|s| matches!(s.kind, ShapeKind::Path { .. }));
     ui.add_space(8.0);
     if ui
-        .add_enabled(curves, egui::Button::new(tr("docker.apply")))
+        .add_enabled(curves, crate::ui::btn_icons::Ib::new("docker.apply"))
         .rich_tip(crate::ui::tips::pair(
             "docker.apply",
             "docker.join_apply_desc",
@@ -3932,7 +4225,7 @@ fn fit_to_path(app: &mut App, ui: &mut Ui) {
     app.docker_preview.extend(preview);
     ui.add_space(8.0);
     if ui
-        .add_enabled(valid, egui::Button::new(tr("docker.apply")))
+        .add_enabled(valid, crate::ui::btn_icons::Ib::new("docker.apply"))
         .rich_tip(crate::ui::tips::pair(
             "docker.apply",
             "docker.fit_to_path_apply_desc",
@@ -4005,6 +4298,76 @@ fn origin_grid(ui: &mut Ui, origin: &mut u8, enabled: bool) {
         if resp.rich_tip(tip.clone()).clicked() && enabled {
             *origin = i;
         }
+    }
+}
+
+#[cfg(test)]
+mod data_sheet_tests {
+    use super::*;
+
+    fn obj(
+        id: u64,
+        data: &[(&str, &str)],
+        children: Vec<tracedraw_core::Shape>,
+    ) -> tracedraw_core::Shape {
+        let kind = if children.is_empty() {
+            ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(0.0, 0.0, 1.0, 1.0),
+                radius: 0.0,
+                corners: None,
+            }
+        } else {
+            ShapeKind::Group { children }
+        };
+        let mut s = tracedraw_core::Shape::new(ShapeId(id), kind);
+        s.data = data
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        s
+    }
+
+    /// The sheet lists the objects with every field as a column, the
+    /// objects of a group only to the levels asked, and totals the cost
+    /// of the listed objects once (#3084).
+    #[test]
+    fn the_data_sheet_lists_fields_and_totals_costs() {
+        let roots = vec![
+            obj(
+                1,
+                &[
+                    ("Name", "ART"),
+                    ("Cost", "$15.00"),
+                    ("Comments", "2020-PRES"),
+                ],
+                vec![],
+            ),
+            obj(
+                2,
+                &[("Name", "SIGN"), ("Cost", "68"), ("Size", ".75\"x7.25\"")],
+                vec![obj(
+                    3,
+                    &[
+                        ("Name", "TEXT"),
+                        ("Cost", "1,000"),
+                        ("fill.rule", "evenodd"),
+                    ],
+                    vec![],
+                )],
+            ),
+        ];
+        let rows = sheet_rows(&roots, 0);
+        assert_eq!(rows.iter().map(|r| r.id.0).collect::<Vec<_>>(), [1, 2]);
+        let rows = sheet_rows(&roots, 1);
+        assert_eq!(
+            rows.iter().map(|r| (r.id.0, r.depth)).collect::<Vec<_>>(),
+            [(1, 0), (2, 0), (3, 1)]
+        );
+        assert_eq!(sheet_columns(&rows), ["Name", "Cost", "Comments", "Size"]);
+        assert_eq!(sheet_total(&rows, "Cost"), Some(83.0));
+        assert_eq!(sheet_total(&rows, "Name"), None);
+        assert_eq!(sheet_total(&rows, "Size"), None);
+        assert_eq!(sheet_number("$1,250.50"), Some(1250.5));
     }
 }
 

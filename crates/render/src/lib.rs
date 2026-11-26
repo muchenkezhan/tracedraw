@@ -98,38 +98,120 @@ pub struct Preview {
 /// The page-space box of every object of a page, worked out once for a
 /// render and shared by its bands: a band's culling asks every object's
 /// box, and before this cache each of the bands (one per core) walked
-/// the whole page's paths again (#3559).
-type PageBounds = std::collections::HashMap<ShapeId, Rect>;
+/// the whole page's paths again (#3559). With it, the box each group can
+/// paint in (#4157).
+#[derive(Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct PageBounds {
+    boxes: std::collections::HashMap<ShapeId, Rect>,
+    /// Where each group (and clip frame) can paint, page mm: the union of
+    /// what its objects' outlines reach. Groups holding an object whose
+    /// reach is not its box (effects, shadows, bitmap effects, symbols)
+    /// are not listed: their objects are tested one by one.
+    reach: std::collections::HashMap<ShapeId, Rect>,
+}
+
+impl PageBounds {
+    fn get(&self, id: &ShapeId) -> Option<&Rect> {
+        self.boxes.get(id)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    // How many objects `Renderer::out_of_sight_in` was asked about on
+    // this thread, for the tests.
+    static SIGHT_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What an object can paint, for a group's reach (#4157).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+enum Reach {
+    /// Nothing (hidden, or an empty group).
+    Nothing,
+    /// Inside this box, page mm.
+    Inside(Rect),
+    /// Anywhere: its extent is not its box.
+    Anywhere,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Reach {
+    fn union(self, other: Reach) -> Reach {
+        match (self, other) {
+            (Reach::Anywhere, _) | (_, Reach::Anywhere) => Reach::Anywhere,
+            (Reach::Nothing, r) | (r, Reach::Nothing) => r,
+            (Reach::Inside(a), Reach::Inside(b)) => Reach::Inside(a.union(b)),
+        }
+    }
+}
 
 /// [`PageBounds`] of the page's drawable layers: each shape's box with
 /// the transforms of the groups and clip frames holding it taken in,
-/// the same value [`Renderer::reach`] would compute for it.
+/// the same value [`Renderer::reach`] would compute for it, and each
+/// group's reach, the union of its objects' (#4157).
 #[cfg(not(target_arch = "wasm32"))]
 fn page_bounds_cache(doc: &Document, page: PageId) -> PageBounds {
-    fn walk(s: &Shape, parent: Affine, map: &mut PageBounds) {
-        let b = if parent == Affine::IDENTITY {
-            s.bounds()
-        } else {
-            parent.transform_rect_bbox(s.bounds())
+    fn walk(s: &Shape, parent: Affine, map: &mut PageBounds) -> Reach {
+        // An object drawn as the picture its bitmap effects make: the
+        // picture's box, which the effects grow past the object (a blur
+        // spreads). The object's own box cut the picture there, a hard
+        // edge round a blurred vector object (#4082).
+        let own = match s.picture() {
+            Some(p) => s.bounds().union(p.bounds()),
+            None => s.bounds(),
         };
-        map.insert(s.id, b);
+        let b = if parent == Affine::IDENTITY {
+            own
+        } else {
+            parent.transform_rect_bbox(own)
+        };
+        map.boxes.insert(s.id, b);
         let t = parent * s.transform;
-        match &s.kind {
+        let inner = match &s.kind {
             ShapeKind::Group { children } => {
+                let mut r = Reach::Nothing;
                 for c in children {
-                    walk(c, t, map);
+                    r = r.union(walk(c, t, map));
                 }
+                Some(r)
             }
             ShapeKind::ClipFrame { frame, contents } => {
-                walk(frame, t, map);
+                // Nothing shows past the frame.
+                let r = walk(frame, t, map);
                 for c in contents {
                     walk(c, t, map);
                 }
+                Some(r)
             }
-            _ => {}
+            _ => None,
+        };
+        // The same objects [`Renderer::out_of_sight_in`] always draws.
+        let reach = if !s.visible {
+            Reach::Nothing
+        } else if !s.effects.is_empty()
+            || s.shadow.is_some()
+            || s.raster_fx.is_some()
+            || matches!(s.kind, ShapeKind::SymbolInstance { .. })
+        {
+            Reach::Anywhere
+        } else if let Some(r) = inner {
+            r
+        } else {
+            match Renderer::reach_of(s, parent, b) {
+                Some(r) => Reach::Inside(r),
+                None => Reach::Anywhere,
+            }
+        };
+        if inner.is_some() {
+            if let Reach::Inside(r) = reach {
+                map.reach.insert(s.id, r);
+            }
         }
+        reach
     }
-    let mut map = PageBounds::new();
+    let mut map = PageBounds::default();
     if let Ok(layers) = doc.layers_drawn_for_page(page) {
         for layer in layers {
             for s in &layer.shapes {
@@ -368,6 +450,9 @@ pub fn render_page_progressive(
         return None;
     }
     let cancelled = || cancel.load(Ordering::Relaxed);
+    if cancelled() {
+        return None;
+    }
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -389,7 +474,11 @@ pub fn render_page_progressive(
     // once here instead of once per band (#3559).
     let boxes = page_bounds_cache(doc, page);
     let next = AtomicUsize::new(0);
-    let done: std::sync::Mutex<Vec<(u32, Pixmap)>> = std::sync::Mutex::new(Vec::new());
+    // Assemble each band as it finishes instead of keeping a whole
+    // picture of bands beside a second whole picture at the end. Only
+    // the workers' current bands and their blur margins stay live.
+    let out = std::sync::Mutex::new(Pixmap::new(w, h)?);
+    let done = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         for _ in 0..cores.min(bands.len() as u32) {
             sc.spawn(|| loop {
@@ -420,24 +509,28 @@ pub fn render_page_progressive(
                     return;
                 };
                 rows.data_mut().copy_from_slice(src);
-                band(y0, &rows);
-                if let Ok(mut d) = done.lock() {
-                    d.push((y0, rows));
+                drop(part);
+                {
+                    let Ok(mut out) = out.lock() else {
+                        return;
+                    };
+                    let start = y0 as usize * row;
+                    let Some(dst) = out.data_mut().get_mut(start..start + len) else {
+                        return;
+                    };
+                    dst.copy_from_slice(rows.data());
                 }
+                // The callback may wait for its consumer. It must never
+                // hold the assembly lock while it does so.
+                band(y0, &rows);
+                done.fetch_add(1, Ordering::Relaxed);
             });
         }
     });
-    let done = done.into_inner().ok()?;
-    if cancelled() || done.len() != bands.len() {
+    if cancelled() || done.load(Ordering::Relaxed) != bands.len() {
         return None;
     }
-    let mut out = Pixmap::new(w, h)?;
-    let row = w as usize * 4;
-    for (y0, rows) in done {
-        let d = y0 as usize * row;
-        out.data_mut()[d..d + rows.data().len()].copy_from_slice(rows.data());
-    }
-    Some(out)
+    out.into_inner().ok()
 }
 
 /// How many bands for each core a picture handed over a band at a time
@@ -1006,11 +1099,14 @@ impl Renderer<'_> {
     /// frame (the pages placed on a printed sheet) is tested where it
     /// draws (#848).
     fn out_of_sight_in(&self, shape: &Shape, parent: Affine, visible: &Rect) -> bool {
+        #[cfg(test)]
+        SIGHT_TESTS.with(|n| n.set(n.get() + 1));
         if !shape.visible {
             return true;
         }
         if !shape.effects.is_empty()
             || shape.shadow.is_some()
+            || shape.raster_fx.is_some()
             || matches!(shape.kind, ShapeKind::SymbolInstance { .. })
             || self.preview.is_some_and(|p| p.shapes.contains(&shape.id))
         {
@@ -1023,6 +1119,21 @@ impl Renderer<'_> {
         // outline inside it flat (#626).
         match &shape.kind {
             ShapeKind::Group { children } => {
+                // The whole group first: off the band when all its
+                // objects' outlines together reach nowhere near, without
+                // asking each object (#4157). Not while something is
+                // dragged: the box was made where it stood.
+                if self.preview.is_none() {
+                    if let Some(r) = self.bounds.and_then(|c| c.reach.get(&shape.id)) {
+                        if r.x1 < visible.x0
+                            || r.x0 > visible.x1
+                            || r.y1 < visible.y0
+                            || r.y0 > visible.y1
+                        {
+                            return true;
+                        }
+                    }
+                }
                 let t = parent * shape.transform;
                 return children.iter().all(|c| self.out_of_sight_in(c, t, visible));
             }
@@ -1070,6 +1181,11 @@ impl Renderer<'_> {
             None if parent == Affine::IDENTITY => shape.bounds(),
             None => parent.transform_rect_bbox(shape.bounds()),
         };
+        Self::reach_of(shape, parent, b)
+    }
+
+    /// [`Self::reach`] of `shape`, whose box on the page is `b`.
+    fn reach_of(shape: &Shape, parent: Affine, b: Rect) -> Option<Rect> {
         if !b.x0.is_finite() || !b.y0.is_finite() || !b.x1.is_finite() || !b.y1.is_finite() {
             return None;
         }
@@ -1249,6 +1365,13 @@ impl Renderer<'_> {
         // the pixel effects (lens, non-uniform transparency).
         if !shape.effects.is_empty() {
             let ev = tracedraw_core::live::evaluate(shape);
+            // What the effects draw keeps the object's id (a symmetry's
+            // mirrored copies, a warped outline), while the shared box
+            // cache holds the object's own box under that id: a band of
+            // the picture outside that box left the copies out, and only
+            // a zoom out (one band) showed them all (#3821). They are
+            // measured on their own here.
+            let cached = self.bounds.take();
             // An object whose effects draw objects of their own (the body
             // of an extrusion, a contour's steps) casts the shadow of all
             // of it, beneath all of it. The shadow was the object's
@@ -1386,6 +1509,7 @@ impl Renderer<'_> {
                 }
                 self.draw_shape(&a, parent);
             }
+            self.bounds = cached;
             return;
         }
         // Characters with their own fill or outline: one text a look.
@@ -3241,11 +3365,23 @@ impl Renderer<'_> {
                 None => mask_px.get(i).map_or(255, lum),
             }
         };
+        // A uniform transparency (a solid mask) is one value over the whole
+        // box: read once, not once a pixel, and a wholly opaque one leaves
+        // the layer as it is (#3761).
+        let constant = match (mask_fill, inside) {
+            (Fill::Solid(_), Some(((x0, _), (y0, _)))) => {
+                Some(mask_px.get(y0 * w as usize + x0).map_or(255, lum))
+            }
+            _ => None,
+        };
         for (i, px) in layer.pixels_mut().iter_mut().enumerate() {
+            if constant == Some(255) {
+                break;
+            }
             if px.alpha() == 0 {
                 continue;
             }
-            let m = mask_at(i);
+            let m = constant.unwrap_or_else(|| mask_at(i));
             let d = px.demultiply();
             let a = (d.alpha() as u32 * m as u32 / 255) as u8;
             if let Some(np) = tiny_skia::ColorU8::from_rgba(d.red(), d.green(), d.blue(), a)
@@ -6381,7 +6517,21 @@ pub fn render_page_image(doc: &Document, page: PageId, dpi: f64) -> Option<Pixma
 /// where nothing is drawn: the page with whatever lies around it on the
 /// desktop, for the Navigator (#2053).
 pub fn render_area_image(doc: &Document, page: PageId, area: Rect, dpi: f64) -> Option<Pixmap> {
-    doc.page(page).ok()?;
+    render_area_image_on_desk(doc, page, area, dpi, None)
+}
+
+/// [`render_area_image`] with the desktop round the page in `desk`
+/// (RGB) and the page white as paper, as the drawing window shows them:
+/// for Edit > Copy Visible Area in a dark theme (#4027). `None` is white
+/// everywhere.
+pub fn render_area_image_on_desk(
+    doc: &Document,
+    page: PageId,
+    area: Rect,
+    dpi: f64,
+    desk: Option<[u8; 3]>,
+) -> Option<Pixmap> {
+    let page_size = doc.page(page).ok()?.size;
     let zoom = dpi / 25.4;
     if !(area.width() > 0.0 && area.height() > 0.0) || !zoom.is_finite() || zoom <= 0.0 {
         return None;
@@ -6405,7 +6555,22 @@ pub fn render_area_image(doc: &Document, page: PageId, area: Rect, dpi: f64) -> 
         },
     )?;
     let mut out = Pixmap::new(w, h)?;
-    out.fill(SkColor::WHITE);
+    match desk {
+        Some([r, g, b]) => {
+            out.fill(SkColor::from_rgba8(r, g, b, 255));
+            // The paper: the page's box (y up from its bottom edge).
+            let x0 = (-area.x0 * zoom) as f32;
+            let x1 = ((page_size.width - area.x0) * zoom) as f32;
+            let y0 = (h as f64 - (page_size.height - area.y0) * zoom) as f32;
+            let y1 = (h as f64 + area.y0 * zoom) as f32;
+            if let Some(paper) = tiny_skia::Rect::from_ltrb(x0, y0, x1, y1) {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color(SkColor::WHITE);
+                out.fill_rect(paper, &paint, Transform::identity(), None);
+            }
+        }
+        None => out.fill(SkColor::WHITE),
+    }
     out.draw_pixmap(
         0,
         0,
@@ -6421,10 +6586,12 @@ pub fn render_area_image(doc: &Document, page: PageId, area: Rect, dpi: f64) -> 
 /// an object left far out on the desktop does not shrink the rest to dots.
 pub const WHOLE_PAGE_REACH: f64 = 3.0;
 
-/// The page with everything drawn on it, also what lies beside it on the
-/// desktop (page coordinates, mm), up to [`WHOLE_PAGE_REACH`] page sizes
-/// away: what a file's thumbnail shows (#2357). `None` without the page
-/// or with a page of no size.
+/// Everything drawn on the page and beside it on the desktop (page
+/// coordinates, mm), up to [`WHOLE_PAGE_REACH`] page sizes away: what a
+/// file's thumbnail shows (#2357). The drawing's own extent, not the
+/// page's, as zooming to all objects shows it (#3052: the page with a
+/// margin round it); the page when nothing is drawn. `None` without the
+/// page or with a page of no size.
 pub fn whole_page_area(doc: &Document, page: PageId) -> Option<Rect> {
     let p = doc.page(page).ok()?;
     let (w, h) = (p.size.width, p.size.height);
@@ -6440,7 +6607,7 @@ pub fn whole_page_area(doc: &Document, page: PageId) -> Option<Rect> {
         .filter(|b| [b.x0, b.y0, b.x1, b.y1].iter().all(|v| v.is_finite()))
         .map(|b| b.intersect(reach))
         .filter(|b| b.width() > 0.0 || b.height() > 0.0);
-    Some(content.map_or(sheet, |b| b.union(sheet)))
+    Some(content.unwrap_or(sheet))
 }
 
 /// The page with whatever lies beside it on the desktop
@@ -6481,9 +6648,28 @@ pub fn render_page_image_with(
 /// every pixel of it (see [`ViewTransform::whole_page`]), with no light
 /// row above it or column to its right.
 pub fn render_page_export_image(doc: &Document, page: PageId, dpi: f64) -> Option<Pixmap> {
+    render_page_export_image_aa(doc, page, dpi, true)
+}
+
+/// [`render_page_export_image`], its edges smoothed (`anti_alias`) or
+/// left hard, each pixel all in or all out of a shape.
+pub fn render_page_export_image_aa(
+    doc: &Document,
+    page: PageId,
+    dpi: f64,
+    anti_alias: bool,
+) -> Option<Pixmap> {
     let p = doc.page(page).ok()?;
     let fit = ViewTransform::whole_page(p.size.width, p.size.height, dpi / 25.4);
-    page_image_in(doc, page, fit, &RenderOptions::default())
+    page_image_in(
+        doc,
+        page,
+        fit,
+        &RenderOptions {
+            anti_alias,
+            ..RenderOptions::default()
+        },
+    )
 }
 
 /// `page` drawn `w` by `h` pixels through `view`, on white.
@@ -11885,6 +12071,49 @@ mod culling_tests {
     use super::*;
     use tracedraw_core::document::{Shape, ShapeKind};
 
+    /// A symmetry's mirrored copies show in every band of a picture drawn
+    /// in bands (#3821): they keep the object's id, and the bands' shared
+    /// box cache gave them the object's own box, so a band away from the
+    /// object left them out until a zoom out drew the page in one band.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mirrored_copies_show_in_bands_away_from_the_object() {
+        let mut s = Shape::new(
+            tracedraw_core::ShapeId(6),
+            ShapeKind::Group {
+                children: vec![rect_shape(7, Rect::new(10.0, 70.0, 30.0, 90.0))],
+            },
+        );
+        s.effects = vec![tracedraw_core::live::Effect::Symmetry {
+            center: tracedraw_core::geometry::Point::new(50.0, 50.0),
+            angle: 0.0,
+            lines: 1,
+            rotate: false,
+        }];
+        let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(100.0, 100.0));
+        let page = doc.pages[0].id;
+        doc.pages[0].layers[0].shapes = vec![s];
+        // The bottom half of the page only: the mirror of the square,
+        // below the line, and not the square itself.
+        let opts = RenderOptions {
+            width: 100,
+            height: 50,
+            view: ViewTransform {
+                zoom: 1.0,
+                origin_x: 0.0,
+                origin_y: 50.0,
+                stretch_y: 1.0,
+            },
+            ..RenderOptions::default()
+        };
+        let boxes = page_bounds_cache(&doc, page);
+        let whole = render_page_whole_in(&doc, page, &opts, None, None).expect("drawn");
+        let band = render_page_whole_in(&doc, page, &opts, None, Some(&boxes)).expect("drawn");
+        let ink = |pm: &Pixmap| pm.data().chunks(4).filter(|p| p[3] > 0).count();
+        assert!(ink(&whole) > 100, "the mirror shows in the bottom half");
+        assert_eq!(ink(&band), ink(&whole), "the band draws it too");
+    }
+
     fn rect_shape(id: u64, r: Rect) -> Shape {
         let mut s = Shape::new(
             tracedraw_core::ShapeId(id),
@@ -12397,6 +12626,66 @@ mod band_tests {
             assert!(!dark(25.0, y + 20.0), "gap above card {row}");
         }
         assert!(dark(75.0, 170.0), "the group");
+    }
+
+    /// A group far off the band is left out by its reach alone, its
+    /// thousand objects never asked about; one near the band still has
+    /// a wide outline of its objects drawn into it (#4157).
+    #[test]
+    fn a_group_off_the_band_is_left_out_without_its_objects() {
+        let group = |id: u64, children: Vec<Shape>| {
+            let mut g = Shape::new(tracedraw_core::ShapeId(id), ShapeKind::Group { children });
+            g.stroke = None;
+            g
+        };
+        let rect_shape = |id: u64, r: Rect| {
+            let mut s = Shape::new(
+                tracedraw_core::ShapeId(id),
+                ShapeKind::Rect {
+                    rect: r,
+                    radius: 0.0,
+                    corners: None,
+                },
+            );
+            s.fill = tracedraw_core::Fill::Solid(tracedraw_core::Color::rgb8(10, 20, 30));
+            s.stroke = None;
+            s
+        };
+        let far: Vec<Shape> = (0..1000)
+            .map(|i| rect_shape(100 + i, Rect::new(500.0, 500.0, 510.0, 510.0)))
+            .collect();
+        let mut wide = rect_shape(5000, Rect::new(20.0, 65.0, 80.0, 90.0));
+        wide.stroke = Some(tracedraw_core::Stroke::new(tracedraw_core::Color::BLACK, 20.0));
+        let mut doc = Document::new("t", tracedraw_core::geometry::Size::new(200.0, 120.0));
+        let page = doc.pages[0].id;
+        let layer = doc.pages[0].layers[0].id;
+        if let Ok(l) = doc.layer_mut(layer) {
+            l.shapes.push(group(1, far));
+            l.shapes.push(group(2, vec![wide]));
+        }
+        // The bottom half of the page: the wide outline reaches 10 mm
+        // under its rectangle, into it; its group's box does not.
+        let opts = RenderOptions {
+            width: 200,
+            height: 60,
+            view: ViewTransform {
+                zoom: 1.0,
+                origin_x: 0.0,
+                origin_y: 60.0,
+                stretch_y: 1.0,
+            },
+            ..RenderOptions::default()
+        };
+        let boxes = page_bounds_cache(&doc, page);
+        assert!(boxes.reach.contains_key(&tracedraw_core::ShapeId(1)));
+        SIGHT_TESTS.with(|n| n.set(0));
+        let band = render_page_whole_in(&doc, page, &opts, None, Some(&boxes)).expect("drawn");
+        let asked = SIGHT_TESTS.with(|n| n.get());
+        assert!(asked < 10, "the far group's objects were asked about: {asked}");
+        let ink = band.data().chunks(4).filter(|p| p[3] > 0).count();
+        assert!(ink > 0, "the wide outline reaches into the band");
+        let whole = render_page_whole_in(&doc, page, &opts, None, None).expect("drawn");
+        assert_eq!(band.data(), whole.data(), "the same picture as without the boxes");
     }
 
     /// The same inside a group, nested twice, and an ordinary 16 mm

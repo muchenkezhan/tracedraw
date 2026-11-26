@@ -76,6 +76,7 @@ mod documents;
 mod drawing_scale;
 mod drop_files;
 mod draw_inside;
+mod outline_presets;
 mod rotate_lines;
 mod grid_handles;
 mod drag_copies;
@@ -97,11 +98,16 @@ mod file_presence;
 mod files;
 mod fill_page;
 mod shape3d;
+mod dialog_preview;
 mod shape_gen;
+mod shape_gen_bg;
 mod shape_gen_cells;
 mod shape_gen_curves;
 mod shape_gen_fill;
+mod shape_gen_growth;
 mod shape_gen_slice;
+mod shape_gen_tool;
+mod shape_gen_warp;
 mod fill_tool;
 mod pattern_fill_tool;
 mod fit_live;
@@ -112,6 +118,8 @@ mod formula;
 mod font_folder;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_stats;
+#[cfg(not(target_arch = "wasm32"))]
+mod hang_watch;
 mod frame_gen;
 mod frame_type;
 mod fx;
@@ -125,6 +133,10 @@ mod gradient_presets;
 mod grammar;
 mod guides;
 mod help;
+#[cfg(test)]
+mod help_scene_list;
+#[cfg(test)]
+mod help_scenes;
 #[cfg(test)]
 mod help_shots;
 mod hunspell;
@@ -158,6 +170,8 @@ mod media;
 mod mesh_tool;
 mod color_points;
 mod text_curve;
+mod text_height;
+mod blur_bar;
 mod trace_sketch;
 mod mixed;
 #[cfg(test)]
@@ -173,6 +187,8 @@ mod offset_shadow_handle;
 mod ops;
 mod ops2;
 mod opening;
+mod saving;
+mod exporting;
 mod package;
 mod page_drop;
 mod page_names;
@@ -189,17 +205,29 @@ mod cut_tools;
 mod pick_drag_tests;
 mod picture_mosaic;
 mod picture_plates;
+mod pixel_adjust;
 mod pixel_edit;
 mod pixel_edit_app;
+mod pixel_keep;
 mod pixel_light;
+mod pixel_liquify;
+mod pixel_ops;
+mod pixel_paint;
+mod pixel_spray;
+mod pixel_surface;
+mod pixel_view;
+mod pixel_warp;
 mod placeholder;
 mod plugins;
 mod pmd_open;
 mod preflight;
 mod prefs;
 mod print_merge;
+#[cfg(all(unix, not(any(target_arch = "wasm32", target_os = "android"))))]
+mod printer_query;
 mod printers;
 mod qr;
+mod quick_commands;
 mod raster;
 mod recognize;
 mod recovery;
@@ -248,8 +276,11 @@ mod system_prefs;
 #[cfg(any(target_os = "macos", test))]
 mod system_quit;
 mod tab_ruler;
+mod spreadsheet_editor;
 mod spreadsheet_import;
 mod table;
+mod table_clipboard;
+mod table_external;
 mod table_tool;
 mod templates;
 mod text_editing;
@@ -301,6 +332,7 @@ mod variable_outline;
 mod symbol_scatter;
 mod vector_mosaic;
 mod view;
+mod view_steps;
 mod view_motion;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_copy;
@@ -437,6 +469,8 @@ pub fn run() -> eframe::Result<()> {
         mcp_link::bridge();
         return Ok(());
     }
+    // A step that takes long is noted in a file; a crash is offered.
+    hang_watch::start();
     // `tracedraw --x11`: the window opens through X11 (XWayland on a
     // Wayland desktop), where a graphics tablet's pen moves the pointer
     // (#850). The patched windowing layer reads a pen on Wayland too
@@ -856,6 +890,13 @@ impl Shell {
         }
         let frame = self.check_frames;
         self.check_frames += 1;
+        if frame == 0 && gpu::gl_drawn_before() {
+            // Read back drawn by an earlier start on this computer: a dark
+            // first frame now is a drawing still loading, not the driver
+            // (#4236).
+            self.renderer_check = RendererCheck::Done;
+            return;
+        }
         match self.renderer_check {
             RendererCheck::Done => return,
             RendererCheck::At(at) => {
@@ -898,6 +939,7 @@ impl Shell {
         if !gpu::renderer_blind(&image, probe) {
             self.renderer_check = RendererCheck::Done;
             log::info!("the window ({w} x {h} px) read back drawn");
+            gpu::note_gl_drawn();
             return;
         }
         if ctx.input(|i| i.viewport().focused) == Some(false) {
@@ -1015,7 +1057,18 @@ impl eframe::App for Shell {
         // What Android's on-screen keyboard typed (#1309).
         soft_keyboard::take_into(raw_input);
         pen::filter_raw_input(ctx, raw_input);
+        // A text box's right-click menu picked last frame (#3798).
+        ui::text_field_menu::raw_input(raw_input);
         interaction::release_chorded_left(ctx, raw_input);
+        // While a large drawing is written off the interface's thread
+        // nothing typed, clicked or dropped reaches it (#4011).
+        if self
+            .app
+            .as_ref()
+            .is_some_and(|app| app.saving.is_some() || app.exporting.is_some())
+        {
+            saving::hold_input(raw_input);
+        }
         // The screen's safe area on Android (#1917).
         if let Some(app) = self.app.as_ref() {
             ui::screen_margins::apply(ctx, &app.settings, raw_input);
@@ -1044,6 +1097,9 @@ impl eframe::App for Shell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A frame stuck for long is a hang, reported (hang_watch.rs).
+        #[cfg(not(target_arch = "wasm32"))]
+        let _hang_frame = hang_watch::Frame::begin();
         // The start works once a frame reached the screen, not when the
         // window was made (#1999).
         #[cfg(not(target_arch = "wasm32"))]
@@ -1134,9 +1190,10 @@ impl eframe::App for Shell {
         app.tell_storage_refusals();
         app.sync_document_colors();
         // File dialogs that finished in the background (browser build).
-        files::run_finished(app);
+        files::run_finished(app, ui.ctx());
         // Clipboard pictures are read and encoded away from the UI thread.
         app.poll_clipboard_paste();
+        app.take_handed_pastes();
         // Files a later start handed over (one try_recv when none came).
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(inbox) = &mut self.handed_over {
@@ -1160,6 +1217,23 @@ impl eframe::App for Shell {
         if app.poll_font_installs() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // A large drawing being saved off the interface's thread (#4011):
+        // a window closed meanwhile waits for the file.
+        if (app.saving.is_some() || app.exporting.is_some())
+            && ui.ctx().input(|i| i.viewport().close_requested())
+        {
+            app.wait_for_saving();
+            app.wait_for_exporting();
+        }
+        if app.poll_saving() | app.poll_exporting() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // A large file of another format about to be opened: its notice
+        // is on screen before the reading starts.
+        if app.poll_open_notice() {
+            ui.ctx().request_repaint();
         }
         // A large drawing being opened off the interface's thread (#2849).
         if app.poll_opening() {
@@ -1191,11 +1265,16 @@ impl eframe::App for Shell {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
+        // What the program does, for a report of a hang, and a report of
+        // a hang or a crash offered.
+        #[cfg(not(target_arch = "wasm32"))]
+        hang_watch::poll(app);
         frame_mark("before the interface");
         ui::root(app, ui);
         // Keyboard handling captures a browser paste's target before its
         // files are applied, even if their promise finished before this frame.
         app.take_handed_pastes();
+        ui::text_field_menu::show(ui.ctx());
         frame_mark("the dialogs");
         // The frame around the safe area (#1917).
         ui::screen_margins::paint(ui.ctx(), &app.settings);
@@ -1216,6 +1295,9 @@ impl eframe::App for Shell {
         app.refresh_live_fits();
         // Texts set to follow their paths are fitted again (#3571).
         app.refresh_text_follow();
+        // Objects of the facing page selected with the current page's go
+        // back to their page once deselected (#3817).
+        app.return_spread_adopted();
         // The window's state is kept once it has settled; until then it
         // is maximized when it should start so, and checked (#787).
         #[cfg(not(target_arch = "wasm32"))]
@@ -1279,6 +1361,8 @@ impl eframe::App for Shell {
     /// session; drawings left unsaved stay backed up for it.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(app) = self.app.as_mut() {
+            app.wait_for_saving();
+            app.wait_for_exporting();
             app.save_settings();
             app.leave_session();
             // Restart after an update: the new version starts last, when

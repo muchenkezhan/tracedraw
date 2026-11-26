@@ -495,6 +495,13 @@ fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> 
     })
 }
 
+/// [`with_clipboard`] for the other parts of the app (a table's cells as
+/// HTML, #4146).
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+pub(crate) fn with_system_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> {
+    with_clipboard(f)
+}
+
 /// Whether the clipboard offers text and a list of files, where
 /// TraceDraw reads its list of types before the clipboard library reads
 /// it (an X11 desktop: no `WAYLAND_DISPLAY`); `None` elsewhere, where the
@@ -724,7 +731,7 @@ fn without_line_end(path: std::path::PathBuf) -> std::path::PathBuf {
 /// The resolution of the picture a copy offers (#2288): 150 dpi, less
 /// for a selection so large that its longer side would pass 4000 pixels.
 #[cfg_attr(
-    not(all(unix, not(any(target_os = "macos", target_os = "android")))),
+    not(all(unix, not(target_os = "android"))),
     allow(dead_code)
 )]
 fn copy_picture_dpi(width_mm: f64, height_mm: f64) -> f64 {
@@ -891,8 +898,45 @@ impl App {
             return;
         };
         self.copy();
+        // A table alone: its cells as tab-separated text and an HTML
+        // table, for spreadsheet apps (#4146).
+        if let Some(id) = self.lone_selected_table() {
+            if let Some(tsv) = self.copy_table_cells_to_system(id, &[]) {
+                self.mark_system_clipboard(Some(tsv.as_str()));
+                return;
+            }
+        }
+        // macOS: the drawing as a picture, which other programs paste as
+        // the drawing; its SVG source went as text alone, and a mail, a
+        // chat or a note pasted that markup (#4170). The copy kept here
+        // still pastes here as objects.
+        #[cfg(target_os = "macos")]
+        if self.offer_picture_copy() {
+            self.mark_system_clipboard(None);
+            return;
+        }
         let written = self.offer_copy(&svg) || write_text(&svg);
         self.mark_system_clipboard(written.then_some(svg.as_str()));
+    }
+
+    /// The selection drawn as a picture on the system clipboard, on a
+    /// transparent ground at [`copy_picture_dpi`]; whether it went there.
+    #[cfg(target_os = "macos")]
+    fn offer_picture_copy(&self) -> bool {
+        let Some(bounds) = self.selection_bounds() else {
+            return false;
+        };
+        let Some(alone) = self.selection_alone(bounds) else {
+            return false;
+        };
+        let dpi = copy_picture_dpi(bounds.width(), bounds.height());
+        let Some((png, _, _)) = crate::ops2::render_alone_png(&alone, dpi, true, true) else {
+            return false;
+        };
+        let Ok(img) = image::load_from_memory(&png) else {
+            return false;
+        };
+        write_image(img.to_rgba8())
     }
 
     /// Offer the copy `svg` to other programs as SVG, as a picture and as
@@ -961,8 +1005,9 @@ impl App {
 
     /// What the drawing window shows of the current page and the desktop
     /// around it, as a picture at the screen's size (one pixel a screen
-    /// point), white where nothing is drawn: for Edit > Copy Visible
-    /// Area (#3527). `None` before the window has a size.
+    /// point): the page white as paper and the desktop in the colour the
+    /// window shows round it, a dark theme's grey too (#4027), for Edit >
+    /// Copy Visible Area (#3527). `None` before the window has a size.
     pub fn visible_area_image(&self) -> Option<image::RgbaImage> {
         let r = self.canvas_rect;
         if !(r.width() >= 1.0 && r.height() >= 1.0) || !r.is_finite() {
@@ -970,7 +1015,8 @@ impl App {
         }
         let area = self.view.visible_page_rect(r);
         let dpi = r.width() as f64 / area.width().max(1e-9) * 25.4;
-        let pm = tracedraw_render::render_area_image(self.doc(), self.page, area, dpi)?;
+        let [r, g, b, _] = self.desktop_color().to_array();
+        let pm = tracedraw_render::render_area_image_on_desk(self.doc(), self.page, area, dpi, Some([r, g, b]))?;
         let mut img = image::RgbaImage::new(pm.width(), pm.height());
         for (px, out) in pm.pixels().iter().zip(img.pixels_mut()) {
             let c = px.demultiply();
@@ -983,6 +1029,7 @@ impl App {
     /// as a picture on the system clipboard, for a chat or a mail; the
     /// copy kept here for Paste stays as it was.
     pub fn copy_visible_area(&mut self) {
+        self.note_view_step(crate::view_steps::ViewStep::CopyVisibleArea);
         let Some(img) = self.visible_area_image() else {
             return;
         };
@@ -1632,13 +1679,25 @@ impl App {
         } else if let Some(img) = content.image {
             self.paste_as_bitmap(img);
         } else if let Some(t) = content.text {
-            self.paste_as_text(&t);
+            self.paste_as_text_or_table(&t);
+        }
+    }
+
+    /// Text pasted on the page: cells copied in a spreadsheet app (rows
+    /// of tab-separated cells) come as a table (#4146), other text as a
+    /// text.
+    pub fn paste_as_text_or_table(&mut self, text: &str) {
+        if crate::table_clipboard::looks_tabular(text) {
+            let rows = crate::table_clipboard::parse_tsv(text);
+            self.paste_rows_as_table(&rows);
+        } else {
+            self.paste_as_text(text);
         }
     }
 
     // ----- external bitmap editing -------------------------------------------------
 
-    fn bitmap_link(&self, id: ShapeId) -> Option<String> {
+    pub(crate) fn bitmap_link(&self, id: ShapeId) -> Option<String> {
         self.doc()
             .find_shape(id)?
             .data
@@ -1761,7 +1820,8 @@ impl App {
     }
 
     /// Image > Edit Bitmap: write the picture to a file next to the
-    /// system's temporary files (a CMYK TIFF for a CMYK picture, a Lab
+    /// system's temporary files, or in a portable copy's own folder (a
+    /// CMYK TIFF for a CMYK picture, a Lab
     /// TIFF for a Lab one, else a PNG), link the object to it and open the system editor (on
     /// Android, an editing app through "open with").
     pub fn edit_bitmap_externally(&mut self) {
@@ -1776,7 +1836,11 @@ impl App {
         let Some(s) = self.doc().find_shape(id).cloned() else {
             return;
         };
-        let dir = std::env::temp_dir().join("tracedraw-edit");
+        // A portable copy keeps them in its own folder (#3908).
+        #[cfg(not(target_arch = "wasm32"))]
+        let dir = crate::settings::work_dir("tracedraw-edit");
+        #[cfg(target_arch = "wasm32")]
+        let dir = std::path::PathBuf::from("tracedraw-edit");
         let path = match self.write_bitmap_for_editing(id, &dir) {
             Ok(p) => p,
             Err(e) => {
@@ -1809,6 +1873,26 @@ impl App {
             Ok(()) => self.status = tr("status.bitmap_sent_to_editor"),
             Err(e) => self.status = e,
         }
+    }
+
+    /// Image > Edit Bitmap With (#4273): pick the image editor's program
+    /// file, keep it as the program Edit Bitmap uses (Options > Global
+    /// shows it), and open the picture in it. Saving there updates the
+    /// picture here (see [`App::watch_linked_bitmaps`]).
+    pub fn edit_bitmap_with(&mut self) {
+        if crate::files::WEB || cfg!(target_os = "android") || self.selected_bitmap().is_none() {
+            return;
+        }
+        crate::files::Dialog::new()
+            .set_title(tr("menu.bitmaps.edit_bitmap_with"))
+            .pick_file(self, |app, path| app.edit_bitmap_in(&path));
+    }
+
+    /// Keep `program` as the image editor and open the selected picture
+    /// in it (Edit Bitmap With, once the program is picked).
+    pub fn edit_bitmap_in(&mut self, program: &std::path::Path) {
+        self.settings.bitmap_editor = program.display().to_string();
+        self.edit_bitmap_externally();
     }
 
     /// Image > Replace Image (#2598): a picture file picked takes the place
@@ -1974,7 +2058,10 @@ impl App {
             let since = now.duration_since(last);
             if since < gap {
                 if let Some(ctx) = ctx {
-                    if !self.linked_mtimes.is_empty() || !self.object_files.is_empty() {
+                    if !self.linked_mtimes.is_empty()
+                        || !self.object_files.is_empty()
+                        || !self.table_files.is_empty()
+                    {
                         ctx.request_repaint_after(gap - since);
                     }
                 }
@@ -1985,6 +2072,8 @@ impl App {
         // Insert What It Saves (#3391): a picture saved for the first
         // time comes in, linked, and follows its file from then on.
         self.watch_object_files();
+        // A table's workbook saved in the spreadsheet program (#4145).
+        self.watch_table_files();
         let linked: Vec<(ShapeId, String)> = self
             .doc()
             .all_layers()
@@ -2100,6 +2189,24 @@ mod tests {
         assert!(img.pixels().any(|p| p.0[3] == 255 && p.0[0] < 20), "the rectangle shows");
         app.canvas_rect = egui::Rect::NOTHING;
         assert!(app.visible_area_image().is_none());
+    }
+
+    /// Copy Visible Area keeps the colour round the page (#4027): a dark
+    /// desktop stays dark in the picture, the page white as paper.
+    #[test]
+    fn the_visible_area_keeps_the_desktop_colour() {
+        let mut app = App::headless();
+        app.settings.desktop_rgb = [61, 61, 61];
+        app.settings.desktop_custom = true;
+        app.canvas_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let page = app.page_rect();
+        // The page in the middle, small: desktop all round it.
+        app.view.fit(page.inflate(page.width(), page.height()), app.canvas_rect);
+        let img = app.visible_area_image().expect("a picture");
+        let (w, h) = img.dimensions();
+        assert_eq!(img.get_pixel(1, 1).0, [61, 61, 61, 255], "the desktop");
+        assert_eq!(img.get_pixel(w - 2, h - 2).0, [61, 61, 61, 255], "the desktop");
+        assert_eq!(img.get_pixel(w / 2, h / 2).0, [255, 255, 255, 255], "the paper");
     }
 
     /// Text another program copied pastes as one step to undo: the text,

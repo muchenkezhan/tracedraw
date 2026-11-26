@@ -206,9 +206,14 @@ impl App {
 
     /// Layout of a text object and the transform from layout space to the
     /// page (the shape's transform after the origin or frame shift).
-    pub fn text_layout_of(&self, id: ShapeId) -> Option<(TextLayout, Affine)> {
+    pub fn text_layout_of(&self, id: ShapeId) -> Option<(std::sync::Arc<TextLayout>, Affine)> {
         let s = self.doc().find_shape(id)?;
-        layout_of_text_shape(s, Affine::IDENTITY)
+        // A text in a group or a clip frame is laid out where the groups
+        // around it show it: with the identity, the caret, the click and
+        // the selection of a text in a moved group sat where the group's
+        // own space had the letters, far from them (#4015, #4037).
+        let parent = self.doc().parent_transform(id).unwrap_or(Affine::IDENTITY);
+        layout_of_text_shape(s, parent)
     }
 
     /// The text objects Vertical Text acts on: the selected ones and the
@@ -1264,6 +1269,27 @@ impl App {
         })
     }
 
+    /// The selected characters get their outline's width in mm, keeping
+    /// its colour (the object's outline supplies one when the span has
+    /// none). Width 0 takes the outline off these characters.
+    pub fn text_apply_outline_width(&mut self, width: f64) -> bool {
+        let base = self
+            .text_edit
+            .as_ref()
+            .and_then(|te| self.doc().find_shape(te.shape))
+            .and_then(|s| s.stroke.clone());
+        self.text_style_selection("Character Outline", move |sp| {
+            let mut st = sp
+                .outline
+                .clone()
+                .filter(|o| o.width > 0.0)
+                .or_else(|| base.clone())
+                .unwrap_or_default();
+            st.width = width.max(0.0);
+            sp.outline = Some(st);
+        })
+    }
+
     /// The span the property bar shows while editing: the one of the
     /// character before the caret (the first span at the start).
     pub fn text_span_at_caret(&self) -> Option<TextSpan> {
@@ -1384,11 +1410,14 @@ impl App {
 }
 
 /// Layout of a text shape (any `ShapeKind::Text`, placed under `parent`)
-/// and the transform from layout space to the page.
+/// and the transform from layout space to the page. The layout is the
+/// font system's shared one: the caret, the marks of non-printing
+/// characters and the outline the page draws of the same text in the
+/// same state are laid out once (#4172).
 pub fn layout_of_text_shape(
     s: &tracedraw_core::Shape,
     parent: Affine,
-) -> Option<(TextLayout, Affine)> {
+) -> Option<(std::sync::Arc<TextLayout>, Affine)> {
     let ShapeKind::Text {
         spans,
         origin,
@@ -1400,7 +1429,7 @@ pub fn layout_of_text_shape(
     else {
         return None;
     };
-    let layout = tracedraw_text::fonts().layout(&TextRequest {
+    let layout = tracedraw_text::fonts().layout_shared(&TextRequest {
         spans,
         frame: *frame,
         align: *align,
@@ -1730,6 +1759,7 @@ mod tests {
                 handles: vec![],
                 corners: vec![],
                 mapping: Default::default(),
+                reference: None,
             }],
         });
         // The place of the sixth letter as laid out, and where the
@@ -2338,6 +2368,42 @@ mod tests {
     }
 
     #[test]
+    fn an_outline_width_picked_with_characters_selected_keeps_their_colour() {
+        let mut app = text_with_cd_selected();
+        let blue = Color::rgb8(0, 0, 255);
+        app.apply_outline_color(Some(blue));
+        assert!(app.text_apply_outline_width(0.5));
+        let spans = app.edit_spans().expect("spans");
+        let outline = spans[1].outline.clone().expect("outline");
+        assert!((outline.width - 0.5).abs() < 1e-6, "{:?}", outline);
+        assert_eq!(outline.color, blue);
+        assert!(spans[0].outline.is_none() && spans[2].outline.is_none());
+        assert_eq!(app.engine.undo_label(), Some("Character Outline"));
+        // Width zero takes the outline off the selected characters.
+        assert!(app.text_apply_outline_width(0.0));
+        let spans = app.edit_spans().expect("spans");
+        assert_eq!(spans[1].outline.as_ref().map(|o| o.width), Some(0.0));
+    }
+
+    #[test]
+    fn apply_outline_width_routes_to_text_selection_when_active() {
+        let mut app = text_with_cd_selected();
+        assert!(app.text_selection_active());
+        let blue = Color::rgb8(0, 0, 255);
+        app.apply_outline_color(Some(blue));
+        app.apply_outline_width(0.75);
+        let spans = app.edit_spans().expect("spans");
+        let outline = spans[1].outline.clone().expect("outline");
+        assert!((outline.width - 0.75).abs() < 1e-6, "{:?}", outline);
+        assert_eq!(outline.color, blue);
+        assert!(spans[0].outline.is_none() && spans[2].outline.is_none());
+        assert_eq!(app.engine.undo_label(), Some("Character Outline"));
+        app.apply_outline_width(0.0);
+        let spans = app.edit_spans().expect("spans");
+        assert_eq!(spans[1].outline.as_ref().map(|o| o.width), Some(0.0));
+    }
+
+    #[test]
     fn a_colour_picked_with_characters_selected_colours_only_them() {
         let mut app = text_with_cd_selected();
         let object_fill = edited_shape(&app).fill.clone();
@@ -2456,6 +2522,63 @@ mod tests {
         assert_eq!(app.vertical_columns(), None);
         app.set_vertical_text(true);
         assert_eq!(app.vertical_columns(), Some(C::LeftToRight));
+    }
+
+    /// A text in a moved group (#4015, #4037): the caret sits on its
+    /// letters where the group shows them, and a click on a letter puts
+    /// the caret there.
+    #[test]
+    fn a_text_in_a_moved_group_takes_the_caret_on_its_letters() {
+        use tracedraw_core::geometry::{Shape as _, Vec2};
+        let mut app = App::headless();
+        let id = app
+            .new_shape(ShapeKind::Text {
+                spans: vec![TextSpan::new("abcdef", "Selawik", 24.0)],
+                origin: Point::new(50.0, 100.0),
+                frame: None,
+                align: Default::default(),
+                para: Default::default(),
+                on_path: None,
+            })
+            .expect("a layer");
+        let other = app
+            .new_shape(ShapeKind::Rect {
+                rect: tracedraw_core::geometry::Rect::new(10.0, 10.0, 20.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("a layer");
+        app.select(vec![id, other]);
+        app.group_selection();
+        app.nudge(Vec2::new(200.0, 150.0));
+        app.begin_text_edit(id);
+        let Some((layout, to_page)) = app.text_layout_of(id) else {
+            panic!("a layout");
+        };
+        if layout.glyphs == 0 {
+            return;
+        }
+        let ink = to_page.transform_rect_bbox(layout.path.bounding_box());
+        let shown = app
+            .doc()
+            .shape_on_page(id)
+            .expect("on the page")
+            .page_path()
+            .bounding_box();
+        assert!(
+            (ink.center() - shown.center()).hypot() < 20.0,
+            "{ink:?} {shown:?}"
+        );
+        // The caret after "abc" by a click between the third and fourth
+        // letters, as they show.
+        let line = &layout.lines[0];
+        let x = (line.ends[2] + line.starts[3]) / 2.0;
+        let y = (layout.path.bounding_box().y0 + layout.path.bounding_box().y1) / 2.0;
+        let click = to_page * Point::new(x, y);
+        assert!(shown.inflate(2.0, 2.0).contains(click), "{click:?} {shown:?}");
+        assert_eq!(app.text_hit_char(click), Some(3));
+        let (top, _, _) = app.text_caret_geometry().expect("caret");
+        assert!(shown.inflate(30.0, 30.0).contains(top), "{top:?} {shown:?}");
     }
 
     /// Vertical text (#257): the caret is a bar across the column, the
@@ -2810,6 +2933,221 @@ mod tests {
             Some(('c', Some(Fill::Solid(Color::rgb8(255, 0, 0)))))
         );
     }
+
+    /// #3904: typing into a new text on the canvas keeps the already-rendered
+    /// page texture untouched across keystrokes (zero full-page renders) while
+    /// updating only the edited text overlay, and falls back to full-page
+    /// rendering when another visible object lies over the text.
+    #[test]
+    fn typing_renders_text_overlay_without_rerendering_the_page() {
+        if !fonts_available() {
+            return;
+        }
+        let mut app = App::headless();
+        app.settings.autocorrect.enabled = false;
+        let bg = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(5.0, 5.0, 180.0, 180.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("backdrop shape");
+        app.run(Command::SetFill {
+            shapes: vec![bg],
+            fill: Fill::Solid(Color::rgb8(220, 230, 240)),
+        });
+        let ctx = crate::theme::ui_context();
+        let draw_frame = |app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+            out.textures_delta.clear();
+        };
+        app.zoom_to_page();
+        draw_frame(&mut app);
+        let page_renders_before = app.raster.borrow().render_count();
+        assert!(page_renders_before >= 1);
+
+        app.start_text(Point::new(30.0, 100.0), None);
+        for ch in ["H", "e", "l", "l", "o"] {
+            app.text_insert(ch);
+            draw_frame(&mut app);
+            assert_eq!(
+                app.raster.borrow().render_count(),
+                page_renders_before,
+                "typing '{ch}' must not re-render the full page"
+            );
+        }
+        let overlay_renders = app.text_edit_overlay.borrow().overlay_renders;
+        assert!(overlay_renders >= 1, "the text overlay rendered");
+
+        // Caret-only movement reuses the cached text overlay without rendering again.
+        app.text_move(CaretMove::Left, false);
+        draw_frame(&mut app);
+        assert_eq!(
+            app.text_edit_overlay.borrow().overlay_renders,
+            overlay_renders
+        );
+        let text_id = app.text_edit.as_ref().expect("editing").shape;
+        app.finish_text();
+
+        // Placing a visible shape over the text disables the overlay fast path.
+        let text_box = app.doc().find_shape(text_id).expect("text").bounds();
+        app.new_shape(ShapeKind::Rect {
+            rect: text_box.inflate(2.0, 2.0),
+            radius: 0.0,
+            corners: None,
+        })
+        .expect("cover");
+        draw_frame(&mut app);
+        app.begin_text_edit(text_id);
+        app.text_insert("!");
+        draw_frame(&mut app);
+        assert!(
+            app.text_edit_overlay.borrow().session.is_none(),
+            "covered text falls back to full-page rendering"
+        );
+    }
+
+    /// A window frame for the overlay tests.
+    fn overlay_frame(ctx: &egui::Context, app: &mut App) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| crate::ui::root(app, ui));
+        out.textures_delta.clear();
+    }
+
+    /// A text typed on the page and finished, over a coloured backdrop.
+    fn finished_text_over_backdrop(app: &mut App, ctx: &egui::Context) -> (ShapeId, ShapeId) {
+        app.settings.autocorrect.enabled = false;
+        let bg = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(5.0, 5.0, 180.0, 180.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("backdrop shape");
+        app.run(Command::SetFill {
+            shapes: vec![bg],
+            fill: Fill::Solid(Color::rgb8(220, 230, 240)),
+        });
+        app.zoom_to_page();
+        overlay_frame(ctx, app);
+        app.start_text(Point::new(30.0, 100.0), None);
+        app.text_insert("Hello");
+        let text = app.text_edit.as_ref().expect("editing").shape;
+        app.finish_text();
+        overlay_frame(ctx, app);
+        (bg, text)
+    }
+
+    /// #4156: a text inside a group (a button, a card) is typed in with
+    /// the overlay too, placed where its group puts it; the page is not
+    /// drawn again for each letter.
+    #[test]
+    fn grouped_text_is_typed_with_the_overlay() {
+        if !fonts_available() {
+            return;
+        }
+        let mut app = App::headless();
+        let ctx = crate::theme::ui_context();
+        let (bg, text) = finished_text_over_backdrop(&mut app, &ctx);
+        app.select(vec![bg, text]);
+        app.group_selection();
+        let group = app.selection.first().copied().expect("group");
+        assert_ne!(group, text);
+        // The group moved: the text is drawn and padded where it shows.
+        app.run(Command::TransformShapes {
+            shapes: vec![group],
+            transform: Affine::translate((7.0, -4.0)),
+        });
+        overlay_frame(&ctx, &mut app);
+        app.begin_text_edit(text);
+        overlay_frame(&ctx, &mut app);
+        // The page without the text, once.
+        overlay_frame(&ctx, &mut app);
+        let renders = app.raster.borrow().render_count();
+        for ch in ["!", "?"] {
+            app.text_insert(ch);
+            overlay_frame(&ctx, &mut app);
+            assert!(
+                app.text_edit_overlay.borrow().session.is_some(),
+                "typing '{ch}' in a grouped text keeps the overlay"
+            );
+            assert_eq!(
+                app.raster.borrow().render_count(),
+                renders,
+                "typing '{ch}' must not re-render the full page"
+            );
+        }
+        assert!(app.text_edit_overlay.borrow().overlay_renders >= 1);
+        let ov = app.text_edit_overlay.borrow();
+        let region = ov
+            .session
+            .as_ref()
+            .and_then(|s| s.checked_rev)
+            .and_then(|(_, r)| r)
+            .expect("the text's box");
+        let placed = app.doc().shape_on_page(text).expect("text").bounds();
+        assert!(
+            region.contains(placed.center()),
+            "the box is where the group puts the text: {region:?} {placed:?}"
+        );
+        drop(ov);
+        // Inside a group that is see-through, the overlay steps aside.
+        app.finish_text();
+        app.run(Command::SetOpacity {
+            shapes: vec![group],
+            opacity: 0.5,
+        });
+        overlay_frame(&ctx, &mut app);
+        app.begin_text_edit(text);
+        app.text_insert("x");
+        overlay_frame(&ctx, &mut app);
+        assert!(app.text_edit_overlay.borrow().session.is_none());
+    }
+
+    /// #4156: typing in a text already on the page shows the letters at
+    /// once, while the page without the text is still being drawn: the
+    /// overlay is drawn with what lies in its box, over the old letters.
+    #[test]
+    fn existing_text_shows_typing_before_the_page_without_it_is_drawn() {
+        if !fonts_available() {
+            return;
+        }
+        let mut app = App::headless();
+        let ctx = crate::theme::ui_context();
+        let (_, text) = finished_text_over_backdrop(&mut app, &ctx);
+        let hold = std::sync::Arc::new(std::sync::Mutex::new(()));
+        app.raster.borrow_mut().hold_renders(hold.clone());
+        let held = hold.lock().expect("hold");
+        app.begin_text_edit(text);
+        overlay_frame(&ctx, &mut app);
+        app.text_insert("!");
+        overlay_frame(&ctx, &mut app);
+        {
+            let ov = app.text_edit_overlay.borrow();
+            let sess = ov.session.as_ref().expect("an overlay session");
+            assert_ne!(
+                app.raster.borrow().shown_revision(),
+                Some(sess.bg_revision),
+                "the page without the text is still on its way"
+            );
+            let c = ov.cached.as_ref().expect("the typed text is drawn at once");
+            assert!(c.key.interim, "drawn with all in its box");
+        }
+        drop(held);
+    }
 }
 
 /// The first letter of `text` is of a script written from right to left
@@ -2822,4 +3160,564 @@ pub fn starts_right_to_left(text: &str) -> bool {
             0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF
         )
     })
+}
+
+/// Tag bit XORed into the revision given to `app.raster` when rendering a
+/// background copy of the page with an edited existing text hidden (#3904).
+const TEXT_EDIT_BG_TAG: u64 = 1u64 << 59;
+
+/// Keeps the rest of the page cached in `app.raster` while a plain text
+/// object is edited on the canvas, rendering only the edited text shape
+/// (`focus` at `0.0` visibility) into a small transparent overlay texture in
+/// the same frame as the caret (#3904).
+#[derive(Default)]
+pub struct TextEditOverlay {
+    session: Option<OverlaySession>,
+    cached: Option<CachedOverlay>,
+    #[cfg(test)]
+    overlay_renders: u64,
+}
+
+struct OverlaySession {
+    instance: u64,
+    page: tracedraw_core::PageId,
+    shape: ShapeId,
+    initial_rev: u64,
+    bg_revision: u64,
+    fresh: bool,
+    above_boxes: Vec<Rect>,
+    hidden_doc: Option<std::sync::Arc<tracedraw_core::Document>>,
+    checked_rev: Option<(u64, Option<Rect>)>,
+    /// Where the text stood when the session began (`None` once known
+    /// to be empty or not known yet): the picture shown until the page
+    /// without the text is drawn still has its letters there (#4156).
+    first_region: Option<Option<Rect>>,
+}
+
+#[derive(PartialEq, Clone)]
+struct OverlayKey {
+    instance: u64,
+    shape: ShapeId,
+    revision: u64,
+    page: tracedraw_core::PageId,
+    zoom_bits: u64,
+    origin_bits: (u64, u64),
+    size: (u32, u32),
+    complex_effects: bool,
+    /// Drawn with everything else in its box, over the paper, while the
+    /// page without the text is not drawn yet (#4156).
+    interim: bool,
+}
+
+struct CachedOverlay {
+    key: OverlayKey,
+    texture: egui::TextureHandle,
+    page_rect: Rect,
+    bg_revision: u64,
+}
+
+impl TextEditOverlay {
+    /// Drop the active typing session, keeping `cached` so the finished text
+    /// stays visible over `bg_revision` until the final background render of
+    /// the page catches up.
+    pub fn suspend(&mut self) {
+        self.session = None;
+    }
+}
+
+fn shape_links_blend_to(s: &tracedraw_core::Shape, id: ShapeId) -> bool {
+    if s.effects.iter().any(|e| {
+        matches!(
+            e,
+            tracedraw_core::live::Effect::Blend {
+                end_id: Some(end),
+                ..
+            } if *end == id
+        )
+    }) {
+        return true;
+    }
+    match &s.kind {
+        ShapeKind::Group { children } => children.iter().any(|c| shape_links_blend_to(c, id)),
+        ShapeKind::ClipFrame { frame, contents } => {
+            shape_links_blend_to(frame, id) || contents.iter().any(|c| shape_links_blend_to(c, id))
+        }
+        _ => false,
+    }
+}
+
+/// Check that `id` is a shape on a visible layer of `app.page`, at the
+/// top or inside plain groups (#4156), with no blend targeting it,
+/// returning the visual bounds on the page of every visible shape drawn
+/// above `id`: the later objects of each group holding it, then the later
+/// objects of the page.
+fn scan_page_for_text_overlay(app: &App, id: ShapeId) -> Option<Vec<Rect>> {
+    let layers = app.doc().layers_for_page(app.page).ok()?;
+    let mut seen = false;
+    let mut above = Vec::new();
+    for layer in layers {
+        if !layer.visible {
+            continue;
+        }
+        for s in &layer.shapes {
+            if shape_links_blend_to(s, id) {
+                return None;
+            }
+            scan_shape_for_text_overlay(s, Affine::IDENTITY, id, &mut seen, &mut above)?;
+        }
+    }
+    seen.then_some(above)
+}
+
+/// One object of [`scan_page_for_text_overlay`] inside `parent`: the
+/// edited text, an object above it, or a group holding it, whose objects
+/// are looked at in turn. `None` when the text is inside something the
+/// overlay cannot draw it in: a clip frame, or a group whose look (its
+/// transparency, effects, shadow, mask) goes over the text too.
+fn scan_shape_for_text_overlay(
+    s: &tracedraw_core::Shape,
+    parent: Affine,
+    id: ShapeId,
+    seen: &mut bool,
+    above: &mut Vec<Rect>,
+) -> Option<()> {
+    if s.id == id {
+        *seen = true;
+        return Some(());
+    }
+    if *seen {
+        if s.visible {
+            let b = s.visual_bounds();
+            let b = if parent == Affine::IDENTITY {
+                b
+            } else {
+                parent.transform_rect_bbox(b)
+            };
+            if b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite() {
+                above.push(b);
+            }
+        }
+        return Some(());
+    }
+    match &s.kind {
+        ShapeKind::Group { children } if holds_shape(s, id) => {
+            let plain = s.visible
+                && s.opacity >= 1.0
+                && s.effects.is_empty()
+                && s.shadow.is_none()
+                && s.raster_fx.is_none()
+                && s.opacity_mask.is_none()
+                && s.group_look.is_none()
+                && s.scale_grid.is_none()
+                && s.fill_looks.is_none();
+            if !plain {
+                return None;
+            }
+            let inner = parent * s.transform;
+            for c in children {
+                scan_shape_for_text_overlay(c, inner, id, seen, above)?;
+            }
+            Some(())
+        }
+        ShapeKind::ClipFrame { .. } if holds_shape(s, id) => None,
+        _ => Some(()),
+    }
+}
+
+/// `s` holds the object `id`, at any depth.
+fn holds_shape(s: &tracedraw_core::Shape, id: ShapeId) -> bool {
+    match &s.kind {
+        ShapeKind::Group { children } => children.iter().any(|c| c.id == id || holds_shape(c, id)),
+        ShapeKind::ClipFrame { frame, contents } => {
+            frame.id == id
+                || holds_shape(frame, id)
+                || contents.iter().any(|c| c.id == id || holds_shape(c, id))
+        }
+        _ => false,
+    }
+}
+
+fn text_overlay_bounds(s: &tracedraw_core::Shape) -> Option<Rect> {
+    let ShapeKind::Text { spans, .. } = &s.kind else {
+        return None;
+    };
+    let b = s.bounds();
+    if !b.x0.is_finite() || !b.y0.is_finite() || !b.x1.is_finite() || !b.y1.is_finite() {
+        return None;
+    }
+    let c = s.transform.as_coeffs();
+    let scale = c[0].hypot(c[1]).max(c[2].hypot(c[3])).max(1.0);
+    let max_pt = spans
+        .iter()
+        .map(|sp| sp.size_pt)
+        .fold(12.0_f64, f64::max)
+        .clamp(1.0, 2000.0);
+    let font_pad = (max_pt * 25.4 / 72.0) * scale * 0.5;
+    let base_stroke = s.stroke.as_ref().map_or(0.0, |st| st.width);
+    let extra_stroke = s
+        .extra_strokes
+        .iter()
+        .map(|st| st.width)
+        .fold(0.0_f64, f64::max);
+    let span_stroke = spans
+        .iter()
+        .filter_map(|sp| sp.outline.as_ref().map(|st| st.width))
+        .fold(0.0_f64, f64::max);
+    let stroke_pad = base_stroke.max(extra_stroke).max(span_stroke) * scale * 3.0;
+    let pad = (font_pad + stroke_pad + 1.0).clamp(1.0, 500.0);
+    Some(b.inflate(pad, pad))
+}
+
+/// Validate `id`'s own properties for the overlay fast path and compute its
+/// padded bounds (`Some(None)` when empty, `None` when ineligible or covered
+/// by an object in `above_boxes`).
+fn shape_bounds_for_overlay(
+    doc: &tracedraw_core::Document,
+    id: ShapeId,
+    above_boxes: &[Rect],
+) -> Option<Option<Rect>> {
+    // As placed on the page: a text in a group is padded and tested
+    // where the groups around it put it (#4156).
+    let s = &doc.shape_on_page(id)?;
+    let ShapeKind::Text { spans, .. } = &s.kind else {
+        return None;
+    };
+    if !s.visible
+        || !s.effects.is_empty()
+        || s.shadow.is_some()
+        || s.raster_fx.is_some()
+        || s.fill_looks.is_some()
+        || s.opacity_mask.is_some()
+        || s.content_link.is_some()
+        || s.wrap_text
+        || s.toc_level.is_some()
+        || s.toc.is_some()
+        || s.page_number.is_some()
+    {
+        return None;
+    }
+    if spans_char_count(spans) == 0 || s.is_empty_path() {
+        return Some(None);
+    }
+    let padded = text_overlay_bounds(s)?;
+    if above_boxes.iter().any(|b| b.overlaps(padded)) {
+        return None;
+    }
+    Some(Some(padded))
+}
+
+impl App {
+    /// Record a freshly created empty text shape so the canvas reuses the
+    /// already-rendered `clean_rev` page texture beneath it (#3904).
+    pub(crate) fn note_fresh_text_edit(&mut self, id: ShapeId, clean_rev: u64) {
+        let Some(above_boxes) = scan_page_for_text_overlay(self, id) else {
+            self.text_edit_overlay.borrow_mut().suspend();
+            return;
+        };
+        let rev = self.engine.revision();
+        let mut ov = self.text_edit_overlay.borrow_mut();
+        ov.session = Some(OverlaySession {
+            instance: self.engine.instance(),
+            page: self.page,
+            shape: id,
+            initial_rev: rev,
+            bg_revision: clean_rev,
+            fresh: true,
+            above_boxes,
+            hidden_doc: None,
+            checked_rev: Some((rev, None)),
+            first_region: Some(None),
+        });
+        ov.cached = None;
+    }
+
+    /// Prepare the background revision (and lazily a hidden-text document
+    /// snapshot when `app.raster` does not already hold that revision at the
+    /// current view) while an eligible text object is being edited (#3904).
+    pub(crate) fn prepare_edited_text_bg(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+    ) -> Option<(Option<std::sync::Arc<tracedraw_core::Document>>, u64)> {
+        let Some(te) = &self.text_edit else {
+            self.text_edit_overlay.borrow_mut().suspend();
+            return None;
+        };
+        if self.wireframe
+            || self.simulate_overprints
+            || self.proof_colors
+            || self.view_mode == crate::app::ViewMode::Pixels
+            || self.render_focus().is_some()
+            || self.is_linked_frame(te.shape)
+        {
+            self.text_edit_overlay.borrow_mut().suspend();
+            return None;
+        }
+        let instance = self.engine.instance();
+        let rev = self.engine.revision();
+        let need_init = {
+            let ov = self.text_edit_overlay.borrow();
+            !ov.session.as_ref().is_some_and(|s| {
+                s.instance == instance
+                    && s.page == self.page
+                    && s.shape == te.shape
+                    && self.engine.unchanged_except(te.shape, s.initial_rev)
+            })
+        };
+        if need_init {
+            let Some(above_boxes) = scan_page_for_text_overlay(self, te.shape) else {
+                self.text_edit_overlay.borrow_mut().suspend();
+                return None;
+            };
+            let mut ov = self.text_edit_overlay.borrow_mut();
+            ov.session = Some(OverlaySession {
+                instance,
+                page: self.page,
+                shape: te.shape,
+                initial_rev: rev,
+                bg_revision: rev ^ TEXT_EDIT_BG_TAG,
+                fresh: false,
+                above_boxes,
+                hidden_doc: None,
+                checked_rev: None,
+                first_region: None,
+            });
+        }
+        let bg_rev = {
+            let mut ov = self.text_edit_overlay.borrow_mut();
+            let sess = ov.session.as_mut()?;
+            if sess.checked_rev.map(|(r, _)| r) != Some(rev) {
+                match shape_bounds_for_overlay(self.doc(), te.shape, &sess.above_boxes) {
+                    Some(bounds) => {
+                        sess.checked_rev = Some((rev, bounds));
+                        sess.first_region.get_or_insert(bounds);
+                    }
+                    None => {
+                        ov.suspend();
+                        return None;
+                    }
+                }
+            }
+            sess.bg_revision
+        };
+        let ppp = ctx.pixels_per_point();
+        let exact_hit = self.raster.borrow().has_exact_plain_picture(
+            bg_rev,
+            self.page,
+            &self.view,
+            rect,
+            ppp,
+            self.rasterize_complex_effects,
+        );
+        if exact_hit {
+            return Some((None, bg_rev));
+        }
+        let mut ov = self.text_edit_overlay.borrow_mut();
+        let sess = ov.session.as_mut()?;
+        if sess.hidden_doc.is_none() {
+            let mut d = self.doc().clone();
+            let Some(s) = d.find_shape_mut(te.shape) else {
+                ov.suspend();
+                return None;
+            };
+            s.visible = false;
+            sess.hidden_doc = Some(std::sync::Arc::new(d));
+        }
+        Some((sess.hidden_doc.clone(), bg_rev))
+    }
+
+    /// Paint an overlay picture where it belongs. One drawn with all in
+    /// its box goes over the window's background and the paper first,
+    /// covering the letters the page's picture still shows (#4156).
+    fn paint_overlay_texture(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: egui::Rect,
+        c: &CachedOverlay,
+    ) {
+        let uv_full = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
+        let at = self.view.rect_to_screen(c.page_rect);
+        let p = painter.with_clip_rect(canvas_rect);
+        if c.key.interim {
+            if self.symbol_edit_index().is_some() {
+                p.rect_filled(at, 0.0, crate::theme::Tokens::PAGE);
+            } else {
+                p.rect_filled(at, 0.0, self.desktop_color());
+                let paper = at.intersect(self.view.rect_to_screen(self.page_rect()));
+                if paper.is_positive() {
+                    p.rect_filled(paper, 0.0, crate::theme::Tokens::PAGE);
+                }
+            }
+        }
+        p.image(c.texture.id(), at, uv_full, egui::Color32::WHITE);
+    }
+
+    /// Paint the small transparent overlay of the edited text shape over the
+    /// cached page picture, and keep it visible right after editing ends
+    /// until the full-page background render catches up (#3904).
+    pub(crate) fn paint_edited_text_overlay(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: egui::Rect,
+    ) {
+        let shown_rev = self.raster.borrow().shown_revision();
+        let mut ov = self.text_edit_overlay.borrow_mut();
+        let Some(sess) = ov.session.as_ref() else {
+            let keep = !self.wireframe
+                && !self.simulate_overprints
+                && !self.proof_colors
+                && self.view_mode != crate::app::ViewMode::Pixels
+                && self.render_focus().is_none()
+                && ov.cached.as_ref().is_some_and(|c| {
+                    c.key.instance == self.engine.instance()
+                        && c.key.page == self.page
+                        && c.key.revision == self.engine.revision()
+                        && shown_rev == Some(c.bg_revision)
+                });
+            if keep {
+                if let Some(c) = &ov.cached {
+                    self.paint_overlay_texture(painter, canvas_rect, c);
+                }
+            } else {
+                ov.cached = None;
+            }
+            return;
+        };
+        // The page without the text is not drawn yet (it is started when
+        // the editing starts and takes a while on a full page): the text
+        // still shows at once, drawn with what lies under and over it in
+        // its box over the paper, its old letters covered, so typing never
+        // waits for the whole page (#4156).
+        let interim = !sess.fresh && shown_rev != Some(sess.bg_revision);
+        let Some((_, now)) = sess.checked_rev else {
+            ov.cached = None;
+            return;
+        };
+        let first = if interim {
+            sess.first_region.flatten()
+        } else {
+            None
+        };
+        let region = match (now, first) {
+            (Some(a), Some(b)) => a.union(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => {
+                ov.cached = None;
+                return;
+            }
+        };
+        let shape = sess.shape;
+        let bg_revision = sess.bg_revision;
+        let instance = sess.instance;
+        let ppp = painter.ctx().pixels_per_point();
+        let canvas_w = (canvas_rect.width() * ppp).round().max(1.0) as u32;
+        let canvas_h = (canvas_rect.height() * ppp).round().max(1.0) as u32;
+        let vt = tracedraw_render::ViewTransform {
+            zoom: (self.view.zoom * ppp) as f64,
+            origin_x: ((self.view.origin.x - canvas_rect.min.x) * ppp) as f64,
+            origin_y: ((self.view.origin.y - canvas_rect.min.y) * ppp) as f64,
+            stretch_y: 1.0,
+        };
+        if !vt.zoom.is_finite() || vt.zoom <= 0.0 {
+            return;
+        }
+        let x0 =
+            ((vt.zoom * region.x0 + vt.origin_x).floor() - 2.0).clamp(0.0, canvas_w as f64) as u32;
+        let x1 =
+            ((vt.zoom * region.x1 + vt.origin_x).ceil() + 2.0).clamp(0.0, canvas_w as f64) as u32;
+        let y0 =
+            ((vt.origin_y - vt.zoom * region.y1).floor() - 2.0).clamp(0.0, canvas_h as f64) as u32;
+        let y1 =
+            ((vt.origin_y - vt.zoom * region.y0).ceil() + 2.0).clamp(0.0, canvas_h as f64) as u32;
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (sub_w, sub_h) = (x1 - x0, y1 - y0);
+        let sub_vt = tracedraw_render::ViewTransform {
+            zoom: vt.zoom,
+            origin_x: vt.origin_x - x0 as f64,
+            origin_y: vt.origin_y - y0 as f64,
+            stretch_y: 1.0,
+        };
+        let sub_page_rect = Rect::new(
+            (x0 as f64 - vt.origin_x) / vt.zoom,
+            (vt.origin_y - y1 as f64) / vt.zoom,
+            (x1 as f64 - vt.origin_x) / vt.zoom,
+            (vt.origin_y - y0 as f64) / vt.zoom,
+        );
+        let okey = OverlayKey {
+            instance,
+            shape,
+            revision: self.engine.revision(),
+            page: self.page,
+            zoom_bits: vt.zoom.to_bits(),
+            origin_bits: (sub_vt.origin_x.to_bits(), sub_vt.origin_y.to_bits()),
+            size: (sub_w, sub_h),
+            complex_effects: self.rasterize_complex_effects,
+            interim,
+        };
+        if let Some(c) = ov.cached.as_mut() {
+            if c.key == okey {
+                c.bg_revision = bg_revision;
+                let c = &*c;
+                self.paint_overlay_texture(painter, canvas_rect, c);
+                return;
+            }
+        }
+        let opts = tracedraw_render::RenderOptions {
+            width: sub_w,
+            height: sub_h,
+            view: sub_vt,
+            preview: None,
+            wireframe: false,
+            simulate_overprints: false,
+            complex_effects: self.rasterize_complex_effects,
+            anti_alias: true,
+            draft: true,
+            focus: (!interim).then(|| (vec![shape], 0.0)),
+        };
+        let Some(pixmap) = tracedraw_render::render_page(self.doc(), self.page, &opts) else {
+            return;
+        };
+        let (pw, ph) = (pixmap.width() as usize, pixmap.height() as usize);
+        let pixels: Vec<egui::Color32> = pixmap
+            .pixels()
+            .iter()
+            .map(|p| {
+                egui::Color32::from_rgba_premultiplied(p.red(), p.green(), p.blue(), p.alpha())
+            })
+            .collect();
+        let image = egui::ColorImage {
+            size: [pw, ph],
+            source_size: egui::vec2(pw as f32, ph as f32),
+            pixels,
+        };
+        #[cfg(test)]
+        {
+            ov.overlay_renders += 1;
+        }
+        match &mut ov.cached {
+            Some(c) => {
+                c.texture.set(image, egui::TextureOptions::LINEAR);
+                c.key = okey;
+                c.page_rect = sub_page_rect;
+                c.bg_revision = bg_revision;
+            }
+            None => {
+                let texture =
+                    painter
+                        .ctx()
+                        .load_texture("edited-text", image, egui::TextureOptions::LINEAR);
+                ov.cached = Some(CachedOverlay {
+                    key: okey,
+                    texture,
+                    page_rect: sub_page_rect,
+                    bg_revision,
+                });
+            }
+        }
+        if let Some(c) = &ov.cached {
+            self.paint_overlay_texture(painter, canvas_rect, c);
+        }
+    }
 }

@@ -734,6 +734,9 @@ impl App {
         if let Some(on) = c.simulate_overprints {
             self.simulate_overprints = on;
         }
+        for (step, selection) in c.view_steps {
+            self.run_view_step_with(step, &selection);
+        }
     }
 
     /// Answer the message or input box the macro waits for.
@@ -832,7 +835,11 @@ impl App {
                 .iter()
                 .position(|p| name.starts_with(&format!("{}.", p.name())))
                 .unwrap_or(usize::MAX);
-            if name == "Scripts" {
+            if name == "Scripts" && e.number == 0 && e.module.is_empty() {
+                // A JavaScript script's error (#4139).
+                self.scripts_output.push(format!("Error: {}", e.description));
+                self.status = trf("status.script_error", &[("e", &e.description)]);
+            } else if name == "Scripts" {
                 self.scripts_output.push(format!(
                     "Error: Run-time error '{}': {} ({}, line {})",
                     e.number, e.description, e.procedure, e.line
@@ -1196,6 +1203,83 @@ mod tests {
     }
 
     #[test]
+    fn a_javascript_script_asks_with_inputbox_and_prompt() {
+        // #4139: the Scripts panel's JavaScript waits for the input box.
+        let mut app = App::headless();
+        let before = app
+            .doc()
+            .all_layers()
+            .map(|l| l.shapes.len())
+            .sum::<usize>();
+        app.run_script(
+            "const n = InputBox('How many?', 'Grid', '2');\n\
+             const w = prompt('Width', '10');\n\
+             const c = prompt('Cancelled?');\n\
+             for (let i = 0; i < Number(n); i++) ActiveLayer.CreateRectangle(i * 20, 0, Number(w), 5);\n\
+             print('made ' + n + ' ' + w + ' ' + c);",
+        );
+        let mut asked = Vec::new();
+        drive(&mut app, |app| {
+            if let Some(Prompt::InputBox {
+                prompt,
+                title,
+                text,
+            }) = app.macros.prompt.take()
+            {
+                asked.push(format!("{title}: {prompt} [{text}]"));
+                let answer = match asked.len() {
+                    1 => Some("3".to_string()),
+                    2 => Some("15".to_string()),
+                    _ => None,
+                };
+                app.answer_macro(Input::Text(answer));
+            }
+        });
+        assert_eq!(
+            asked,
+            vec![
+                "Grid: How many? [2]".to_string(),
+                ": Width [10]".to_string(),
+                ": Cancelled? []".to_string()
+            ]
+        );
+        assert!(
+            app.scripts_output.iter().any(|l| l == "made 3 15 null"),
+            "{:?}",
+            app.scripts_output
+        );
+        let after = app
+            .doc()
+            .all_layers()
+            .map(|l| l.shapes.len())
+            .sum::<usize>();
+        assert_eq!(after, before + 3);
+        // Where nobody can answer, the default comes back.
+        let out = crate::scripting::run(&mut app, "print(InputBox('n', 't', '7') + prompt('x'))")
+            .unwrap();
+        assert_eq!(out, vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn a_javascript_script_error_after_inputbox_is_shown() {
+        let mut app = App::headless();
+        app.run_script("const n = InputBox('n'); nothing_here();");
+        drive(&mut app, |app| {
+            if app.macros.prompt.take().is_some() {
+                app.answer_macro(Input::Text(Some("1".into())));
+            }
+        });
+        assert!(
+            app.scripts_output
+                .iter()
+                .any(|l| l.starts_with("Error: ") && l.contains("nothing_here")),
+            "{:?}",
+            app.scripts_output
+        );
+        assert!(app.macros.error.is_none());
+    }
+
+    #[test]
     fn a_macro_asks_with_msgbox_and_inputbox_and_draws() {
         let code = "Sub Go()\r\n\
             Dim n As String, r As Long\r\n\
@@ -1483,6 +1567,30 @@ mod tests {
             "{:?}",
             app.scripts_output
         );
+    }
+
+    /// A VBA macro's ActiveWindow.ActiveView.ToFitAllObjects zooms to
+    /// fit what it drew, as View > Zoom To Fit does (#4020).
+    #[test]
+    fn a_macro_zooms_to_fit_what_it_drew() {
+        let code = "Sub Go()\r\n\
+            ActiveDocument.Unit = cdrMillimeter\r\n\
+            ActiveLayer.CreateRectangle2 150, 120, 20, 20\r\n\
+            ActiveWindow.ActiveView.ToFitAllObjects\r\n\
+            End Sub\r\n";
+        let mut app = app_with(project("Fit", code, Vec::new()));
+        app.canvas_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        app.fit_pending = false;
+        app.view.fit(
+            tracedraw_core::geometry::Rect::new(0.0, 0.0, 600.0, 600.0),
+            app.canvas_rect,
+        );
+        let before = app.view.zoom;
+        app.run_macro(0, "Main", "Go");
+        drive(&mut app, |_| {});
+        assert!(app.macros.error.is_none(), "{:?}", app.macros.error);
+        assert!(app.view.zoom > before * 4.0, "{before} {}", app.view.zoom);
     }
 
     #[test]

@@ -254,6 +254,18 @@ scale is the whole drawing's (#3450,
   otherwise, #1753,
   `pick_drag_tests::ctrl_a_with_a_guideline_selected_selects_all_guidelines`).
 
+### Convert to Guidelines
+
+Object > Convert to Guidelines, also in the objects' right-click menu
+under Convert Outline to Object (#3954): each selected unlocked object
+becomes guidelines and is removed, one undo step ("Convert to
+Guidelines"). Each straight side gives one guideline through it
+(horizontal, vertical or angled; sides on one line give one); an object
+with no straight side (a circle, an ellipse, a free curve) gives the
+four edges of its box. A guideline already on the page is not added
+again. With the master page's guidelines chosen they go there
+(`App::convert_to_guides`, `guides::guide_lines_of_path`).
+
 ### Guidelines panel
 
 Show and Snap toggles, Guideline type (horizontal, vertical, angled), the
@@ -290,7 +302,12 @@ default preset guideline colour, and presets added in the preset colour:
   upper left quarter).
 - User defined: margins (top, bottom, left, right), columns (number,
   distance between, set between the margins when those are on), grid
-  (rows, columns).
+  (rows, columns), and bleed (off; top, bottom, left, right, 3 mm each):
+  lines that far outside the page edges (#3916). Margins and bleed each
+  have Mirror: no mirror, top to bottom (the bottom takes the top's
+  value), left to right (the right takes the left's), or all four sides
+  (all take the top's); the fields that follow are greyed
+  (`ui::layout_options::tests::user_defined_bleed_guides_stand_outside_the_page_and_mirror`).
 
 A preset line already present is not added twice.
 

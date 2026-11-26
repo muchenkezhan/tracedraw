@@ -9,9 +9,9 @@ the right.
 
 | Row | Contents |
 |---|---|
-| Page, Master Page | open or close arrow, a sheet (cream for the Master Page), name (in bold for the current page and the Master Page); a click opens or closes it |
+| Page, Master Page, Range Pages | open or close arrow, a sheet (cream for the Master Page), name (in bold for the current page and the shared-layer groups); a click opens or closes it |
 | Layer (light grey), one step in | collapse arrow, eye (show or hide), printer (print and export or not), padlock (lock or unlock), layer icon (its top sheet blue for a page's layers, amber for master layers), name |
-| Active layer | as a layer, on `#D4E6F7` with a 3 px accent bar at the left, name in bold |
+| Active layer | as a layer, on `#D4E6F7` with a 3 px accent bar at the left, name in bold; selected non-active layers are highlighted like selected object rows |
 | Master layer for odd or even pages | as a layer, followed by "Odd pages" or "Even pages" in small grey; dimmed on the pages it does not show on |
 | Master layer in front of the page's layers | as a layer, followed by "In front" in small grey (after "Odd pages" or "Even pages" if it has one); it stays listed under the Master Page (#1132) |
 | Guides | open or close arrow (when it has guidelines), eye (show or hide the guidelines), a pale printer (guidelines never print), padlock (locks or unlocks all of the page's guidelines; shut when they all are) |
@@ -32,6 +32,17 @@ the right.
   one object or takes it out, as in a file list; locked objects stay out
   (#2483,
   `ui::objects_docker::tests::shift_click_selects_a_range_of_rows_and_ctrl_click_one_more`).
+- Layer rows take the same clicks: Ctrl+click (Cmd on a Mac) adds or
+  removes a layer in the layer selection, Shift+click selects the range
+  of layer rows from the last clicked layer, and Ctrl+Shift+click adds
+  that range (#3966,
+  `ui::objects_docker::tests::ctrl_and_shift_clicks_select_multiple_layers`);
+  selected non-active layers are highlighted like selected object rows
+  while the active layer keeps `#D4E6F7`, the 3 px accent bar and the
+  bold name. The eye, the printer, the padlock, Delete, Select the
+  Layer's Objects, Cut, Copy and Move to Master Page or Move to Page
+  then act on all selected layers together in one undo step
+  (`ui::objects_docker::tests::selected_layers_batch_visibility_lock_print_select_and_delete`).
 - With several objects selected, the eye of one of them hides them all
   when it is visible and shows them all when it is hidden, whatever each
   was; they stay selected, and one undo step brings each back as it
@@ -87,6 +98,11 @@ the right.
   middle still takes them into the group, and a locked object, a group
   or an object inside a group takes none
   (`ui::objects_docker::drag_tests::a_row_dropped_in_the_middle_of_another_powerclips_it`).
+- A content's row dragged out of a PowerClip that is not being edited
+  needs no click first: the drop takes the contents out for editing with
+  that object chosen, as a click on its row does, and then drops it, so
+  one drag onto the layer's row or beside an object outside frees it
+  (#4061, `a_content_row_drags_out_of_a_powerclip_without_a_click_first`).
 - Double-click a layer to rename it; double-click an object to name it
   (Rename Object; an empty name goes back to the description).
 - Double-click the page node, or pick Rename in its context menu, to
@@ -178,6 +194,14 @@ the right.
 - Which layers are closed, which groups are open and which page nodes
   and the Master Page node are closed lasts for the session.
 
+## Range pages
+
+The **Range Pages** group contains shared layers limited to named page
+positions, such as `1-8, 12, 15-20`. Its menu and the New Master Layer
+button's menu create a range layer. Layer Properties edits the range.
+See [Page range layers](page-range-layers.md) for page-order rules,
+validation, saving and output behavior.
+
 ## Thumbnails
 
 - Each object row starts with a thumbnail: the object drawn alone by the
@@ -222,6 +246,8 @@ the right.
 - `ui::objects_docker::tests::master_layer_objects_are_picked_where_their_layer_shows`
 - `ui::objects_docker::tests::delete_takes_the_selection_else_the_active_layer`
 - `ui::objects_docker::tests::clicking_an_object_in_the_docker_makes_its_layer_active`
+- `ui::objects_docker::tests::ctrl_and_shift_clicks_select_multiple_layers`
+- `ui::objects_docker::tests::selected_layers_batch_visibility_lock_print_select_and_delete`
 - `ui::objects_docker::tests::the_list_scrolls_to_an_object_selected_on_the_page`
 - `ui::objects_docker::tests::rows_show_thumbnails_drawn_once_per_change`
 - `ui::objects_docker::tests::ctrl_wheel_and_the_bar_change_the_thumbnail_size`

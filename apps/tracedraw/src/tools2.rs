@@ -39,6 +39,54 @@ pub fn spiral_path(rect: Rect, revolutions: u32, logarithmic: bool, expansion: u
     tracedraw_core::geometry::smooth_path(&pts, false)
 }
 
+/// The drawn points of a stroke evened out (#4068): each moved to the
+/// Gaussian-weighted mean of its neighbours along the stroke, `sigma` the
+/// spread in the stroke's length units; the first and last points stay
+/// where they were drawn. The hand's tremor goes, the shape stays.
+pub fn smooth_stroke(points: &[Point], sigma: f64) -> Vec<Point> {
+    let n = points.len();
+    if n < 3 || !(sigma.is_finite() && sigma > 1e-9) {
+        return points.to_vec();
+    }
+    let mut at = Vec::with_capacity(n);
+    let mut s = 0.0;
+    for (i, p) in points.iter().enumerate() {
+        if i > 0 {
+            s += (*p - points[i - 1]).hypot();
+        }
+        at.push(s);
+    }
+    let reach = 3.0 * sigma;
+    let mut out = Vec::with_capacity(n);
+    out.push(points[0]);
+    let mut lo = 0;
+    for i in 1..n - 1 {
+        while at[i] - at[lo] > reach {
+            lo += 1;
+        }
+        // The window narrows near the ends, so they are not pulled in.
+        let room = (at[i] - at[0]).min(at[n - 1] - at[i]);
+        let sig = sigma.min(room / 3.0).max(1e-9);
+        let (mut wx, mut wy, mut wsum) = (0.0, 0.0, 0.0);
+        let mut j = lo;
+        while j < n && at[j] - at[i] <= reach {
+            let d = (at[j] - at[i]) / sig;
+            let w = (-0.5 * d * d).exp();
+            wx += w * points[j].x;
+            wy += w * points[j].y;
+            wsum += w;
+            j += 1;
+        }
+        out.push(if wsum > 0.0 {
+            Point::new(wx / wsum, wy / wsum)
+        } else {
+            points[i]
+        });
+    }
+    out.push(points[n - 1]);
+    out
+}
+
 /// A freehand stroke drawn through `raw` as few nodes as stay within
 /// `tol` (mm, from the Smoothing setting): the points are thinned to
 /// within `tol`, drawn as a curve through them by [`fit_freehand`] (with
@@ -231,6 +279,9 @@ pub fn radial_grid_path(rect: Rect, rings: u32, spokes: u32) -> BezPath {
     p
 }
 
+/// The most outlines one Outline Offset makes of an object.
+pub const OUTLINE_OFFSET_STEPS: u32 = 50;
+
 impl App {
     pub fn tools2_input(&mut self, response: &Response, p: Point, mods: Modifiers) {
         match self.tool {
@@ -318,6 +369,33 @@ impl App {
     }
 
     pub(crate) fn box_like_input(&mut self, response: &Response, p: Point, mods: Modifiers) {
+        // The Common Shapes tool drags the handles of the selected shape
+        // it drew, as the Shape tool does, so a shape is adjusted right
+        // after it is drawn (#4045).
+        if self.tool == Tool::CommonShapes {
+            if response.drag_started_by(PointerButton::Primary) {
+                if let Some((s, node @ crate::kind_nodes::KindNode::Adjust { .. })) =
+                    self.kind_node_at(p)
+                {
+                    self.drag = Drag::KindNode {
+                        shape: s.id,
+                        node,
+                        start: Box::new(s),
+                        single: false,
+                        chosen: [false; 4],
+                        begun: false,
+                        turn: 0.0,
+                    };
+                    return;
+                }
+            }
+            if matches!(self.drag, Drag::KindNode { .. }) {
+                if response.dragged_by(PointerButton::Primary) {
+                    self.kind_node_drag_step(p, mods);
+                }
+                return;
+            }
+        }
         let p = self.snap_point(p);
         if response.drag_started_by(PointerButton::Primary) {
             self.drag = Drag::Box {
@@ -407,6 +485,7 @@ impl App {
                 radial_grid_path(r, self.graph_rings, self.graph_spokes)
             }
             Tool::GraphPaper => grid_path(r, self.graph_rows, self.graph_cols),
+            Tool::ShapeGenerator => self.shape_gen_tool_preview(r),
             Tool::ActionLines => self.action_lines.path(r),
             Tool::Balloon => crate::balloons::Balloon::new(
                 r,
@@ -452,11 +531,19 @@ impl App {
                 if rect.width() > 0.1 && rect.height() > 0.1 {
                     // A shape of My shapes is filled when its outline was
                     // closed, as the objects it was made from.
-                    let (path, closed) = match self.picked_my_shape() {
+                    let mine = self.picked_my_shape();
+                    let (path, closed) = match &mine {
                         Some(mine) => (mine.path(rect), mine.closed),
                         None => (self.common_shape.path(rect), true),
                     };
-                    if let Some(id) = self.new_shape(ShapeKind::Path { path, closed }) {
+                    // A common shape keeps what it is and its settings, so
+                    // the Shape tool shows its handles (#4045).
+                    let params = mine.is_none().then(|| {
+                        let shape = self.common_shape;
+                        Box::new(crate::common_shapes::params(shape, rect, &shape.defaults()))
+                    });
+                    let kind = ShapeKind::Path { path, closed };
+                    if let Some(id) = self.new_shape_styled(kind, |s| s.common_shape = params) {
                         self.select(vec![id]);
                     }
                 }
@@ -520,52 +607,106 @@ impl App {
     /// open line gets the band round both of its sides; an inner offset
     /// larger than the object leaves nothing for it.
     pub fn outline_offset(&mut self, distance_mm: f64, outside: bool) {
+        self.outline_offset_with(
+            distance_mm,
+            outside,
+            tracedraw_core::shaping::Join::Miter,
+            1,
+        );
+    }
+
+    /// The curves Outline Offset makes of the selection: for each object
+    /// that gets any, the object and its outline offset `steps` times,
+    /// the first by `distance_mm`, the next by twice that and so on,
+    /// outside it or inside, the corners turned as `join` says (page
+    /// space). An open line gets the band round both of its sides; an
+    /// inner offset larger than the object leaves nothing for it.
+    pub fn outline_offset_paths(
+        &self,
+        distance_mm: f64,
+        outside: bool,
+        join: tracedraw_core::shaping::Join,
+        steps: u32,
+    ) -> Vec<(Shape, Vec<BezPath>)> {
         let d = distance_mm.abs();
         if !d.is_finite() || d < 1e-6 {
-            return;
+            return Vec::new();
         }
-        let Some(layer) = self.active_layer() else {
-            return;
-        };
-        let mut cmds = Vec::new();
-        let mut ids = Vec::new();
+        let mut out = Vec::new();
         for s in self.selected_shapes() {
             let base = s.transform * s.local_path();
             if base.elements().is_empty() {
                 continue;
             }
             let open = matches!(s.kind, ShapeKind::Path { closed: false, .. });
-            let join = tracedraw_core::shaping::Join::Miter;
-            let path = if open {
-                tracedraw_core::shaping::open_offset_band(&base, d, join)
-            } else {
-                let signed = if outside { d } else { -d };
-                tracedraw_core::shaping::offset_filled(&base, signed, join, s.fill_rule)
-            };
-            if path.elements().is_empty() {
-                continue;
+            let mut paths = Vec::new();
+            for k in 1..=steps.clamp(1, OUTLINE_OFFSET_STEPS) {
+                let dk = d * f64::from(k);
+                let path = if open {
+                    tracedraw_core::shaping::open_offset_band(&base, dk, join)
+                } else {
+                    let signed = if outside { dk } else { -dk };
+                    tracedraw_core::shaping::offset_filled(&base, signed, join, s.fill_rule)
+                };
+                if path.elements().is_empty() {
+                    // Further in there is nothing left either.
+                    break;
+                }
+                paths.push(path);
             }
-            let id = self.engine.new_shape_id();
-            let mut o = Shape::new(id, ShapeKind::Path { path, closed: true });
-            o.fill = s.fill.clone();
-            o.stroke = s.stroke.clone();
-            if matches!(o.fill, Fill::None) && o.stroke.is_none() {
-                o.stroke = Some(Stroke::new(tracedraw_core::Color::BLACK, Stroke::HAIRLINE));
+            if !paths.is_empty() {
+                out.push((s, paths));
             }
-            o.name = Some("Offset".into());
+        }
+        out
+    }
+
+    /// Outline Offset with every option of its dialog: the corners and
+    /// how many outlines, each `distance_mm` beyond the one before. The
+    /// new curves take the object's fill and outline and are selected;
+    /// those outside go behind their object, the farthest at the back,
+    /// and those inside in front, the innermost on top, so all show. One
+    /// undo step.
+    pub fn outline_offset_with(
+        &mut self,
+        distance_mm: f64,
+        outside: bool,
+        join: tracedraw_core::shaping::Join,
+        steps: u32,
+    ) {
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        let mut cmds = Vec::new();
+        let mut ids = Vec::new();
+        for (s, paths) in self.outline_offset_paths(distance_mm, outside, join, steps) {
             let placed = self.doc().locate(s.id).ok();
-            cmds.push(Command::AddShape {
-                layer: placed.map(|(l, _)| l).unwrap_or(layer),
-                shape: o,
-            });
-            if placed.is_some() {
-                cmds.push(Command::OrderRelative {
-                    shapes: vec![id],
-                    reference: s.id,
-                    in_front: !outside,
+            // Each new curve goes right behind (outside) or right in
+            // front of (inside) the one before it.
+            let mut reference = s.id;
+            for path in paths {
+                let id = self.engine.new_shape_id();
+                let mut o = Shape::new(id, ShapeKind::Path { path, closed: true });
+                o.fill = s.fill.clone();
+                o.stroke = s.stroke.clone();
+                if matches!(o.fill, Fill::None) && o.stroke.is_none() {
+                    o.stroke = Some(Stroke::new(tracedraw_core::Color::BLACK, Stroke::HAIRLINE));
+                }
+                o.name = Some("Offset".into());
+                cmds.push(Command::AddShape {
+                    layer: placed.map(|(l, _)| l).unwrap_or(layer),
+                    shape: o,
                 });
+                if placed.is_some() {
+                    cmds.push(Command::OrderRelative {
+                        shapes: vec![id],
+                        reference,
+                        in_front: !outside,
+                    });
+                }
+                reference = id;
+                ids.push(id);
             }
-            ids.push(id);
         }
         if !cmds.is_empty() {
             let _ = self.engine.run_batch("Outline Offset", &cmds);
@@ -1990,6 +2131,59 @@ mod tests {
         let g = grid_path(r, 4, 3);
         // Frame (5 elements) plus 2 vertical and 3 horizontal lines.
         assert_eq!(g.elements().len(), 5 + 2 * 2 + 3 * 2);
+    }
+
+    /// #4068: at the top of the smoothing scale a shaky stroke (two
+    /// pixels of tremor) comes out as a few long smooth curves close to
+    /// the line the hand meant, with fewer nodes than at the default 50,
+    /// its ends where it was drawn; up to 50 nothing changes.
+    #[test]
+    fn full_smoothing_evens_out_a_shaky_stroke() {
+        use tracedraw_core::geometry::{ParamCurve, ParamCurveNearest};
+        let zoom = 4.0;
+        let meant = |x: f64| 15.0 * (x / 120.0 * std::f64::consts::TAU).sin();
+        let mut raw = Vec::new();
+        let mut seed = 11u32;
+        for i in 0..=320 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let j = (f64::from(seed >> 16 & 0xff) / 255.0 - 0.5) * 4.0 / zoom;
+            let x = f64::from(i) * 0.375;
+            raw.push(Point::new(x, meant(x) + j));
+        }
+        let prefs = |s: u32| crate::prefs::CurvePrefs {
+            smoothing: s,
+            ..Default::default()
+        };
+        assert!(prefs(50).freehand_presmooth_px().is_none());
+        assert!((prefs(50).freehand_tolerance_px() - 1.3).abs() < 1e-9);
+        assert!((prefs(20).freehand_tolerance_px() - (0.2 + 0.2 * 2.2)).abs() < 1e-9);
+        let draw = |s: u32| {
+            let c = prefs(s);
+            let pts = c
+                .freehand_presmooth_px()
+                .map_or(raw.clone(), |sig| smooth_stroke(&raw, sig / zoom));
+            freehand_path(&pts, c.freehand_tolerance_px() / zoom, None, None).unwrap()
+        };
+        let (mid, top) = (draw(50), draw(100));
+        assert!(
+            top.elements().len() < mid.elements().len(),
+            "{} vs {}",
+            top.elements().len(),
+            mid.elements().len()
+        );
+        // Close to the line meant: within the fit tolerance (1 mm at
+        // this zoom), most of it much closer.
+        let segs: Vec<_> = top.segments().collect();
+        for k in 1..60 {
+            let x = f64::from(k) * 2.0;
+            let d = segs
+                .iter()
+                .map(|s| s.nearest(Point::new(x, meant(x)), 1e-6).distance_sq.sqrt())
+                .fold(f64::MAX, f64::min);
+            assert!(d < 1.0, "{x}: {d} mm off");
+        }
+        assert_eq!(top.elements()[0], tracedraw_core::geometry::PathEl::MoveTo(raw[0]));
+        assert!((segs.last().unwrap().end() - raw[raw.len() - 1]).hypot() < 1e-9);
     }
 
     /// A wavy stroke drawn by hand (jittered mouse points every few

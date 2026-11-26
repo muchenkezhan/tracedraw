@@ -15,6 +15,9 @@ use egui::{RichText, Ui};
 /// The library section: the picture count, the folder, Browse and the
 /// progress while the folder is read.
 fn library(app: &mut App, ui: &mut Ui) {
+    if let Some(dir) = crate::files::take_picked("picture-mosaic-folder") {
+        app.picture_mosaic_load_library(dir);
+    }
     section(ui, Some(&tr("docker.picture_mosaic_library")));
     let none = tr("docker.form_none");
     let n = app.picture_mosaic.images.len();
@@ -58,7 +61,7 @@ fn library(app: &mut App, ui: &mut Ui) {
         if ui
             .add_enabled(
                 !busy,
-                egui::Button::new(tr("docker.picture_mosaic_browse"))
+                crate::ui::btn_icons::Ib::new("docker.picture_mosaic_browse")
                     .min_size(egui::vec2(100.0, 24.0)),
             )
             .rich_tip(match crate::files::FolderUse::MosaicLibrary.tip() {
@@ -90,9 +93,7 @@ fn library(app: &mut App, ui: &mut Ui) {
 fn choose_library(app: &mut App) {
     match crate::files::FolderUse::MosaicLibrary.action() {
         crate::files::FolderAction::PickFolder(token) => {
-            if let Some(dir) = crate::files::pick_folder(token) {
-                app.picture_mosaic_load_library(dir);
-            }
+            crate::files::pick_folder_into(token, None, "picture-mosaic-folder");
         }
         crate::files::FolderAction::OpenFiles => {
             crate::files::Dialog::new()
@@ -280,7 +281,7 @@ pub fn picture_mosaic(app: &mut App, ui: &mut Ui) {
         && !app.picture_mosaic.images.is_empty()
         && app.picture_mosaic_job.is_none();
     let tip = crate::ui::tips::pair("docker.apply", "docker.picture_mosaic_apply_desc");
-    if crate::ui::docker_form::wide_button(ui, &tr("docker.apply"), ready, &tip) {
+    if crate::ui::docker_form::wide_button(ui, "docker.apply", ready, &tip) {
         let s = app.picture_mosaic.clone();
         app.apply_picture_mosaic(&s);
     }
