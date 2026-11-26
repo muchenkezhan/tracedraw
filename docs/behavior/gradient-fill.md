@@ -4,7 +4,7 @@
 
 | Control | Default | Range |
 |---|---|---|
-| Type | Linear | Linear, Radial (elliptical), Conical, Square, Shaped |
+| Type | Linear | Linear, Radial (elliptical), Conical, Square, Shaped, Color points |
 | Stops | 2: colour 0% = object colour or black, 100% = white | 2..64 |
 | Angle (linear, conical, square) | 0 (left to right, counter-clockwise positive) | -360..360 |
 | Edge pad | 0% | 0..49% |
@@ -17,17 +17,48 @@
 | Steps | unticked (256, smooth) | ticked: 2..255 colour bands (16 when first ticked, then the count last used) |
 | Smooth transition | off | |
 | Acceleration | 0 | -100..100 |
+| Dither | off | on: each colour channel moved up or down by up to two levels, by an even noise fixed to the page, over what the fill covers (on screen and in bitmap export) |
 
 The editor shows the whole run as drawn (repeats, mirror, inversion and
 the blend settings in) in a strip under the type. The Interactive Fill
 property bar and the Transparency tool's gradient list offer the Shaped
 type too; a shaped gradient has no handles on the canvas.
 
+Color points (`FountainKind::Points`): each stop is a colour at a point
+of its own anywhere in the object (`Fountain::points`, box-relative as
+the handles are; a stop with no point yet sits on a circle of 0.6 round
+the centre, `point_places`). With the Interactive Fill or Shape tool the
+points show as nodes (numbered as mesh nodes, `crate::color_points`):
+a drag moves one (one undo step), a click chooses it and a palette
+colour then goes to it, a double click inside the object adds a point
+there in the colour the fill has there (on the Shape tool not on the
+outline, where a double click adds a node), and Delete takes the chosen
+one away while two stay. The stops are kept spread evenly, first to
+last, so the Properties docker lists them in order. The angle, offset,
+repeat and blend settings do not apply; the Transparency tool does not
+offer the type. `.cdr`, SVG and PDF get the closest radial gradient
+(`color_points::tests::color_points_are_added_coloured_moved_and_deleted`).
+
+Each colour point has a spread (#3947, `Fountain::spreads`, 1 by
+default, 0.1 to 10): how far its colour reaches. The chosen point shows
+a ring round it, of radius spread x 15 % of the box diagonal, with a
+handle on its right; dragging the handle sets the spread to the
+pointer's distance from the point over that 15 % (one undo step for the
+drag), and a press on it keeps the point chosen. On the Interactive
+Fill tool's property bar a Colour points type groups the chosen point's
+colour, transparency and Spread (10 to 1000 %, one undo step, "Colour
+Point Spread") and Delete Point between separators; with no point
+chosen it shows how to choose or add one, and the angle and edge pad,
+which the type does not use, are not shown. A point added gets spread
+1; a point deleted takes its spread along
+(`color_points::tests::a_color_point_spread_widens_its_reach`,
+`the_spread_handle_is_dragged_on_the_canvas`).
+
 Blend settings (#1208, the rows after Bilinear and Invert colours in the
 Properties docker): Blend direction as three buttons (the Blend effect's
 words: Direct, Clockwise, Counterclockwise), Steps as a checkbox with
-the count beside it while ticked, Smooth transition as a checkbox, and
-Acceleration as a field. Each is a fill field of its own
+the count beside it while ticked, Smooth transition as a checkbox,
+Acceleration as a field, and Dither as a checkbox. Each is a fill field of its own
 (`FillField::BlendDirection`, `Steps`, `Smooth`, `Acceleration`), so a
 change goes into each selected object's own gradient and is one undo
 step (`dockers::tests::gradient_blend_rows_show_and_patch`,
@@ -274,6 +305,12 @@ Bounding box `b` of the object in page space, centre `c`.
   of at most 384 pixels across the object (`edge_distance` in the
   renderer, two passes of the 1-D lower envelope of parabolas), drawn
   smoothed; they do not change with zoom.
+- Color points: no `t`; the colour at `p` is every point's colour
+  weighed by `k² / d²`, `d` the distance from `p` to the point over the
+  box diagonal and `k` the point's spread, so the nearest point counts
+  the most and a point with spread 2 weighs at distance `2d` what one
+  with spread 1 weighs at `d`; on a point, its own colour
+  (`Fountain::points_sample`, opacity alike).
 - The stop parameter `s` of `t` (`Fountain::stop_param`), in this order:
   1. Bilinear: `t = 1 - |2t - 1|` (first colour at both ends, last in
      the middle).

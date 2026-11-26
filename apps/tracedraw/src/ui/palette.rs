@@ -94,6 +94,64 @@ pub fn swatch_side_of(app: &App, which: Row) -> f32 {
     f32::from(s.clamp(crate::settings::SWATCH_MIN, crate::settings::SWATCH_MAX))
 }
 
+/// The height of a line of the list of colour names (#3512).
+const NAME_LINE: f32 = 18.0;
+
+/// The palette opened out as a list (#3512): each colour's swatch and
+/// its name (its values when it has none), scrolling; a click fills, a
+/// right click sets the outline. The colour picked and whether it is for
+/// the outline.
+fn name_list(
+    ui: &mut Ui,
+    id: egui::Id,
+    colors: &[(String, Color)],
+    size: egui::Vec2,
+) -> Option<(Color, bool)> {
+    let mut picked = None;
+    ui.set_width(size.x);
+    egui::ScrollArea::vertical()
+        .id_salt(id.with("names"))
+        .max_height(size.y)
+        .auto_shrink([false, true])
+        .show_rows(ui, NAME_LINE, colors.len(), |ui, range| {
+            for i in range {
+                let (name, c) = &colors[i];
+                let (line, resp) =
+                    ui.allocate_exact_size(vec2(size.x - 12.0, NAME_LINE), Sense::click());
+                let painter = ui.painter();
+                if resp.hovered() {
+                    painter.rect_filled(line, 2.0, Tokens::tool_hover());
+                }
+                let cell = Rect::from_min_size(
+                    line.min + vec2(2.0, 2.0),
+                    vec2(NAME_LINE - 4.0, NAME_LINE - 4.0),
+                );
+                painter.rect_filled(cell, 0.0, crate::canvas::to_color32(*c));
+                painter.rect_stroke(cell, 0.0, Stroke::new(1.0, FRAME), egui::StrokeKind::Outside);
+                let label = if name.trim().is_empty() {
+                    color_values(*c)
+                } else {
+                    name.clone()
+                };
+                painter.with_clip_rect(line).text(
+                    pos2(cell.right() + 6.0, line.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(12.0),
+                    Tokens::text(),
+                );
+                let resp = resp.rich_tip(swatch_tip(name, *c));
+                if resp.clicked() {
+                    picked = Some((*c, false));
+                }
+                if resp.secondary_clicked() {
+                    picked = Some((*c, true));
+                }
+            }
+        });
+    picked
+}
+
 /// From one swatch of `which` to the next.
 pub fn stride_of(app: &App, which: Row) -> f32 {
     swatch_side_of(app, which) + 1.0
@@ -348,6 +406,20 @@ fn colors_of(app: &App, which: Row) -> Vec<(String, Color)> {
             None => Vec::new(),
         },
     }
+}
+
+/// The value the palette itself holds at `i` when an RGB drawing shows
+/// its bar `which` in RGB; `None` otherwise (#4128).
+fn palette_value(app: &App, which: Row, i: usize) -> Option<Color> {
+    if !rgb_drawing(app) || which == Row::Document || shows_document(app, which) {
+        return None;
+    }
+    let own = match which {
+        Row::Main => &app.palette,
+        Row::Extra(k) => &app.extra_palettes.get(k)?.colors,
+        Row::Document => return None,
+    };
+    own.get(i).map(|(_, c)| *c)
 }
 
 /// `palette` as an RGB drawing shows it: the default palette's colours
@@ -1011,7 +1083,26 @@ fn swatch(
     }
     let resp = match entry {
         None => resp.rich_tip(tr("palette.no_color_tip")),
-        Some((name, c)) => resp.on_hover_ui(|ui| swatch_tip_ui(ui, name, *c)),
+        Some((name, c)) => {
+            let source = color_index.and_then(|i| palette_value(app, which, i));
+            resp.on_hover_ui(|ui| {
+                swatch_tip_ui(ui, name, *c);
+                // A CMYK palette in an RGB drawing applies RGB: the
+                // palette's own values show too, so it is seen as the
+                // palette chosen (#4128).
+                if let Some(p) = source.filter(|p| p != c) {
+                    let size = ui.style().text_styles[&egui::TextStyle::Small].size;
+                    ui.label(
+                        egui::RichText::new(crate::i18n::trf(
+                            "palette.rgb_drawing_source",
+                            &[("v", &color_values(p))],
+                        ))
+                        .size(size)
+                        .color(Tokens::text_dim()),
+                    );
+                }
+            })
+        }
     };
 
     // Dragging the colour: inside an object it fills it, on its outline
@@ -1098,6 +1189,7 @@ fn swatch(
             app.doc_palette_current = color_index;
         }
         match entry {
+            None if app.pixel_edit.is_some() => {}
             None => app.apply_fill(Fill::None),
             Some((_, c)) => {
                 if ui.input(|i| i.modifiers.ctrl) {
@@ -1176,6 +1268,14 @@ fn swatch(
 /// tenth of the colour into the outline, as Ctrl+click mixes into the
 /// fill; otherwise the outline takes the colour (#2132).
 fn right_click_outline(app: &mut App, ui: &Ui, entry: Option<&(String, Color)>) {
+    // The image editing mode: the outline colour of the shapes.
+    if let Some(pe) = app.pixel_edit.as_mut() {
+        if let Some((_, c)) = entry {
+            let [r, g, b] = c.to_rgb8();
+            pe.opts.outline_color = [r, g, b, 255];
+        }
+        return;
+    }
     match entry {
         Some((_, c)) if ui.input(|i| i.modifiers.ctrl) => app.mix_into_outline(*c),
         _ => app.apply_outline_color(entry.map(|(_, c)| *c)),
@@ -1431,12 +1531,25 @@ fn menu_of(app: &mut App, ui: &mut Ui, which: Row, swatch: bool) {
         app.settings.palette.show_document = !app.settings.palette.show_document;
         app.settings.save();
     }
+    // Names beside the swatches when the palette opens out (#3512).
+    if check(ui, "palette.show_names", "", app.settings.palette.show_names) {
+        app.settings.palette.show_names = !app.settings.palette.show_names;
+        app.settings.save();
+    }
     if which != Row::Document {
         crate::ui::palette_bars::strip_items(app, ui, which);
     }
     crate::ui::palette_bars::open_bar_items(app, ui);
     if item(ui, "palette.new", "", true) {
         crate::ui::palette_bars::start_new_palette(app);
+    }
+    // The selection's colours changed to this palette's nearest ones
+    // (#3534).
+    if let Some(i) = palette_index_of(app, which) {
+        let sel = app.has_document() && !app.selection.is_empty();
+        if item(ui, "palette.fit_selection", "", sel) {
+            app.fit_selection_to_palette(i);
+        }
     }
     if let Some(i) = user_palette_of(app, which) {
         let sel = app.has_document() && !app.selection.is_empty();
@@ -1650,11 +1763,18 @@ pub fn popups(app: &mut App, ctx: &egui::Context) {
         let vertical = ctx
             .data(|d| d.get_temp::<bool>(egui::Id::new(("palette_strip_vertical", which.key()))))
             .unwrap_or(false);
+        let names = app.settings.palette.show_names;
+        // A list of names: one line a colour, scrolling past 20 lines.
+        let list = vec2(240.0, (colors.len().max(1) as f32 * NAME_LINE).min(20.0 * NAME_LINE) + 8.0);
         let (cols, size, pos) = if vertical {
             // Beside a column: towards the middle of the window.
             let cols = 12usize;
             let rows = colors.len().div_ceil(cols).max(1);
-            let size = vec2(cols as f32 * st + 1.0, rows as f32 * st + 1.0);
+            let size = if names {
+                list
+            } else {
+                vec2(cols as f32 * st + 1.0, rows as f32 * st + 1.0)
+            };
             let x = if strip.x > screen.center().x {
                 strip.x - size.x - 24.0
             } else {
@@ -1668,7 +1788,11 @@ pub fn popups(app: &mut App, ctx: &egui::Context) {
         } else {
             let cols = (((screen.right() - strip.x - 24.0) / st).floor() as usize).clamp(1, 33);
             let rows = colors.len().div_ceil(cols).max(1);
-            let size = vec2(cols as f32 * st + 1.0, rows as f32 * st + 1.0);
+            let size = if names {
+                list
+            } else {
+                vec2(cols as f32 * st + 1.0, rows as f32 * st + 1.0)
+            };
             // Above the row, or below it when it is docked at the top.
             let above = strip.y - size.y - 16.0;
             let y = if above < screen.top() {
@@ -1684,6 +1808,10 @@ pub fn popups(app: &mut App, ctx: &egui::Context) {
             .fixed_pos(pos)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    if names {
+                        picked = name_list(ui, id, &colors, size);
+                        return;
+                    }
                     let (r, _) = ui.allocate_exact_size(size, Sense::hover());
                     let painter = ui.painter();
                     painter.rect_filled(r, 0.0, FRAME);
@@ -2155,7 +2283,11 @@ mod tests {
     #[test]
     fn the_default_palette_has_greys_process_colours_and_tints() {
         let app = App::headless();
-        assert_eq!(app.palette.len(), 94);
+        assert_eq!(app.palette.len(), 95);
+        assert_eq!(
+            app.palette.last().map(|(n, _)| n.as_str()),
+            Some(crate::palette::REGISTRATION_BLACK)
+        );
         let names: Vec<&str> = app.palette.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(&names[..3], &["Black", "90% Black", "80% Black"]);
         assert_eq!(names[10], "White");
@@ -2530,6 +2662,40 @@ mod tests {
         );
     }
 
+    /// Show Color Names opens the palette out as a scrolling list of
+    /// names, narrow and no taller than 20 lines, clear of the row
+    /// (#3512).
+    #[test]
+    fn show_color_names_opens_the_palette_as_a_list() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        app.settings.palette.show_names = true;
+        let run = |app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                palette_row(app, ui);
+                popups(app, ui.ctx());
+            });
+            out.textures_delta.clear();
+        };
+        run(&mut app);
+        app.palette_expanded = Some(Row::Main);
+        run(&mut app);
+        run(&mut app);
+        let area = ctx
+            .memory(|m| m.area_rect(egui::Id::new("palette_expanded")))
+            .expect("the list shown");
+        assert!(area.width() < 300.0, "{area:?}");
+        assert!(area.height() < 20.0 * NAME_LINE + 40.0, "{area:?}");
+        assert!(area.top() >= thickness(&app, Row::Main), "{area:?}");
+    }
+
     /// With two rows the default palette is twice as thick and fills line
     /// by line: Black sits beside the No Color well with 90% Black next to
     /// it, and the second line goes on where the first ends; scrolling
@@ -2733,6 +2899,13 @@ mod tests {
         assert_eq!(rgb[0].0, "Cyan");
         assert_eq!(rgb[0].1, Color::rgb8(0, 255, 255));
         assert_eq!(rgb[1].1, Color::rgb8(10, 20, 30));
+        // The tooltip names the palette's own CMYK value beside the RGB
+        // one applied (#4128); none for the document palette.
+        assert_eq!(
+            palette_value(&app, Row::Main, 0),
+            Some(Color::cmyk_pct(100.0, 0.0, 0.0, 0.0))
+        );
+        assert_eq!(palette_value(&app, Row::Document, 0), None);
     }
 
     /// The default palette in an RGB drawing holds clean RGB values: black
@@ -2751,8 +2924,11 @@ mod tests {
                 .map(|(_, c)| *c)
                 .expect(name)
         };
-        assert_eq!(rgb.len(), 94);
+        assert_eq!(rgb.len(), 95);
         assert_eq!(of("Black"), Color::rgb8(0, 0, 0));
+        // Registration Black, an ink mix, is plain black on screen
+        // (#3666).
+        assert_eq!(of(crate::palette::REGISTRATION_BLACK), Color::rgb8(0, 0, 0));
         assert_eq!(of("White"), Color::rgb8(255, 255, 255));
         assert_eq!(of("50% Black"), Color::rgb8(128, 128, 128));
         assert_eq!(of("Red"), Color::rgb8(255, 0, 0));

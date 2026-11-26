@@ -18,10 +18,16 @@ delete the selection as everywhere (#1527,
 
 - The pointer is sampled every 0.2 mm of movement; on release the points
   are simplified with a tolerance of `0.2 + s / 100 x 2.2` screen pixels
-  (`s` the Freehand smoothing, 0 to 100, 50 by default: 1.3 pixels; at
-  least 0.02 mm), so a zoomed-in drawing keeps more detail, and fitted
-  with smooth cubic segments (`geometry::smooth_path`). The smoothing is
-  on the property bar and in Options > Tools > Curve tools.
+  up to 50 (`s` the Freehand smoothing, 0 to 100, 50 by default: 1.3
+  pixels; at least 0.02 mm), then `1.3 + (s - 50) / 50 x 2.7` (4 pixels
+  at 100), so a zoomed-in drawing keeps more detail, and fitted with
+  smooth cubic segments (`geometry::smooth_path`). Above 50 the drawn
+  points are first evened out along the stroke by a Gaussian of
+  `(s - 50) / 50 x 6` screen pixels (narrower near the ends, which stay
+  where they were drawn; `tools2::smooth_stroke`), so the top of the
+  scale gives long smooth curves free of the hand's tremor (#4068,
+  `tools2::tests::full_smoothing_evens_out_a_shaky_stroke`). The
+  smoothing is on the property bar and in Options > Tools > Curve tools.
 - A click, then another click: a straight line between them, previewed
   to the pointer after the first click; Ctrl keeps it to steps of the
   constrain angle (15 degrees by default); Esc drops the first click; a
@@ -225,6 +231,14 @@ delete the selection as everywhere (#1527,
   or paste nothing (#2694, `pick_drag_tests::
   bspline_closed_with_c_held_fixes_the_first_point`, `pick_drag_tests::
   bspline_ctrl_c_and_ctrl_v_fix_the_point_instead_of_copying`).
+- Space while the curve is drawn places a control point where the
+  pointer is and the curve goes on, so a curve can be stitched with the
+  pointer and the Space bar (it neither ends the curve nor picks the Pick
+  tool then; a press on the last point places nothing); a right click
+  places a fixed point there (the curve turns a sharp corner) and opens
+  no context menu. A press that drifts into a drag places its point and
+  never holds back the next click's (#4087, #4076, `pick_drag_tests::
+  bspline_space_and_right_click_place_points`).
 - Double-click, Enter or Esc finishes (Esc with one point drops it);
   clicking the first point (once there are three) closes it into the periodic spline,
   smooth all round. The result is a curve object (its nodes are the
@@ -239,6 +253,36 @@ delete the selection as everywhere (#1527,
   `pick_drag_tests::bspline_preview_is_the_curve_that_is_made`,
   `pick_drag_tests::bspline_double_click_makes_the_previewed_curve`
   and `pick_drag_tests::a_bspline_keeps_its_control_points_for_the_shape_tool`.
+
+## Curvature Pen
+
+The curve group's Curvature Pen (after B-Spline; no shortcut) places
+points as the B-Spline tool does (a click or the start of a drag each,
+double click or Enter to finish, a click on the first point from three
+closes, Backspace takes the last back, each point one undo step) but the
+curve runs through them (`geometry::curvature_path`):
+
+- At a smooth point the handles lie along the chord from the point before
+  to the point after; each handle is as long as a circular arc leaving
+  its own segment's chord at that angle needs: a third of the segment's
+  chord over cos² of half the angle (at most two thirds, at a right
+  angle). Three points on a circle make that circle however wide the arc,
+  so a long curve drawn with few points is as smooth as a short one
+  (#3948; the handles used to shrink as the curve turned, flattening wide
+  arcs). Moving or adding a point refits the segments beside it.
+- A point placed with Alt, C or V held is a corner, as are the two ends of
+  an open curve: the handle beside it is the smooth handle across the
+  segment mirrored about the segment's chord, so the end bends as a
+  parabola would. Two corners side by side give a straight segment.
+- Closed, the last point runs on to the first, smooth there unless that
+  point is a corner.
+- The preview is the curve with the pointer as the next point; no control
+  polygon is drawn. The curve made is a plain curve with the points as its
+  nodes (no B-spline control points are kept).
+
+Test: `pick_drag_tests::the_curvature_pen_draws_a_smooth_curve_through_its_clicks`,
+`geometry::tests::a_curvature_curve_runs_through_its_points`,
+`geometry::tests::a_wide_curvature_arc_stays_round`.
 
 ## Polyline and 2-point line
 

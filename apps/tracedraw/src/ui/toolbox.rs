@@ -8,6 +8,7 @@
 //! Commands dragged onto it from Options > Customization > Commands
 //! follow the tools, as on the toolbars (#3211).
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::i18n::tr;
 use crate::theme::{self, Tokens};
@@ -15,6 +16,10 @@ use crate::tools::{Tool, GROUPS};
 use crate::ui::icons;
 use crate::ui::tips::RichTip;
 use egui::{Pos2, Rect, Sense, Stroke, Ui, Vec2};
+
+/// Seconds the pointer rests on another flyout button, with a list open,
+/// before that button's list takes its place (#4081).
+const FLYOUT_SWITCH_REST: f64 = 0.35;
 
 /// Tools after which a flyout draws a separator.
 const SEPARATE_AFTER: [Tool; 7] = [
@@ -287,6 +292,9 @@ pub fn button_width(app: &App) -> f32 {
 
 /// The width of a docked toolbox column (its buttons and the margins).
 pub fn column_width(app: &App) -> f32 {
+    if app.pixel_edit.is_some() {
+        return crate::ui::pixel_mode::column_width();
+    }
     button_width(app) + 6.0
 }
 
@@ -318,6 +326,11 @@ fn caption_font() -> egui::FontId {
 /// column on a side, or floating as a grid two buttons wide.
 pub fn toolbox(app: &mut App, ui: &mut Ui, dock: crate::ui::bars::Dock) {
     use crate::ui::bars::Dock;
+    // The image editing mode: the image tools.
+    if app.pixel_edit.is_some() {
+        crate::ui::pixel_mode::toolbox(app, ui, dock);
+        return;
+    }
     // Nothing to draw on the Welcome Screen: the tools show pale.
     if !app.drawing_shown() {
         ui.disable();
@@ -441,7 +454,13 @@ fn tools(app: &mut App, ui: &mut Ui, dock: crate::ui::bars::Dock, fitted: Option
             ui.add_space(2.0);
         }
     }
-    commands(app, ui, side, horizontal);
+    commands(
+        app,
+        ui,
+        crate::ui::bar_items::ItemBar::Toolbox,
+        side,
+        horizontal,
+    );
     quick_customize(app, ui, horizontal);
 }
 
@@ -450,10 +469,17 @@ fn tools(app: &mut App, ui: &mut Ui, dock: crate::ui::bars::Dock, fitted: Option
 /// icon for a tool, the start of its name when it has no picture); a
 /// click runs it as its menu item would. In customize mode a button
 /// moves or leaves as on the toolbars, and the whole toolbox takes a
-/// command dragged from the Commands page.
-fn commands(app: &mut App, ui: &mut Ui, side: f32, horizontal: bool) {
-    use crate::ui::bar_items::{self, ItemBar};
-    let list = bar_items::items(app, ItemBar::Toolbox);
+/// command dragged from the Commands page. A toolbar the user made
+/// docked at a side draws its buttons the same way, as `bar` (#3723).
+pub(crate) fn commands(
+    app: &mut App,
+    ui: &mut Ui,
+    bar: crate::ui::bar_items::ItemBar,
+    side: f32,
+    horizontal: bool,
+) {
+    use crate::ui::bar_items;
+    let list = bar_items::items(app, bar);
     let custom = bar_items::customizing(app, ui.ctx());
     let size = Vec2::new(button_width(app), side);
     let icon = Tokens::tool_icon().min(side - 4.0).max(12.0);
@@ -487,12 +513,13 @@ fn commands(app: &mut App, ui: &mut Ui, side: f32, horizontal: bool) {
             Some(t) => t.name(),
             None => tr(id),
         };
-        crate::theme::paint_icon_button(
-            ui.painter(),
-            rect,
-            resp.hovered(),
-            tool.is_some_and(|t| app.tool == t),
-        );
+        // A toggle command (Snap To Objects, Page Border) shows pushed in
+        // while it is on, picture or not (#4208).
+        let on = match tool {
+            Some(t) => app.tool == t,
+            None => crate::ui::menus::command_on(app, ui.ctx(), id).unwrap_or(false),
+        };
+        crate::theme::paint_icon_button(ui.painter(), rect, resp.hovered(), on);
         let pic = Rect::from_center_size(rect.center(), Vec2::splat(icon));
         if tool.is_some() || crate::ui::menus::has_menu_picture(id) {
             bar_items::picture(ui.painter(), pic, id, Tokens::icon());
@@ -520,6 +547,11 @@ fn commands(app: &mut App, ui: &mut Ui, side: f32, horizontal: bool) {
             );
         }
         let resp = resp.on_hover_ui(|ui| crate::ui::toolbar::rich_tip(ui, &name));
+        // A right click: the toolbox's menu under the command's
+        // Properties, as on a tool's button (#4206).
+        if !custom {
+            crate::ui::bars::bar_menu_of(app, &resp, crate::ui::bars::Bar::Toolbox, Some(id));
+        }
         if custom {
             if resp.hovered() {
                 ui.painter().rect_stroke(
@@ -532,8 +564,11 @@ fn commands(app: &mut App, ui: &mut Ui, side: f32, horizontal: bool) {
             if resp.drag_started() && !crate::ui::overflow::finger_sliding(ui.ctx()) {
                 app.bar_item_drag = Some(bar_items::ItemDrag {
                     item: id.clone(),
-                    from: Some((ItemBar::Toolbox, i)),
+                    from: Some((bar, i)),
                 });
+            }
+            if resp.clicked() && bar_items::customization_open(app) {
+                crate::ui::options::pick_bar_item(app, id);
             }
         } else if resp.clicked() {
             match tool {
@@ -551,7 +586,7 @@ fn commands(app: &mut App, ui: &mut Ui, side: f32, horizontal: bool) {
     // The whole toolbox takes a dropped command (after the tools when it
     // has none yet).
     app.bar_slots.push(bar_items::Slot {
-        bar: ItemBar::Toolbox,
+        bar,
         rect: ui.min_rect(),
         items: rects,
         vertical: !horizontal,
@@ -741,7 +776,36 @@ fn tool_button(
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let switch = resp.hovered() && app.flyout_open.is_some_and(|o| o != gi);
+        // Another list opens only once the pointer rests on this button a
+        // moment: on its way to a tool of the open list the pointer
+        // crosses other buttons, which swapped the list each time, so its
+        // tools were hard to reach (#4081).
+        let rest_id = resp.id.with("flyout_rest");
+        let passing = resp.hovered() && app.flyout_open.is_some_and(|o| o != gi);
+        let switch = if passing {
+            let now = ui.input(|i| i.time);
+            // Heading for the open list (the pointer inside the wedge from
+            // where it left that list's button to the list), the rest only
+            // counts once the pointer stops: a slow, steady move across
+            // the buttons on the way never swaps the list (#4081).
+            let moving = ui.input(|i| i.pointer.delta() != Vec2::ZERO);
+            let aiming = app
+                .flyout_open
+                .is_some_and(|o| heading_for_flyout(ui.ctx(), o, ui.input(|i| i.pointer.latest_pos())));
+            if aiming && moving {
+                ui.ctx().data_mut(|d| d.insert_temp(rest_id, now));
+            }
+            let since = ui.ctx().data_mut(|d| *d.get_temp_mut_or_insert_with(rest_id, || now));
+            if now - since >= FLYOUT_SWITCH_REST {
+                true
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+                false
+            }
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<f64>(rest_id));
+            false
+        };
         let pressed = (resp.drag_started() || resp.long_touched() || held)
             && !crate::ui::overflow::finger_sliding(ui.ctx());
         if pressed {
@@ -764,7 +828,11 @@ fn tool_button(
             .data(|d| d.get_temp::<bool>(flyout_press_id).unwrap_or(false));
     if resp.clicked() && !(has_flyout && on_arrow) && !opened_by_press {
         app.flyout_open = None;
-        app.choose_tool(shown);
+        if crate::ui::bar_items::customization_open(app) {
+            crate::ui::options::pick_bar_item(app, shown.id());
+        } else {
+            app.choose_tool(shown);
+        }
     }
     // Double-clicking a tool button: Pick selects every object, Shape
     // every node, Zoom fits the drawing, Rectangle adds a frame around
@@ -902,7 +970,11 @@ fn flyout(app: &mut App, ui: &mut Ui, gi: usize, button: Rect, dock: crate::ui::
                             );
                         }
                         if rr.on_hover_ui(|ui| tool_tooltip(ui, *t, &keys)).clicked() {
-                            app.choose_tool(*t);
+                            if crate::ui::bar_items::customization_open(app) {
+                                crate::ui::options::pick_bar_item(app, t.id());
+                            } else {
+                                app.choose_tool(*t);
+                            }
                             close = true;
                         }
                         if SEPARATE_AFTER.contains(t) {
@@ -941,6 +1013,71 @@ fn flyout(app: &mut App, ui: &mut Ui, gi: usize, button: Rect, dock: crate::ui::
     if close || clicked_elsewhere || (away && !over_toolbox) {
         app.flyout_open = None;
     }
+    // Where the pointer last was on this list's button, and where the list
+    // lies: the wedge between them is the way to the list (#4081).
+    let pointer = ui.input(|i| i.pointer.latest_pos());
+    let aim_id = flyout_aim_id();
+    let last: Option<FlyoutAim> = ui.ctx().data(|d| d.get_temp(aim_id));
+    let anchor = match pointer {
+        Some(p) if button.expand(1.0).contains(p) => p,
+        _ => last
+            .filter(|a| a.group == gi)
+            .map_or(button.center(), |a| a.anchor),
+    };
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            aim_id,
+            FlyoutAim {
+                group: gi,
+                list: area.response.rect,
+                anchor,
+            },
+        )
+    });
+}
+
+/// The open flyout's list and the point the pointer left its button
+/// from, kept from frame to frame (#4081).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FlyoutAim {
+    group: usize,
+    list: Rect,
+    anchor: Pos2,
+}
+
+fn flyout_aim_id() -> egui::Id {
+    egui::Id::new("toolbox_flyout_aim")
+}
+
+/// Whether `pointer` lies on the way from where it left group `open`'s
+/// button to that group's open list: inside the shape spanned by that
+/// point and the list (a little wider, for an unsteady hand).
+fn heading_for_flyout(ctx: &egui::Context, open: usize, pointer: Option<Pos2>) -> bool {
+    let Some(p) = pointer else {
+        return false;
+    };
+    let Some(aim) = ctx.data(|d| d.get_temp::<FlyoutAim>(flyout_aim_id())) else {
+        return false;
+    };
+    aim.group == open && in_wedge(aim.anchor, aim.list.expand(6.0), p)
+}
+
+/// Whether `p` lies inside the hull of point `a` and rectangle `r`.
+fn in_wedge(a: Pos2, r: Rect, p: Pos2) -> bool {
+    if r.contains(p) {
+        return true;
+    }
+    let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+    let cross = |o: Pos2, u: Pos2, v: Pos2| (u - o).x * (v - o).y - (u - o).y * (v - o).x;
+    (0..4).any(|i| {
+        let (b, c) = (corners[i], corners[(i + 1) % 4]);
+        let d1 = cross(a, b, p);
+        let d2 = cross(b, c, p);
+        let d3 = cross(c, a, p);
+        let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+        let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+        !(neg && pos)
+    })
 }
 
 /// The "+" at the end of the toolbox: tick the flyouts to show.
@@ -976,15 +1113,28 @@ fn quick_customize_button(app: &mut App, ui: &mut Ui) {
                 }
             }
             ui.separator();
-            if ui.button(tr("toolbox.reset")).clicked() {
+            if ui.ibutton("toolbox.reset").clicked() {
                 app.settings.toolbox_hidden.clear();
                 app.settings.show_outline_flyout = false;
+                ui.close();
+            }
+            // Commands to drag onto the toolbox, or onto a toolbar of
+            // one's own docked beside it (#3723).
+            if ui.ibutton("bars.customize_options").clicked() {
+                open_commands_page(app);
                 ui.close();
             }
         },
     )
     .response
     .rich_tip(tr("toolbox.quick_customize"));
+}
+
+/// The "+" menu > Customize...: Options > Customization > Commands on
+/// its General tab, the list whose commands drag onto the bars.
+pub(crate) fn open_commands_page(app: &mut App) {
+    app.shortcut_editor.keys_tab = false;
+    app.open_options_page(crate::ui::dialogs::OptionsPage::Commands);
 }
 
 fn set_group_visible(app: &mut App, gi: usize, on: bool) {
@@ -1120,10 +1270,20 @@ mod tests {
                 vec![egui::Event::PointerMoved(center)],
                 0.02,
             );
+            // Passing over another button keeps the open list (#4081);
+            // resting there a moment switches it.
+            if source != target {
+                assert_eq!(
+                    app.flyout_open,
+                    Some(group_of(tools[source])),
+                    "passing by keeps the list"
+                );
+            }
+            flyout_pointer_frame(&ctx, &mut app, Vec::new(), 0.4);
             assert_eq!(
                 app.flyout_open,
                 Some(target_group),
-                "hover switches the list"
+                "resting switches the list"
             );
             let chosen = app.tool_chosen;
             click_flyout_button(&ctx, &mut app, center);
@@ -1135,6 +1295,62 @@ mod tests {
                 "the click chooses the tool once"
             );
         }
+    }
+
+    /// On the way from a button to its open list the pointer crosses
+    /// other buttons; however slowly it moves, the list stays while it
+    /// heads for it, and resting on a button still switches (#4081).
+    #[test]
+    fn heading_for_the_open_list_never_swaps_it() {
+        let ctx = crate::theme::ui_context();
+        let mut app = App::headless();
+        flyout_pointer_frame(&ctx, &mut app, Vec::new(), 0.02);
+        let buttons = flyout_pointer_frame(&ctx, &mut app, Vec::new(), 0.02);
+        let arrow = buttons[0].right_bottom() - Vec2::splat(3.0);
+        click_flyout_button(&ctx, &mut app, arrow);
+        let first = group_of(Tool::Shape);
+        assert_eq!(app.flyout_open, Some(first));
+        flyout_pointer_frame(&ctx, &mut app, Vec::new(), 0.02);
+        let aim: FlyoutAim = ctx
+            .data(|d| d.get_temp(flyout_aim_id()))
+            .expect("the open list is kept");
+        assert_eq!(aim.group, first);
+        // From the arrow to the list's lowest tool: the steps on the next
+        // button down.
+        let target = aim.list.left_bottom() + Vec2::new(12.0, -6.0);
+        let path: Vec<Pos2> = (0..=200)
+            .map(|i| arrow + (target - arrow) * (i as f32 / 200.0))
+            .filter(|p| buttons[1].contains(*p) && !buttons[0].expand(1.0).contains(*p))
+            .collect();
+        assert!(path.len() >= 2, "the way crosses the next button: {path:?}");
+        // Slowly: a tenth of a second a step, back and forth, well over
+        // the rest that switches lists.
+        for k in 0..8 {
+            let p = path[k % path.len()];
+            flyout_pointer_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(p)], 0.1);
+            assert_eq!(app.flyout_open, Some(first), "step {k} at {p:?}");
+        }
+        // Off the way, straight down the toolbox, the rest switches.
+        assert!(!in_wedge(aim.anchor, aim.list.expand(6.0), buttons[1].left_center() + Vec2::new(2.0, 0.0)));
+        // Stopped on the button, the rest switches.
+        let last = *path.last().unwrap();
+        flyout_pointer_frame(&ctx, &mut app, Vec::new(), 0.4);
+        flyout_pointer_frame(&ctx, &mut app, Vec::new(), 0.02);
+        assert!(buttons[1].contains(last));
+        assert_eq!(app.flyout_open, Some(group_of(Tool::Zoom)), "resting switches");
+    }
+
+    /// The wedge: the list itself, and the way from the point to it.
+    #[test]
+    fn the_wedge_spans_the_point_and_the_list() {
+        let list = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(200.0, 200.0));
+        let a = Pos2::new(50.0, 10.0);
+        assert!(in_wedge(a, list, Pos2::new(150.0, 100.0)));
+        assert!(in_wedge(a, list, Pos2::new(90.0, 60.0)));
+        assert!(in_wedge(a, list, Pos2::new(60.0, 10.0)));
+        assert!(!in_wedge(a, list, Pos2::new(50.0, 60.0)));
+        assert!(!in_wedge(a, list, Pos2::new(40.0, 10.0)));
+        assert!(!in_wedge(a, list, Pos2::new(90.0, -20.0)));
     }
 
     /// Letting go after a hold or a sideways drag keeps the list open.

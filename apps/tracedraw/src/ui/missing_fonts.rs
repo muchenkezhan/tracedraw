@@ -11,6 +11,7 @@
 //! (tests, scripts, the MCP server), which keep the plain note. See
 //! docs/behavior/missing-fonts.md.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::i18n::{tr, trf};
 use crate::ui::dialogs::window;
@@ -41,6 +42,9 @@ pub struct MissingFontsState {
     pub keep: bool,
     /// Do not ask again (Options > Global > Warnings).
     pub dont_show: bool,
+    /// From now on take the automatic fonts without asking, replaced in
+    /// the drawing or for the session as chosen here (#3725).
+    pub always: bool,
     /// The installed families typed into the list's filter.
     pub filter: String,
     /// Pictures read smaller than the file holds them, said after this
@@ -72,6 +76,7 @@ impl MissingFontsState {
             rows,
             keep: false,
             dont_show: false,
+            always: false,
             filter: String::new(),
             shrunk: Vec::new(),
             families_seen: 0,
@@ -134,6 +139,12 @@ impl App {
         if st.dont_show {
             // The dialog's own choice: the plain note stays as it is.
             self.settings.warnings.ask_missing_fonts = false;
+            self.settings.save();
+        }
+        if st.always {
+            // Options > Global > Warnings turns it off again.
+            self.settings.warnings.accept_missing_fonts = true;
+            self.settings.warnings.accept_missing_fonts_keep = st.keep;
             self.settings.save();
         }
         self.check_missing_fonts();
@@ -210,7 +221,7 @@ pub fn dialog(app: &mut App, ctx: &Context, st: &mut MissingFontsState, close: &
             });
         ui.add_space(4.0);
         if ui
-            .button(tr("missing_fonts.add_font"))
+            .ibutton("missing_fonts.add_font")
             .rich_tip(crate::ui::tips::pair(
                 "missing_fonts.add_font",
                 "missing_fonts.add_font_tip",
@@ -230,6 +241,11 @@ pub fn dialog(app: &mut App, ctx: &Context, st: &mut MissingFontsState, close: &
         ui.radio_value(&mut st.keep, false, tr("missing_fonts.session"));
         ui.radio_value(&mut st.keep, true, tr("missing_fonts.keep"));
         ui.add_space(4.0);
+        ui.checkbox(&mut st.always, tr("missing_fonts.always"))
+            .rich_tip(crate::ui::tips::pair(
+                "missing_fonts.always",
+                "missing_fonts.always_tip",
+            ));
         ui.checkbox(&mut st.dont_show, tr("notes.dont_show"));
         let (o, h) = crate::ui::dialogs::help_ok_cancel(ui, close);
         ok = o;
@@ -406,17 +422,19 @@ mod tests {
     }
 
     /// For this session only: the drawing keeps its font name, the font
-    /// chosen draws it; Cancel changes nothing.
+    /// chosen draws it; Cancel changes nothing. A family of its own: the
+    /// stand-ins are shared, and another test that ends by dropping the
+    /// stand-in of the same family made this one fail when run beside it.
     #[test]
     fn a_font_chosen_for_the_session_draws_the_text_and_the_drawing_keeps_its_font() {
-        let (mut app, family) = drawing();
+        let (mut app, family) = drawing_in("Nowhere Grotesk 4202");
         let Some(other) = app
             .font_families
             .iter()
             .find(|f| {
                 Some(f.as_str())
                     != tracedraw_text::fonts()
-                        .substitute("Nowhere Grotesk 936")
+                        .substitute("Nowhere Grotesk 4202")
                         .as_deref()
             })
             .cloned()
@@ -431,7 +449,7 @@ mod tests {
         frame(&mut app, &ctx, Vec::new());
         app.dialog = Dialog::None;
         assert!(tracedraw_text::fonts()
-            .chosen_substitute("Nowhere Grotesk 936")
+            .chosen_substitute("Nowhere Grotesk 4202")
             .is_none());
         // Chosen for the session.
         app.show_open_notes("b.tdraw".into(), 0);
@@ -443,16 +461,16 @@ mod tests {
         let st = st.clone();
         app.apply_font_choices(&st);
         assert_eq!(
-            tracedraw_text::fonts().chosen_substitute("Nowhere Grotesk 936"),
+            tracedraw_text::fonts().chosen_substitute("Nowhere Grotesk 4202"),
             Some(other.clone())
         );
         assert_eq!(
             app.doc().font_families_used(),
-            vec!["Nowhere Grotesk 936".to_string()]
+            vec!["Nowhere Grotesk 4202".to_string()]
         );
-        assert_eq!(app.missing_fonts, vec!["Nowhere Grotesk 936".to_string()]);
+        assert_eq!(app.missing_fonts, vec!["Nowhere Grotesk 4202".to_string()]);
         assert!(app.status.contains(&other), "{}", app.status);
-        tracedraw_text::fonts().set_substitute("Nowhere Grotesk 936", None);
+        tracedraw_text::fonts().set_substitute("Nowhere Grotesk 4202", None);
     }
 
     /// The dialog has a choice of its own in Options > Global > Warnings:
@@ -495,6 +513,58 @@ mod tests {
         app.settings.warnings.missing_fonts = true;
         app.show_open_notes("old.cdr".into(), 0);
         assert!(matches!(&app.dialog, Dialog::OpenNotes(n) if n.fonts.len() == 1));
+        app.settings.warnings = Default::default();
+    }
+
+    /// Options > Global > Warnings can take the automatic fonts without
+    /// asking (#3725), replaced in the drawing or for the session; the
+    /// dialog's "Always" box turns it on with the way chosen there.
+    #[test]
+    fn the_automatic_fonts_can_be_taken_without_asking() {
+        let (mut app, family) = drawing_in("Nowhere Sans 3725");
+        if family.is_empty() || tracedraw_text::fonts().substitute("Nowhere Sans 3725").is_none() {
+            return;
+        }
+        app.ask_missing_fonts = true;
+        // Asked, and "Always" ticked with Replace in the drawing.
+        app.show_open_notes("a.cdr".into(), 0);
+        let Dialog::MissingFonts(st) = &mut app.dialog else {
+            panic!("asked");
+        };
+        st.keep = true;
+        st.always = true;
+        let st = st.clone();
+        app.apply_font_choices(&st);
+        assert!(app.settings.warnings.accept_missing_fonts);
+        assert!(app.settings.warnings.accept_missing_fonts_keep);
+        assert!(app.missing_fonts.is_empty());
+        app.undo();
+        app.check_missing_fonts();
+        // Opened again: replaced at once, nothing asked, one undo step.
+        app.dialog = Dialog::None;
+        app.show_open_notes("a.cdr".into(), 0);
+        assert!(matches!(app.dialog, Dialog::None), "{:?}", app.dialog);
+        assert!(app.missing_fonts.is_empty());
+        assert!(!app
+            .doc()
+            .font_families_used()
+            .contains(&"Nowhere Sans 3725".to_string()));
+        assert_eq!(app.status, tr("missing_fonts.replaced"));
+        app.undo();
+        app.check_missing_fonts();
+        // For the session only: the drawing keeps its font, no dialog and
+        // no note about the fonts.
+        app.settings.warnings.accept_missing_fonts_keep = false;
+        app.show_open_notes("a.cdr".into(), 0);
+        assert!(matches!(app.dialog, Dialog::None), "{:?}", app.dialog);
+        assert_eq!(
+            app.doc().font_families_used(),
+            vec!["Nowhere Sans 3725".to_string()]
+        );
+        // Turned off in the options: asked again.
+        app.settings.warnings.accept_missing_fonts = false;
+        app.show_open_notes("a.cdr".into(), 0);
+        assert!(matches!(app.dialog, Dialog::MissingFonts(_)));
         app.settings.warnings = Default::default();
     }
 }

@@ -8,6 +8,7 @@
 //! buttons, and Clear Transparency. The Transparency tool's bar keeps its
 //! one-row form (`toolbar::transparency_part`).
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::effects_ui::TransparencySettings;
 use crate::i18n::{tr, trf};
@@ -484,6 +485,10 @@ fn fountain_icon(k: FountainKind) -> (&'static str, fn(f32, f32) -> f32) {
                 1.0 - (0.45 - d) / 0.45
             }
         }),
+        // Not offered for a transparency (see `fountain`).
+        FountainKind::Points => ("f_radial", |u, v| {
+            (((u - 0.5).powi(2) + (v - 0.5).powi(2)).sqrt() * 2.0).clamp(0.0, 1.0)
+        }),
     }
 }
 
@@ -525,29 +530,44 @@ pub fn section(app: &mut App, ui: &mut Ui) {
     let ty = current.map(|k| TransparencyType::of(k, &set.mask));
     let mut field = None;
 
-    // Merge mode, full width at the top.
-    dim(ui, tr("transparency.merge_mode"));
+    // Merge mode, full width at the top; in the classic Properties
+    // layout on one row after its label.
+    let classic = crate::ui::dockers::classic_active(ui.ctx());
     let merge_shown = !mixed.contains(&F::Merge);
-    crate::ui::keynav::ComboBox::from_id_salt("transparency_docker_merge")
-        .selected_text(if merge_shown {
-            set.merge.name().to_string()
-        } else {
-            String::new()
-        })
-        .width(ui.available_width() - 4.0)
-        .show_ui(ui, |ui| {
-            for m in tracedraw_core::live::MergeMode::ALL {
-                if ui
-                    .selectable_label(merge_shown && set.merge == m, m.name())
-                    .clicked()
-                {
-                    set.merge = m;
-                    field = Some(F::Merge);
+    let mut merge_list = |ui: &mut Ui, field: &mut Option<F>| {
+        crate::ui::keynav::ComboBox::from_id_salt("transparency_docker_merge")
+            .selected_text(if merge_shown {
+                set.merge.name().to_string()
+            } else {
+                String::new()
+            })
+            .width(ui.available_width() - 4.0)
+            .show_ui(ui, |ui| {
+                for m in tracedraw_core::live::MergeMode::ALL {
+                    if ui
+                        .selectable_label(merge_shown && set.merge == m, m.name())
+                        .clicked()
+                    {
+                        set.merge = m;
+                        *field = Some(F::Merge);
+                    }
                 }
-            }
-        })
-        .response
-        .rich_tip(crate::ui::tips::keyed("transparency.merge_mode"));
+            })
+            .response
+            .rich_tip(crate::ui::tips::keyed("transparency.merge_mode"));
+    };
+    if classic {
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{}:",
+                tr("transparency.merge_mode").trim_end_matches(':')
+            ));
+            merge_list(ui, &mut field);
+        });
+    } else {
+        dim(ui, tr("transparency.merge_mode"));
+        merge_list(ui, &mut field);
+    }
 
     // The type buttons.
     ui.horizontal_wrapped(|ui| {
@@ -659,7 +679,7 @@ pub fn section(app: &mut App, ui: &mut Ui) {
     if ui
         .add_enabled(
             app.can_clear_transparency(),
-            egui::Button::new(tr("toolbar.clear_transparency")),
+            crate::ui::btn_icons::Ib::new("toolbar.clear_transparency"),
         )
         .rich_tip(crate::ui::tips::keyed("toolbar.clear_transparency"))
         .clicked()
@@ -812,7 +832,7 @@ fn picker(
             save_transparency(app, &set.mask);
         }
         if ui
-            .button(tr("transparency.edit"))
+            .ibutton("transparency.edit")
             .rich_tip(crate::ui::tips::keyed("transparency.edit"))
             .clicked()
         {
@@ -844,7 +864,11 @@ fn fountain(ui: &mut Ui, set: &mut TransparencySettings, mixed: &[F], field: &mu
     let kind_shown = !mixed.contains(&F::MaskKind);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        for k in FountainKind::ALL {
+        // Colour points are a fill of their own, not a transparency.
+        for k in FountainKind::ALL
+            .into_iter()
+            .filter(|k| *k != FountainKind::Points)
+        {
             let (name, g) = fountain_icon(k);
             let tex = icon_texture(ui, name, g);
             if icon_button(ui, &tex, kind_shown && f.kind == k)
@@ -1052,7 +1076,7 @@ fn two_greys(ui: &mut Ui, set: &mut TransparencySettings, field: &mut Option<F>)
         new.1 = transparency_gray(bg_t);
     }
     if ui
-        .button(tr("transparency.swap"))
+        .ibutton("transparency.swap")
         .rich_tip(crate::ui::tips::keyed("transparency.swap"))
         .clicked()
     {
@@ -1149,6 +1173,8 @@ fn texture(ui: &mut Ui, set: &mut TransparencySettings, field: &mut Option<F>) {
         TextureKind::Marble => "texture.marble",
         TextureKind::Noise => "texture.noise",
         TextureKind::Wood => "texture.wood",
+        TextureKind::Holographic => "texture.holographic",
+        TextureKind::HoloGlitter => "texture.holo_glitter",
     };
     crate::ui::keynav::ComboBox::from_id_salt("transparency_docker_texture")
         .selected_text(tr(key(t.kind)))

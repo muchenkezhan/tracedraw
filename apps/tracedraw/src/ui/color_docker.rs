@@ -9,6 +9,7 @@
 //! Spot Colors, Add to Color Styles Palette). When the selection changes,
 //! the new color becomes the selected object's fill.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
@@ -120,6 +121,12 @@ fn set_color(app: &mut App, c: Color) {
     if s > 1e-3 {
         app.color_docker.hue = h;
     }
+}
+
+/// A colour sampled by the Color Eyedropper becomes the docker's new
+/// colour as well.
+pub fn take_sampled_color(app: &mut App, c: Color) {
+    set_color(app, c);
 }
 
 /// A 28 x 26 picture button, shaded while `on`.
@@ -889,7 +896,7 @@ fn options_menu(app: &mut App, ui: &mut Ui) {
         app.color_docker.lock = lock;
     }
     ui.separator();
-    if ui.button(tr("docker.reset_panel")).clicked() {
+    if ui.ibutton("docker.reset_panel").clicked() {
         reset(app);
         ui.close();
     }
@@ -965,25 +972,14 @@ fn top_row(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// The hex row: the new colour's code, typed values applied when the
-/// field is left, and the gamut warning.
+/// The hex row: the new colour's code in the buffered field the colour
+/// picker uses, so a code can be typed, erased, copied and pasted, and
+/// the gamut warning.
 fn hex_row(ui: &mut Ui, c: &mut Color) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(tr("docker.hex"));
-        let mut hex = c.to_hex();
-        if ui
-            .add(egui::TextEdit::singleline(&mut hex).desired_width(64.0))
-            .rich_tip(crate::ui::tips::keyed("docker.hex_color"))
-            .lost_focus()
-        {
-            if let Some(nc) = Color::from_hex(&hex) {
-                if nc.to_hex() != c.to_hex() {
-                    *c = nc;
-                    changed = true;
-                }
-            }
-        }
+        changed = crate::ui::color_picker::hex_field(ui, egui::Id::new("col_docker_hex"), c);
         if !c.in_cmyk_gamut(6.0) {
             gamut_warning(ui).rich_tip(tr("docker.gamut_warning"));
         }
@@ -1152,7 +1148,7 @@ fn actions(app: &mut App, ui: &mut Ui, c: Color) {
     });
     if let Some(ec) = app.eyedropper_color {
         if ui
-            .add(egui::Button::new(trf("docker.use_sampled", &[("c", &ec.to_hex())])).small())
+            .add(crate::ui::btn_icons::Ib::with_text("docker.use_sampled", trf("docker.use_sampled", &[("c", &ec.to_hex())])).small())
             .rich_tip(crate::ui::tips::keyed("docker.use_sampled_tip"))
             .clicked()
         {
@@ -1164,38 +1160,56 @@ fn actions(app: &mut App, ui: &mut Ui, c: Color) {
 /// The items of the "..." menu; `has`: something is selected.
 fn more_actions(app: &mut App, ui: &mut Ui, c: Color, has: bool) {
     if ui
-        .add_enabled(has, egui::Button::new(tr("docker.no_fill")))
+        .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.no_fill"))
         .clicked()
     {
         app.apply_fill(Fill::None);
         ui.close();
     }
     if ui
-        .add_enabled(has, egui::Button::new(tr("docker.no_outline_action")))
+        .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.no_outline_action"))
         .clicked()
     {
         app.apply_outline_color(None);
         ui.close();
     }
     if ui
-        .add_enabled(has, egui::Button::new(tr("docker.swap_colors")))
+        .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.swap_colors"))
         .clicked()
     {
         app.swap_colors();
         ui.close();
     }
+    // Two objects exchange their fills; each outline takes its own
+    // object's fill colour (#3770).
+    if ui
+        .add_enabled(app.selection.len() == 2, crate::ui::btn_icons::Ib::new("docker.swap_fills"))
+        .rich_tip(crate::ui::tips::keyed("docker.swap_fills"))
+        .clicked()
+    {
+        app.swap_fills();
+        ui.close();
+    }
+    if ui
+        .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.outline_from_fill"))
+        .rich_tip(crate::ui::tips::keyed("docker.outline_from_fill"))
+        .clicked()
+    {
+        app.outline_from_fill();
+        ui.close();
+    }
     ui.separator();
-    if ui.button(tr("docker.add_to_document_palette")).clicked() {
+    if ui.ibutton("docker.add_to_document_palette").clicked() {
         app.add_to_document_palette(c);
         ui.close();
     }
-    if ui.button(tr("docker.add_to_spot_colors")).clicked() {
+    if ui.ibutton("docker.add_to_spot_colors").clicked() {
         let name = spot_ink_name(app, c);
         add_ink(app, name, c);
         app.color_docker.new_ink.clear();
         ui.close();
     }
-    if ui.button(tr("docker.add_to_color_styles")).clicked() {
+    if ui.ibutton("docker.add_to_color_styles").clicked() {
         crate::ui::dockers2::add_color_style(app, c);
         ui.close();
     }
@@ -1290,14 +1304,14 @@ fn spot_inks(app: &mut App, ui: &mut Ui, current: Color, with_tint: bool) {
                 }
             }
             if ui
-                .add_enabled(has, egui::Button::new(tr("docker.fill")).small())
+                .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.fill").small())
                 .rich_tip(crate::ui::tips::pair("docker.fill", "docker.ink_fill_desc"))
                 .clicked()
             {
                 app.apply_fill(Fill::Solid(ink.color(tint)));
             }
             if ui
-                .add_enabled(has, egui::Button::new(tr("docker.outline")).small())
+                .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.outline").small())
                 .rich_tip(crate::ui::tips::pair(
                     "docker.outline",
                     "docker.ink_outline_desc",
@@ -1333,7 +1347,7 @@ fn spot_inks(app: &mut App, ui: &mut Ui, current: Color, with_tint: bool) {
         if ui
             .add_enabled(
                 !name.is_empty() && !taken,
-                egui::Button::new(tr("docker.new_ink")),
+                crate::ui::btn_icons::Ib::new("docker.new_ink"),
             )
             .rich_tip(tr("docker.new_ink_tip"))
             .clicked()

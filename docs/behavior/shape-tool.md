@@ -153,6 +153,7 @@ chosen it deletes the selected object, as the Delete key does (#1982).
 | Double-click node | delete |
 | Double-click a rectangle, ellipse or polygon | it becomes a curve; pictures, text, groups and clip frames stay as they are |
 | Drag a picture's corner | the picture goes into a clip frame of its rectangle (Crop Bitmap) and the corner moves as a node of that frame; a clip frame's frame shows its nodes and edits like any curve, so a cropped picture can be reshaped further |
+| Drag a picture's edge (away from its corners) | the picture goes into a clip frame of its rectangle as for a corner, and the edge's two corner nodes are chosen and move together, so the picture is cropped from that side and not stretched; Ctrl keeps the move to one axis (#3532, `shape_tool::bitmap_node_tests::an_edge_of_a_picture_drags_to_crop_it`) |
 | Delete, Backspace, Edit > Delete, the node menu's Delete, the toolbar's Delete button | with a segment chosen by a click: deletes that segment, its nodes staying (an open curve splits there or loses its end, a closed one opens there, a curve left with no segment is deleted; one undo step, Delete Segment); otherwise deletes the selected nodes; when a deleted node sat between segments and either side was a curve, one cubic is refitted from the segment before to the segment after (least squares with the old end tangents held, Graphics Gems), so the curve is kept rather than collapsing to the far handles; the first node of a closed curve too, its last and first segments refitted into one (#472, `nodes::tests::deleting_the_start_of_a_closed_curve_keeps_the_shape`); a node between two straight segments leaves a straight join; two or more neighbouring nodes deleted together become one curve between the nodes either side, fitted by least squares to the old segments, so the outline keeps its general shape even when they were all lines: at an end where the run's segment or the kept node's other segment is a curve the old tangent is held (only the handle's length is fitted, so a smooth node stays smooth), and between lines the handle is free in both directions; a closed curve left with one node is that node alone; the whole deletion is one pass over the curve, however many nodes go (#675, `nodes::tests::neighbouring_line_nodes_deleted_together_become_a_curve`, `a_run_between_curves_keeps_the_kept_nodes_smooth`, `a_run_holds_the_tangent_where_a_curve_meets_it`, `lone_nodes_go_as_delete_node_takes_them`, `deleting_many_nodes_of_a_long_curve_is_one_pass`, `pick_drag_tests::deleting_two_neighbouring_line_nodes_leaves_a_curve`). Every route takes the chosen nodes and never the object they belong to: Edit > Delete removed the whole object while nodes were chosen (#1982, `pick_drag_tests::the_delete_key_with_a_chosen_node_takes_the_node_not_the_object`, `edit_delete_with_a_chosen_node_takes_the_node_not_the_object`, `the_node_menus_delete_with_a_chosen_node_takes_the_node_not_the_object`). With no node chosen, each of them deletes the selected object, one undo step bringing it back (`delete_with_the_shape_tool_and_no_node_chosen_removes_the_object`) |
 | + / - | with nodes chosen: a node in the middle of each segment ending at them (for the start node of a closed curve, its closing segment), the chosen nodes staying chosen together with the new ones, so each press halves those segments again (a square with every node chosen: 4, 8, 16 nodes; #1326, `node_edit::tests::add_nodes_again_keeps_doubling`) / delete them (without chosen nodes they zoom) |
 | C, S, Y (with nodes chosen) | C makes them cusp, S smooth and Y symmetrical, each key one type whatever the nodes were (C used to turn a cusp node smooth and S to make nodes symmetrical, so neither gave the type it stands for, #2210, `pick_drag_tests::node_keys_in_the_shape_tool`); while nodes are chosen these letters do not align objects or pick tools. The type chosen is kept with the curve (saved in `.tdraw`), so a cusp node may keep aligned handles and its handles still move apart; nodes never given a type read as their handles do (aligned: smooth; aligned and of equal length: symmetrical), and a curve that gains or loses nodes goes back to that |
@@ -304,6 +305,24 @@ round their corners with their own handles either way.
   the curve (sharp or rounded) takes the new radius (a rounded corner is
   chosen by any node of its arc). Dragging back past the corner makes it sharp. Scallops
   and chamfers are found again only right after they were cut (below).
+- Rounded corners follow node edits (#3265): Options > Nodes and
+  Handles > Rounded corners follow node edits (on at first, under the
+  rings option, which it needs). Moving nodes (a drag, the arrow keys,
+  the node transform handles) or bending a segment of a curve with
+  rounded corners makes the edit on the curve with those corners taken
+  back to their sharp corners, then rounds each of them again with the
+  radius it had, so a rounded corner beside a moved node or a bent side
+  stays a circular arc tangent to its sides where they now run, and
+  keeps its widget. A rounded corner whose arc nodes are all among the
+  moved ones moves as its sharp corner; one with only some of its arc
+  nodes moved, or whose own arc is bent, is left as curve, as before. A
+  corner whose sides no longer take its radius gets the largest radius
+  they take; one whose sides come into line stays sharp. Looked for on
+  curves of up to 4000 elements. Off, the arc stays as it was drawn and
+  loses its widget once its sides move, as before
+  (`tracedraw_core` `corner_cut::tests::rounded_corners_stay_round_when_nodes_move`,
+  `corner_cut::tests::rounded_corners_stay_round_when_a_side_bends`,
+  `pick_drag_tests::rounded_corners_stay_round_when_a_node_beside_them_moves`).
 - On a stretched or skewed curve corners round on the page, so a new
   rounding is round, also on a curve stretched after other corners were
   rounded. A corner rounded before the stretch keeps its stretched arc

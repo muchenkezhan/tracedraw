@@ -24,6 +24,12 @@ back.
    The settings sit in a panel at the right; under it **Reset** puts every
    setting back to its default, and the two arrows undo and redo the changes
    made in the dialog box.
+   With **Settings in the Effects panel** ticked, effects open in the Effects panel
+   beside the drawing instead: pick the effect from the list at its top, set
+   the sliders while the drawing shows the result, then click
+   **Apply** (one undo step) or **Cancel**. Untick the box there to
+   go back to the dialog box. Image Adjustments and Tone Curve keep their
+   dialog boxes.
 
 ![A bitmap effect dialog box](../../img/effects-bitmap-effects.png)
 
@@ -39,7 +45,7 @@ The change to the whole selection is one undo step. With a bitmap selected,
 | [[menu.effects.adjust]] | [[fx.auto_adjust]], [[fx.image_adjustments]], [[fx.contrast_enhancement]], [[fx.local_equalization]], [[fx.target_balance]], [[fx.tone_curve]], [[fx.brightness_contrast_intensity]], [[fx.color_balance]], [[fx.gamma]], [[fx.hue_saturation_lightness]], [[fx.selective_color]], [[fx.replace_colors]], [[fx.desaturate]], [[fx.channel_mixer]] |
 | [[menu.effects.art_strokes]] | [[fx.charcoal]], [[fx.conte_crayon]], [[fx.crayon]], [[fx.cubist]], [[fx.impressionist]], [[fx.palette_knife]], [[fx.pastels]], [[fx.pen_ink]], [[fx.pointillist]], [[fx.scraperboard]], [[fx.sketch_pad]], [[fx.watercolor]], [[fx.felt_marker]], [[fx.paper_grain]], [[fx.paper_layers]], [[fx.bristle_paint]], [[fx.mural_paint]], [[fx.luminous_wash]], [[fx.inked_poster]], [[fx.diagonal_smear]], [[fx.blotted_color]], [[fx.primed_canvas]], [[fx.chalked_edges]], [[fx.diagonal_hatching]], [[fx.pencil_weave]], [[fx.light_shadow_strokes]], [[fx.spray_streaks]], [[fx.ink_wash]], [[fx.copier_toner]], [[fx.rubber_print]], [[fx.wet_fiber_paper]] |
 | [[menu.effects.blur]] | [[fx.directional_smooth]], [[fx.gaussian_blur]], [[fx.jagged_edges]], [[fx.low_pass]], [[fx.motion_blur]], [[fx.radial_blur]], [[fx.smart_blur]], [[fx.smooth]], [[fx.soften]], [[fx.zoom]] |
-| [[menu.effects.camera]] | [[fx.colorize]], [[fx.diffuse]], [[fx.photo_filter]], [[fx.sepia_toning]], [[fx.vintage_photo]] |
+| [[menu.effects.camera]] | [[fx.colorize]], [[fx.diffuse]], [[fx.lens_correction]], [[fx.photo_filter]], [[fx.sepia_toning]], [[fx.tilt_shift]], [[fx.vintage_photo]] |
 | [[menu.effects.color_transform]] | [[fx.bit_planes]], [[fx.halftone]], [[fx.psychedelic]], [[fx.solarize]], [[fx.dither]], [[fx.gradient_map]], [[fx.riso_print]], [[fx.newsprint]], [[fx.grit_screen]] |
 | [[menu.effects.contour_group]] | [[fx.edge_detect]], [[fx.find_edges]], [[fx.trace_contour]], [[fx.neon_outline]] |
 | [[menu.effects.correction]] | [[fx.dust_and_scratch]] |
@@ -73,8 +79,11 @@ The change to the whole selection is one undo step. With a bitmap selected,
 ## Editing the effects of an object {#fx-section}
 
 The [[docker.fx]] section of the [[docker.properties]] panel lists the
-effects of the selected object, first applied at the top. Each row has a
-check box to show or hide the effect, **Edit** (opens its dialog box),
+effects of the selected object, first applied at the top: the live effects
+of its stack (contour, envelope, extrusion, shadows, glows and the others of
+the Effects panel) above its bitmap effects. Each row has an eye that shows or
+hides the effect (a hidden effect keeps its place and settings), **Edit**
+(opens its dialog box, or for a live effect the panel that sets it),
 **Move up**, **Move down** and **Delete**. **Add effect** opens the effect
 groups.
 

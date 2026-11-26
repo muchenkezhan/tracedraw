@@ -4,6 +4,7 @@
 //! colours; the object and colour accelerations. They show the selected
 //! contour and edit the selected contours live.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::contour_tool::{blend_key, join_key, ContourDirection};
 use crate::i18n::tr;
@@ -37,6 +38,23 @@ fn accel(ui: &mut Ui, key: &str, v: &mut f64) -> bool {
 
 /// The controls, a group to a row.
 pub fn contour_controls(app: &mut App, ui: &mut Ui) {
+    contour_controls_in(app, ui, false);
+}
+
+/// A row of the controls: in the docker (`wrap`) it breaks onto further
+/// lines when the panel is narrowed, as the Properties docker's rows do,
+/// instead of running past the panel's edge (#4148); in the bar it stays
+/// one line.
+fn group_row<R>(ui: &mut Ui, wrap: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if wrap {
+        ui.horizontal_wrapped(add).inner
+    } else {
+        ui.horizontal(add).inner
+    }
+}
+
+/// [`contour_controls`], its rows wrapped when `wrap` (the docker).
+pub fn contour_controls_in(app: &mut App, ui: &mut Ui, wrap: bool) {
     app.sync_contour_settings();
     // A box of these controls typed into and left with Enter: the focus
     // it held before them is gone after them.
@@ -44,10 +62,10 @@ pub fn contour_controls(app: &mut App, ui: &mut Ui) {
     let palette = app.palette.clone();
     let mut s = app.contour;
     let mut changed = false;
-    ui.horizontal(|ui| {
+    group_row(ui, wrap, |ui| {
         for d in ContourDirection::ALL {
             if ui
-                .selectable_label(s.direction == d, tr(d.key()))
+                .iselectable(s.direction == d, d.key())
                 .rich_tip(crate::ui::tips::keyed(d.key()))
                 .clicked()
                 && s.direction != d
@@ -57,7 +75,7 @@ pub fn contour_controls(app: &mut App, ui: &mut Ui) {
             }
         }
     });
-    ui.horizontal(|ui| {
+    group_row(ui, wrap, |ui| {
         crate::ui::toolbar::dim_labelled_as(ui, "docker.steps", "contour.steps_desc", |ui| {
             // A slider (with its number box), stepped on a logarithmic
             // scale so the first steps are easy to pick (#1265).
@@ -105,7 +123,7 @@ pub fn contour_controls(app: &mut App, ui: &mut Ui) {
             .response
             .rich_tip(tr("contour.corners"));
     });
-    ui.horizontal(|ui| {
+    group_row(ui, wrap, |ui| {
         crate::ui::keynav::ComboBox::from_id_salt("contour_blend")
             .selected_text(tr(blend_key(s.color_blend)))
             .width(110.0)
@@ -154,7 +172,7 @@ pub fn contour_controls(app: &mut App, ui: &mut Ui) {
             true,
         );
     });
-    ui.horizontal(|ui| {
+    group_row(ui, wrap, |ui| {
         changed |= accel(ui, "docker.object_acceleration", &mut s.accel_objects);
         changed |= accel(ui, "docker.color_acceleration", &mut s.accel_colors);
     });
@@ -179,42 +197,53 @@ fn apply_on_enter(app: &mut App) {
     }
 }
 
-/// Selected objects that can take a contour and have none.
+/// Selected objects that can take a contour and have none: a group too,
+/// drawn round its objects (#3245); Apply was not offered for one, so a
+/// selected group seemed unable to take a contour (#3667).
 fn has_bare(app: &App) -> bool {
     app.selected_shapes().iter().any(|s| {
         !s.effects
             .iter()
             .any(|e| matches!(e, tracedraw_core::live::Effect::Contour { .. }))
-            && !matches!(
-                s.kind,
-                tracedraw_core::ShapeKind::Bitmap { .. } | tracedraw_core::ShapeKind::Group { .. }
-            )
+            && !matches!(s.kind, tracedraw_core::ShapeKind::Bitmap { .. })
     })
 }
 
-/// Apply (for selected objects with no contour), Clear Contour and Break
-/// Apart.
+/// Copy Contour From: the next object clicked gives the selected objects
+/// its contour, as Object > Copy Effect > Contour From does (#3667).
+fn start_copy_contour(app: &mut App) {
+    app.pending_copy_effect = Some(crate::copy_effect::CopyKind::Contour);
+    app.status = tr("status.click_source_object");
+}
+
+/// Apply (for selected objects with no contour), Clear Contour, Break
+/// Apart and Copy Contour From.
 pub fn contour_actions(app: &mut App, ui: &mut Ui) {
+    contour_actions_in(app, ui, false);
+}
+
+/// [`contour_actions`], the buttons wrapped when `wrap` (the docker).
+pub fn contour_actions_in(app: &mut App, ui: &mut Ui, wrap: bool) {
     let has = app.selected_contour().is_some();
     let bare = has_bare(app);
-    ui.horizontal(|ui| {
+    group_row(ui, wrap, |ui| {
         if bare
             && ui
-                .button(tr("docker.apply"))
+                .ibutton("docker.apply")
                 .rich_tip(crate::ui::tips::pair("docker.apply", "contour.apply_desc"))
                 .clicked()
         {
             app.add_contour();
         }
         if ui
-            .add_enabled(has, egui::Button::new(tr("contour.clear")))
+            .add_enabled(has, crate::ui::btn_icons::Ib::new("contour.clear"))
             .rich_tip(crate::ui::tips::keyed("contour.clear"))
             .clicked()
         {
             app.clear_contour();
         }
         if ui
-            .add_enabled(has, egui::Button::new(tr("docker.break_apart")))
+            .add_enabled(has, crate::ui::btn_icons::Ib::new("docker.break_apart"))
             .rich_tip(crate::ui::tips::pair(
                 "docker.break_apart",
                 "toolbar.effect_break_apart_desc",
@@ -222,6 +251,19 @@ pub fn contour_actions(app: &mut App, ui: &mut Ui) {
             .clicked()
         {
             app.break_effect_groups();
+        }
+        if ui
+            .add_enabled(
+                !app.selection.is_empty(),
+                crate::ui::btn_icons::Ib::new("contour.copy_from"),
+            )
+            .rich_tip(crate::ui::tips::pair(
+                "contour.copy_from",
+                "contour.copy_from_desc",
+            ))
+            .clicked()
+        {
+            start_copy_contour(app);
         }
     });
 }
@@ -284,6 +326,50 @@ mod tests {
         app.contour.direction = ContourDirection::Outside;
         frame(&mut app, true);
         assert_eq!(app.contour.direction, ContourDirection::Inside);
+    }
+
+    /// A selected group is offered Apply, and Copy Contour From gives
+    /// the selection the contour of the object clicked next (#3667).
+    #[test]
+    fn a_group_is_offered_apply_and_a_contour_can_be_copied() {
+        let mut app = App::headless();
+        app.tool = crate::tools::Tool::Contour;
+        let square = |app: &mut App, x: f64| {
+            app.new_shape(ShapeKind::Rect {
+                rect: Rect::new(x, 0.0, x + 20.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("square")
+        };
+        let (a, b) = (square(&mut app, 0.0), square(&mut app, 30.0));
+        app.select(vec![a, b]);
+        app.group_selection();
+        let g = app.selection[0];
+        assert!(has_bare(&app), "a group without a contour is offered Apply");
+        // The source: a third object with a contour of 4 steps.
+        let src = square(&mut app, 100.0);
+        app.select(vec![src]);
+        app.contour.steps = 4;
+        app.add_contour();
+        let contour = |app: &App, id| {
+            app.doc().find_shape(id).and_then(|s| {
+                s.effects
+                    .iter()
+                    .find(|e| matches!(e, tracedraw_core::live::Effect::Contour { .. }))
+                    .cloned()
+            })
+        };
+        let want = contour(&app, src).expect("the source has a contour");
+        app.select(vec![g]);
+        start_copy_contour(&mut app);
+        assert_eq!(
+            app.pending_copy_effect,
+            Some(crate::copy_effect::CopyKind::Contour)
+        );
+        let kind = app.pending_copy_effect.take().expect("waiting");
+        app.copy_effect_from(src, kind);
+        assert_eq!(contour(&app, g), Some(want));
     }
 
     #[test]

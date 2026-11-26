@@ -16,16 +16,21 @@ pub enum FountainKind {
     /// Follows the object's outline: 0 on its edge, 1 at the point
     /// deepest inside it.
     Shaped,
+    /// Colour points placed anywhere in the object (see
+    /// [`Fountain::points`]): each spot takes the colours of the points
+    /// near it, the nearest the most.
+    Points,
 }
 
 impl FountainKind {
     /// Every kind, in the order the fill editor lists them.
-    pub const ALL: [FountainKind; 5] = [
+    pub const ALL: [FountainKind; 6] = [
         FountainKind::Linear,
         FountainKind::Radial,
         FountainKind::Conical,
         FountainKind::Square,
         FountainKind::Shaped,
+        FountainKind::Points,
     ];
 }
 
@@ -195,6 +200,20 @@ pub struct Fountain {
     /// keep the nearest equivalent for formats that know only those).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handles: Option<FountainHandles>,
+    /// Dithered: a faint even noise over the colours, so a long blend
+    /// between close colours shows no steps.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub dither: bool,
+    /// Colour points (the Points kind): where each stop's colour sits,
+    /// box-relative as [`FountainHandles`] are. Stops without one are
+    /// placed round the middle (see [`Fountain::point_places`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<Point>,
+    /// Colour points: how far each stop's colour reaches (#3947), 1 by
+    /// default, from [`Fountain::MIN_SPREAD`] to [`Fountain::MAX_SPREAD`];
+    /// a stop without one has 1 (see [`Fountain::point_spread`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spreads: Vec<f64>,
 }
 
 /// The nodes of a fountain fill placed freely (see [`Fountain::handles`]),
@@ -280,6 +299,9 @@ impl Fountain {
             smooth: false,
             acceleration: 0,
             handles: None,
+            dither: false,
+            points: Vec::new(),
+            spreads: Vec::new(),
         }
     }
 
@@ -368,6 +390,66 @@ impl Fountain {
         sample_stop(blended, self.band_param(self.stop_param(t)))
     }
 
+    /// Where each stop's colour point is (box-relative): its own place,
+    /// or, for a stop without one, a place round the middle.
+    pub fn point_places(&self) -> Vec<Point> {
+        let n = self.stops.len().max(1) as f64;
+        (0..self.stops.len())
+            .map(|i| {
+                self.points.get(i).copied().unwrap_or_else(|| {
+                    let a = std::f64::consts::TAU * i as f64 / n + std::f64::consts::FRAC_PI_4;
+                    Point::new(0.6 * a.cos(), 0.6 * a.sin())
+                })
+            })
+            .collect()
+    }
+
+    /// The smallest and largest spread of a colour point (#3947).
+    pub const MIN_SPREAD: f64 = 0.1;
+    pub const MAX_SPREAD: f64 = 10.0;
+
+    /// How far colour point `i` reaches: its spread, 1 when it has none.
+    pub fn point_spread(&self, i: usize) -> f64 {
+        self.spreads
+            .get(i)
+            .copied()
+            .filter(|s| s.is_finite())
+            .unwrap_or(1.0)
+            .clamp(Self::MIN_SPREAD, Self::MAX_SPREAD)
+    }
+
+    /// The colour and opacity of a Points fill at the page point `p` for
+    /// the object's box `b`: every point's colour weighed by its spread
+    /// squared over its squared distance, so the nearest point counts the
+    /// most and a point with twice the spread reaches as far as one with
+    /// 1 at half the distance (#3947); on a point, its own colour.
+    pub fn points_sample(&self, places: &[Point], b: Rect, p: Point) -> (Color, f32) {
+        let scale = b.width().hypot(b.height()).max(1e-9);
+        let (mut rgb, mut op, mut sum) = ([0.0f64; 3], 0.0f64, 0.0f64);
+        for (i, (stop, r)) in self.stops.iter().zip(places).enumerate() {
+            let d = Self::rel_to_page(b, *r).distance(p) / scale;
+            if d < 1e-6 {
+                return (stop.color, stop.opacity);
+            }
+            let k = self.point_spread(i);
+            let w = k * k / (d * d);
+            let c = stop.color.to_rgb8();
+            for k in 0..3 {
+                rgb[k] += w * f64::from(c[k]);
+            }
+            op += w * f64::from(stop.opacity);
+            sum += w;
+        }
+        if sum <= 0.0 {
+            return (Color::BLACK, 1.0);
+        }
+        let ch = |v: f64| (v / sum).round().clamp(0.0, 255.0) as u8;
+        (
+            Color::rgb8(ch(rgb[0]), ch(rgb[1]), ch(rgb[2])),
+            (op / sum).clamp(0.0, 1.0) as f32,
+        )
+    }
+
     /// A box-relative point (see [`FountainHandles`]) on the page, for the
     /// object's bounding box `b`.
     pub fn rel_to_page(b: Rect, r: Point) -> Point {
@@ -396,7 +478,7 @@ impl Fountain {
     /// nodes when they are placed freely, else `None` (the angle and the
     /// offset place the fill). A frame that is flat counts as none.
     pub fn frame(&self, b: Rect) -> Option<Affine> {
-        if self.kind == FountainKind::Shaped {
+        if matches!(self.kind, FountainKind::Shaped | FountainKind::Points) {
             return None;
         }
         let h = self.handles?;
@@ -428,7 +510,7 @@ impl Fountain {
                 }
             }
             FountainKind::Square => u.abs().max(v.abs()),
-            FountainKind::Shaped => return None,
+            FountainKind::Shaped | FountainKind::Points => return None,
         })
     }
 
@@ -441,7 +523,7 @@ impl Fountain {
         let c = b.center();
         let rel = |p: Point| Self::page_to_rel(b, p);
         match self.kind {
-            FountainKind::Linear | FountainKind::Shaped => {
+            FountainKind::Linear | FountainKind::Shaped | FountainKind::Points => {
                 let half = (b.width() * ca.abs() + b.height() * sa.abs()) / 2.0;
                 let d = Vec2::new(ca, sa) * half;
                 let s = c - d;
@@ -867,6 +949,7 @@ impl Fountain {
         Fountain {
             kind: match self.kind {
                 FountainKind::Shaped => FountainKind::Square,
+                FountainKind::Points => FountainKind::Radial,
                 k => k,
             },
             stops,
@@ -882,6 +965,9 @@ impl Fountain {
             smooth: false,
             acceleration: 0,
             handles: None,
+            dither: self.dither,
+            points: Vec::new(),
+            spreads: Vec::new(),
         }
     }
 }
@@ -1066,6 +1152,12 @@ pub struct PatternPlacement {
     /// Whether `shift_percent` moves the rows or the columns.
     #[serde(default, skip_serializing_if = "is_default_shift")]
     pub shift: TileShift,
+    /// How much each row (or column, the same way as `shift`) lies over
+    /// the one before it, percent of a tile 0..90: tiles closer than
+    /// their size, as hexagons interlock (a 50% shift with 25% overlap).
+    /// The later row is drawn over the earlier.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub overlap_percent: f64,
     /// The size of one tile on the page, mm; `None` keeps the kind's own
     /// size (`Pattern::natural_tile`). The tile's content is stretched to
     /// fit.
@@ -1104,12 +1196,14 @@ impl PatternPlacement {
             &mut self.rotation,
             &mut self.skew,
             &mut self.shift_percent,
+            &mut self.overlap_percent,
         ] {
             if !v.is_finite() {
                 *v = 0.0;
             }
         }
         self.shift_percent = self.shift_percent.clamp(0.0, 100.0);
+        self.overlap_percent = self.overlap_percent.clamp(0.0, 90.0);
         // A skew of 90 degrees would flatten the tiles to a line.
         self.skew = self.skew.clamp(-89.0, 89.0);
         if let Some(s) = self.size {
@@ -1123,7 +1217,16 @@ impl PatternPlacement {
     /// Whether the block that repeats holds more than one tile: mirrored
     /// tiles or a row or column shift. Without, one tile is the block.
     pub fn needs_cell(&self) -> bool {
-        self.mirror_horizontal || self.mirror_vertical || self.shift_percent != 0.0
+        self.mirror_horizontal
+            || self.mirror_vertical
+            || self.shift_percent != 0.0
+            || self.overlap_percent != 0.0
+    }
+
+    /// The step from one row (column) of tiles to the next, as a share of
+    /// the tile: 1 without overlap.
+    fn step(&self) -> f64 {
+        1.0 - self.overlap_percent.clamp(0.0, 90.0) / 100.0
     }
 
     /// Tiles across and down in the block that repeats (2 where mirrored).
@@ -1142,8 +1245,12 @@ impl PatternPlacement {
     pub fn cell(&self, tile: Size) -> Affine {
         let (cols, rows) = self.cell_tiles();
         let (w, h) = (tile.width, tile.height);
-        let (cw, ch) = (w * f64::from(cols), h * f64::from(rows));
+        let k = self.step();
         let s = self.shift_percent / 100.0;
+        let (cw, ch) = match self.shift {
+            TileShift::Row => (w * f64::from(cols), k * h * f64::from(rows)),
+            TileShift::Column => (k * w * f64::from(cols), h * f64::from(rows)),
+        };
         match self.shift {
             TileShift::Row => Affine::new([cw, 0.0, s * w * f64::from(rows), ch, 0.0, 0.0]),
             TileShift::Column => Affine::new([cw, s * h * f64::from(cols), 0.0, ch, 0.0, 0.0]),
@@ -1159,30 +1266,70 @@ impl PatternPlacement {
         let (cols, rows) = self.cell_tiles();
         let (w, h) = (tile.width, tile.height);
         let s = self.shift_percent / 100.0;
+        let k = self.step();
         let shifted = s != 0.0;
+        // Overlapping rows (columns) reach into the block from rows
+        // (columns) before and after it.
+        let reach = if k < 1.0 { (1.0 / k).ceil() as i32 } else { 0 };
         let mut out = Vec::new();
-        let (i0, i1, j0, j1) = match (self.shift, shifted) {
-            (_, false) => (0, cols as i32 - 1, 0, rows as i32 - 1),
-            (TileShift::Row, true) => (-1, cols as i32 + 1, 0, rows as i32 - 1),
-            (TileShift::Column, true) => (0, cols as i32 - 1, -1, rows as i32 + 1),
-        };
-        for j in j0..=j1 {
-            for i in i0..=i1 {
-                let (dx, dy) = match self.shift {
-                    TileShift::Row => (f64::from(i) * w + f64::from(j) * s * w, f64::from(j) * h),
-                    TileShift::Column => {
-                        (f64::from(i) * w, f64::from(j) * h + f64::from(i) * s * h)
-                    }
-                };
-                let mut m = Affine::translate((dx, dy));
-                if self.mirror_horizontal && i.rem_euclid(2) == 1 {
-                    m *= Affine::new([-1.0, 0.0, 0.0, 1.0, w, 0.0]);
-                }
-                if self.mirror_vertical && j.rem_euclid(2) == 1 {
-                    m *= Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, h]);
-                }
-                out.push(m);
+        let (i0, i1, j0, j1) = match self.shift {
+            TileShift::Row => {
+                let side = i32::from(shifted) * (1 + reach);
+                (
+                    -side,
+                    cols as i32 - 1 + side + i32::from(shifted),
+                    -reach,
+                    rows as i32 - 1 + reach,
+                )
             }
+            TileShift::Column => {
+                let side = i32::from(shifted) * (1 + reach);
+                (
+                    -reach,
+                    cols as i32 - 1 + reach,
+                    -side,
+                    rows as i32 - 1 + side + i32::from(shifted),
+                )
+            }
+        };
+        // Bottom rows (left columns) first, so that a later one lies over
+        // an earlier one where they overlap.
+        let mut order: Vec<(i32, i32)> = Vec::new();
+        match self.shift {
+            TileShift::Column if k < 1.0 => {
+                for i in i0..=i1 {
+                    for j in j0..=j1 {
+                        order.push((i, j));
+                    }
+                }
+            }
+            _ => {
+                for j in j0..=j1 {
+                    for i in i0..=i1 {
+                        order.push((i, j));
+                    }
+                }
+            }
+        }
+        for (i, j) in order {
+            let (dx, dy) = match self.shift {
+                TileShift::Row => (
+                    f64::from(i) * w + f64::from(j) * s * w,
+                    f64::from(j) * k * h,
+                ),
+                TileShift::Column => (
+                    f64::from(i) * k * w,
+                    f64::from(j) * h + f64::from(i) * s * h,
+                ),
+            };
+            let mut m = Affine::translate((dx, dy));
+            if self.mirror_horizontal && i.rem_euclid(2) == 1 {
+                m *= Affine::new([-1.0, 0.0, 0.0, 1.0, w, 0.0]);
+            }
+            if self.mirror_vertical && j.rem_euclid(2) == 1 {
+                m *= Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, h]);
+            }
+            out.push(m);
         }
         out
     }
@@ -1194,18 +1341,21 @@ impl PatternPlacement {
     pub fn tile_uv(&self, p: Point, tile: Size) -> (f64, f64) {
         let (w, h) = (tile.width.max(1e-12), tile.height.max(1e-12));
         let s = self.shift_percent / 100.0;
+        // With overlap the later row (column) lies on top: the point is in
+        // the last one that starts at or before it.
+        let k = self.step();
         let (i, j, u, v) = match self.shift {
             TileShift::Row => {
-                let j = (p.y / h).floor();
+                let j = (p.y / (k * h)).floor();
                 let x = p.x - j * s * w;
                 let i = (x / w).floor();
-                (i, j, x / w - i, p.y / h - j)
+                (i, j, x / w - i, (p.y - j * k * h) / h)
             }
             TileShift::Column => {
-                let i = (p.x / w).floor();
+                let i = (p.x / (k * w)).floor();
                 let y = p.y - i * s * h;
                 let j = (y / h).floor();
-                (i, j, p.x / w - i, y / h - j)
+                (i, j, (p.x - i * k * w) / w, y / h - j)
             }
         };
         let odd = |k: f64| (k as i64).rem_euclid(2) == 1;
@@ -1438,21 +1588,41 @@ pub enum TextureKind {
     Marble,
     Noise,
     Wood,
+    /// A fixed holographic (iridescent) foil look: rainbow bands that
+    /// flow through dark and light patches like a film of oil on metal,
+    /// from colour A (the dark patches) to colour B (the light ones).
+    /// It does not change with the viewing angle: the picture is the
+    /// same on screen, in print and in every export.
+    Holographic,
+    /// [`TextureKind::Holographic`] with fine sparkling grains of
+    /// spectral colour over it (holographic glitter).
+    HoloGlitter,
 }
 
 impl TextureKind {
-    pub const ALL: [TextureKind; 4] = [
+    pub const ALL: [TextureKind; 6] = [
         TextureKind::Clouds,
         TextureKind::Marble,
         TextureKind::Noise,
         TextureKind::Wood,
+        TextureKind::Holographic,
+        TextureKind::HoloGlitter,
     ];
+
+    /// The holographic kinds, which are coloured from the spectrum and
+    /// not only mixed from the two colours.
+    pub fn is_holographic(self) -> bool {
+        matches!(self, TextureKind::Holographic | TextureKind::HoloGlitter)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             TextureKind::Clouds => "Clouds",
             TextureKind::Marble => "Marble",
             TextureKind::Noise => "Noise",
             TextureKind::Wood => "Wood",
+            TextureKind::Holographic => "Holographic",
+            TextureKind::HoloGlitter => "Holo glitter",
         }
     }
 }
@@ -2779,6 +2949,10 @@ pub struct Stroke {
     /// and line ends fall in the middle of a dash.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub align_dashes: bool,
+    /// A gradient of the outline's own fill runs along the line, from its
+    /// start to its end, instead of across the drawing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fill_along: bool,
 }
 
 /// Where an outline lies relative to the path of a closed object.
@@ -3091,6 +3265,7 @@ impl Default for Stroke {
             position: OutlinePosition::Center,
             miter_limit: Self::DEFAULT_MITER_LIMIT,
             align_dashes: false,
+            fill_along: false,
         }
     }
 }
@@ -4154,6 +4329,48 @@ mod tests {
             (u - 0.25).abs() < 1e-9 && (v - 0.75).abs() < 1e-9,
             "{u} {v}"
         );
+    }
+
+    /// Hexagons: rows half a tile along and a quarter of a tile over the
+    /// row before, the later row drawn over the earlier.
+    #[test]
+    fn overlapping_rows_interlock_like_hexagons() {
+        let p = PatternPlacement {
+            shift_percent: 50.0,
+            overlap_percent: 25.0,
+            ..PatternPlacement::default()
+        };
+        let tile = Size::new(10.0, 12.0);
+        assert!(p.needs_cell());
+        // The block is one row step high: three quarters of a tile.
+        assert_eq!(p.cell(tile).as_coeffs(), [10.0, 0.0, 5.0, 9.0, 0.0, 0.0]);
+        // Rows before and after reach into the block, and come in order.
+        let copies = p.tile_copies(tile);
+        let ys: Vec<f64> = copies.iter().map(|c| (*c * Point::ORIGIN).y).collect();
+        assert!(ys.contains(&-9.0) && ys.contains(&9.0), "{ys:?}");
+        assert!(ys.windows(2).all(|w| w[0] <= w[1]), "{ys:?}");
+        // A point at y = 10 is in the second row (it starts at y = 9), on
+        // top of the first row's last quarter.
+        let (u, v) = p.tile_uv(Point::new(6.0, 10.0), tile);
+        assert!(
+            (u - 0.1).abs() < 1e-9 && (v - 1.0 / 12.0).abs() < 1e-9,
+            "{u} {v}"
+        );
+        // Columns the same way.
+        let c = PatternPlacement {
+            shift: TileShift::Column,
+            ..p
+        };
+        assert_eq!(c.cell(tile).as_coeffs(), [7.5, 6.0, 0.0, 12.0, 0.0, 0.0]);
+        let (u, _) = c.tile_uv(Point::new(8.0, 7.0), tile);
+        assert!((u - 0.05).abs() < 1e-9, "{u}");
+        // Out of range comes back in range.
+        let wild = PatternPlacement {
+            overlap_percent: 400.0,
+            ..p
+        }
+        .sanitized();
+        assert_eq!(wild.overlap_percent, 90.0);
     }
 
     #[test]

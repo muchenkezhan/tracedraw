@@ -56,6 +56,10 @@ pub struct PageNumberSettings {
     /// 0 bottom centre, 1 bottom outer corner, 2 top centre, 3 top outer corner.
     pub position: u8,
     pub size_pt: f64,
+    /// The last pages, this many, get no number (#3789).
+    pub skip_last: usize,
+    /// Pages ("5, 9-10") that get no number, not counted (#3789).
+    pub skip: String,
 }
 
 impl Default for PageNumberSettings {
@@ -68,6 +72,8 @@ impl Default for PageNumberSettings {
             style: 0,
             position: 0,
             size_pt: 12.0,
+            skip_last: 0,
+            skip: String::new(),
         }
     }
 }
@@ -81,6 +87,8 @@ impl PageNumberSettings {
             style: self.style,
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),
+            skip_last: self.skip_last,
+            skip: self.skip.clone(),
         }
     }
 
@@ -131,7 +139,7 @@ pub fn drawing_scale() -> f64 {
 }
 
 /// The inner shadow the Inner Shadow tool gives the next object dragged
-/// on (#2473), as CorelDRAW's Inner Shadow tool starts: black, half
+/// on (#2473): black, half
 /// opaque, feathered and multiplied with the object.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InnerShadowStyle {
@@ -141,6 +149,8 @@ pub struct InnerShadowStyle {
     /// Feathering, millimetres.
     pub blur: f64,
     pub merge: tracedraw_core::live::MergeMode,
+    /// 0..1, see `Effect::InnerShadow`.
+    pub spread: f64,
 }
 
 impl Default for InnerShadowStyle {
@@ -150,6 +160,7 @@ impl Default for InnerShadowStyle {
             opacity: 0.5,
             blur: 2.0,
             merge: tracedraw_core::live::MergeMode::Multiply,
+            spread: 0.0,
         }
     }
 }
@@ -410,6 +421,11 @@ pub enum Drag {
         /// snapped axis alone, so the side stays on what it snapped to
         /// (#2004).
         snapped: (bool, bool),
+        /// The axes, x and y, on which the selection has no size of its
+        /// own (a perfectly vertical or horizontal line: its box is only
+        /// as wide as its outline). They are kept at 100 %: scaled about
+        /// the box's edge, the line was flung sideways ever faster (#4173).
+        flat: (bool, bool),
         /// Where the selection stood when the handle was grabbed, built
         /// once the handle has left the snapping radius of its start: the
         /// handle then snaps to the selection's own nodes and edges as
@@ -430,12 +446,17 @@ pub enum Drag {
     /// Rotating the selection about `center`. `grab` is the selection's
     /// own point (a node) the turn started from in rotate mode, which the
     /// turn carries onto other objects' points and edges (#933); `None`
-    /// for a rotate handle.
+    /// for a rotate handle. With Shift held the selection is also
+    /// scaled, keeping its proportions, by how far the pointer is from
+    /// `center` against `start_radius` (#3772); `scale` is that factor,
+    /// 1 without Shift.
     Rotate {
         center: Point,
         start_angle: f64,
         current_angle: f64,
         grab: Option<Point>,
+        start_radius: f64,
+        scale: f64,
     },
     /// Rubber-band selection; with `touching` (Alt) objects it touches
     /// count too.
@@ -748,6 +769,11 @@ pub struct CurveInProgress {
     pub dragging_handle: bool,
     /// B-Spline tool: the nodes are control points the curve runs near.
     pub bspline: bool,
+    /// Curvature Pen (with `bspline`, whose clicks it shares): the curve
+    /// runs through the points placed, smooth at each, with a corner at
+    /// the fixed ones (placed with Alt, C or V held); it is made a plain
+    /// curve, its points its nodes.
+    pub curvature: bool,
     /// B-Spline tool: the control points placed with C or V held, which
     /// the curve passes through with a corner (fixed points, #2060); one
     /// flag a node, missing ones floating.
@@ -779,16 +805,18 @@ impl CurveInProgress {
     /// The incoming handle of node `i`: frozen for a cusp, else the mirror
     /// of its outgoing handle about the node.
     pub fn in_handle(&self, i: usize) -> Option<Point> {
-        if let Some(h) = self.in_handles.get(&i) {
-            return *h;
-        }
         let (p, out) = *self.nodes.get(i)?;
+        if let Some(h) = self.in_handles.get(&i) {
+            return h.filter(|h| (*h - p).hypot() > 1e-9);
+        }
+        let out = out.filter(|o| (*o - p).hypot() > 1e-9);
         if let (Some(len), Some(o)) = (self.in_lengths.get(&i), out) {
             let d = o - p;
             let n = d.hypot();
-            if n > 1e-12 {
+            if n > 1e-12 && *len > 1e-9 {
                 return Some(p - d * (len / n));
             }
+            return None;
         }
         out.map(|o| p - (o - p))
     }
@@ -869,6 +897,9 @@ impl CurveInProgress {
     pub fn path_closed(&self, preview: Option<Point>, closed: bool) -> tracedraw_core::BezPath {
         if closed && self.bspline {
             let pts: Vec<Point> = self.nodes.iter().map(|n| n.0).collect();
+            if self.curvature {
+                return tracedraw_core::geometry::curvature_path(&pts, &self.spline_fixed, true);
+            }
             return tracedraw_core::geometry::bspline_path_fixed(&pts, &self.spline_fixed, true);
         }
         let mut path = self.open_path(preview);
@@ -879,6 +910,7 @@ impl CurveInProgress {
             if let (Some((first, _)), Some((end, end_out))) =
                 (self.nodes.first().copied(), self.nodes.last().copied())
             {
+                let end_out = end_out.filter(|o| (*o - end).hypot() > 1e-9);
                 let into = self.closing_handle();
                 if self.smooth && last > 0 && (end_out.is_some() || into.is_some()) {
                     path.curve_to(end_out.unwrap_or(end), into.unwrap_or(first), first);
@@ -925,6 +957,9 @@ impl CurveInProgress {
         }
         if self.bspline {
             let pts = self.bspline_controls(preview);
+            if self.curvature {
+                return tracedraw_core::geometry::curvature_path(&pts, &self.spline_fixed, false);
+            }
             return tracedraw_core::geometry::bspline_path_fixed(&pts, &self.spline_fixed, false);
         }
         for (i, (p, _)) in nodes.iter().enumerate() {
@@ -933,6 +968,7 @@ impl CurveInProgress {
                 continue;
             }
             let (prev, prev_out) = nodes[i - 1];
+            let prev_out = prev_out.filter(|o| (*o - prev).hypot() > 1e-9);
             let cur_in = if i < self.nodes.len() {
                 self.in_handle(i)
             } else {
@@ -1157,6 +1193,9 @@ pub struct App {
     /// The trace of the selected bitmaps running off the interface
     /// thread, shown in its progress window (`trace_job.rs`).
     pub trace_job: Option<crate::trace_job::TraceJob>,
+    /// The Workflow window's steps, wires and results, kept while it is
+    /// closed (`ui/workflow.rs`).
+    pub workflow: Box<crate::ui::workflow::WorkflowState>,
     /// The digits typed with Alt held while editing text, for a character
     /// by its number (#447; the system does it on Windows).
     pub alt_code: String,
@@ -1228,6 +1267,15 @@ pub struct App {
     /// The view each page of the drawing was last shown with in this
     /// window, so going back to a page shows it as it was left (#3434).
     pub page_views: std::collections::HashMap<PageId, crate::view::View>,
+    /// A bitmap effect whose settings the Effects docker holds instead of
+    /// its dialog (#4253), and the selection it was opened for.
+    pub fx_panel: Option<crate::ui::effect_dialog::EffectState>,
+    pub fx_panel_sel: Vec<ShapeId>,
+    /// The values each Layer Effects entry was last given, so an effect
+    /// taken away with its × (or a new object's) starts again from them
+    /// instead of the defaults (#4242).
+    pub layer_fx_last:
+        std::collections::HashMap<crate::ui::layer_effects::Kind, tracedraw_core::live::Effect>,
     /// Set the view of Options > Display > View when a drawing opens
     /// with the next fit (a drawing just opened or made, #1134).
     pub open_view_pending: bool,
@@ -1374,6 +1422,11 @@ pub struct App {
     pub action_lines: crate::action_lines::ActionLines,
     /// The Shape Generator panel's settings (#3412, #3413).
     pub shape_gen: crate::shape_gen::ShapeGenSettings,
+    /// The Shape Generator's live differential growth.
+    pub shape_gen_growth: Option<crate::shape_gen_growth::GrowthLive>,
+    /// The Shape Generator tool's preview, kept between the frames of a
+    /// drag.
+    pub shape_gen_tool_cache: std::cell::RefCell<Option<crate::shape_gen_tool::ToolPreview>>,
     /// Speech Balloon tool (#2179): the style, the tail's width (percent
     /// of the body's smaller side) and bend for new balloons, and the
     /// balloon whose tail tip is being dragged.
@@ -1394,6 +1447,10 @@ pub struct App {
     pub join_pending: Option<crate::join_tool::JoinEnd>,
     /// The formula settings used last, for the next new formula (#2183).
     pub last_formula: Option<crate::formula::FormulaSpec>,
+    /// The Transform Each settings used last.
+    pub last_transform_each: crate::ui::transform_each::TransformEach,
+    /// The Light Flare settings used last.
+    pub last_flare: crate::ui::flare::Flare,
     pub blend_steps: u32,
     /// The Blend docker's options for the next blend (and the shown one).
     pub blend_options: tracedraw_core::live::BlendOptions,
@@ -1507,7 +1564,9 @@ pub struct App {
     /// frame; it is made once when the drag ends.
     pub node_drag_shown: Option<NodeDragShown>,
     /// The visual bounds of objects with live effects, for the document
-    /// revision they were measured at (see [`App::visual_bounds`]).
+    /// revision they were measured at (see [`App::visual_bounds`]);
+    /// plain objects' geometric bounds measured once per change of the
+    /// drawing share it (see [`App::plain_bounds_cached`], #3559).
     pub visual_cache: std::cell::RefCell<(u64, std::collections::HashMap<ShapeId, Rect>)>,
     /// The Edit Fill dialog's fill is shown on the selection as an engine
     /// preview (#436).
@@ -1524,6 +1583,9 @@ pub struct App {
     /// and the selection they were gathered for (see
     /// [`App::selected_rc`]).
     pub selected_cache: std::cell::RefCell<Option<SelectedCache>>,
+    /// Mesh guides flattened at the current zoom, reused while panning
+    /// and between frames; only changed edges need new subdivision.
+    pub mesh_grid_cache: std::cell::RefCell<crate::canvas::MeshGridCache>,
     /// The selection's outlines flattened for Mask Outside Page, with the
     /// gathered selection and the zoom they were made for (see
     /// [`App::selected_outlines`]).
@@ -1545,7 +1607,7 @@ pub struct App {
     pub main_window_doc: Option<(u64, u32)>,
     /// Whether each paragraph text overflows its frame, by document
     /// revision (laying text out every frame would be slow).
-    pub overflow_cache: std::cell::RefCell<(u64, std::collections::HashMap<ShapeId, bool>)>,
+    pub overflow_cache: std::cell::RefCell<std::collections::HashMap<ShapeId, (u64, bool)>>,
     /// Paragraph texts flowed in the frames a drag gives them (#1327).
     pub live_reflow: std::cell::RefCell<crate::text_frames::LiveReflow>,
     /// The Shape Builder's parts crossed and the one under the pointer
@@ -1633,6 +1695,14 @@ pub struct App {
     pub show_welcome: bool,
     /// Object > Outline Offset: the distance last used, mm (#2622).
     pub outline_offset_mm: f64,
+    /// The corners and the number of outlines Outline Offset made last.
+    pub outline_offset_join: tracedraw_core::shaping::Join,
+    pub outline_offset_steps: u32,
+    /// Dialogs that change the drawing show their result on the page
+    /// while they are open (their Preview box).
+    pub dialog_preview: bool,
+    /// Outline Offset's preview curves.
+    pub offset_preview: crate::dialog_preview::OffsetCache,
     /// Object > Clip to Frame > Place Inside Frame is waiting for a click on the frame.
     pub pending_clip_frame: bool,
     /// A frame's flow tab was clicked: the next click says where its text
@@ -1673,6 +1743,12 @@ pub struct App {
     /// Clip frame being edited in place: (frame id, the page's other
     /// objects when editing began; see `clip_edit_contents`).
     pub clip_frame_edit: Option<(ShapeId, std::collections::HashSet<ShapeId>)>,
+    /// Symbol definition being edited on its own clean sheet.
+    pub symbol_edit: Option<crate::ops2::SymbolEdit>,
+    /// Draw Behind on the drawing tools' property bar: what they draw
+    /// goes behind the selected objects of its layer, or to the back of
+    /// the layer with nothing selected there. Off at first.
+    pub draw_behind: bool,
     /// The undo steps that began and finished editing a clip frame's
     /// contents, so undo and redo across them leave or enter the edit
     /// (#851).
@@ -1699,6 +1775,9 @@ pub struct App {
     pub pixel_edit: Option<Box<crate::pixel_edit_app::PixelEdit>>,
     /// The brush settings of picture editing, kept between pictures.
     pub pixel_opts: crate::pixel_edit::BrushOpts,
+    /// The layers of pictures edited inside, kept after Finish while the
+    /// drawings are open (#4112).
+    pub pixel_kept: crate::pixel_keep::KeptLayers,
     pub show_guides: bool,
     /// Selected guidelines of the active page (indices).
     pub selected_guides: Vec<usize>,
@@ -1736,6 +1815,7 @@ pub struct App {
     pub settings: crate::settings::Settings,
     pub welcome_tab: WelcomeTab,
     pub fullscreen_preview: bool,
+    pub preview_session: Option<crate::ui::preview::PreviewSession>,
     /// File > Print Preview, while it is open.
     pub print_preview: Option<crate::ui::print_preview::PrintPreview>,
     /// The printer list being read off the interface's thread for the
@@ -1745,9 +1825,30 @@ pub struct App {
     /// a printer's spooler can take minutes and the window stays usable
     /// meanwhile (#810). The status it ends with.
     pub print_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// How far the print on its way has come, for the status bar.
+    pub print_progress: std::sync::Arc<crate::printers::PrintProgress>,
     /// A large `.tdraw` being read off the interface's thread, with its
     /// progress window (#2849).
     pub opening: Option<crate::opening::Opening>,
+    /// A large drawing being written off the interface's thread (#4011):
+    /// while it is, nothing typed or clicked reaches the drawing.
+    pub saving: Option<crate::saving::Saving>,
+    /// Save, Save As and their shortcuts write a large drawing on a
+    /// worker thread, and File > Export runs on one (never in a browser,
+    /// nor in the tests unless one asks for it, which write at once).
+    pub save_on_worker: bool,
+    /// An export running off the interface's thread, with its progress
+    /// window; nothing typed or clicked reaches the drawing meanwhile.
+    pub exporting: Option<crate::exporting::Exporting>,
+    /// A large file of another format about to be opened (its path, the
+    /// password given and the frames its notice has been shown): the
+    /// window says so before the reading stops it.
+    pub open_notice: Option<(PathBuf, String, u8)>,
+    /// More large files to open after that one, in their order.
+    open_notice_next: Vec<(PathBuf, String)>,
+    /// The file whose notice was shown, or that is read at once (Revert):
+    /// it is read now.
+    pub(crate) open_noticed: Option<PathBuf>,
     /// What that read gave, for the open it finishes.
     pub opened_read: Option<(PathBuf, crate::opening::OpenRead)>,
     /// Manual two-sided printing: the settings of a print whose fronts
@@ -1763,6 +1864,11 @@ pub struct App {
     pub page_sorter: bool,
     /// View > Multipage View: every page laid out beside the current one.
     pub multipage: bool,
+    /// Objects of the facing page brought onto the current page to be
+    /// selected with its own (#3488), each with the page and layer it came
+    /// from, the page it went to and where its page lay in that page's
+    /// coordinates: they go home once they leave the selection (#3817).
+    pub spread_adopted: Vec<crate::multipage::Adopted>,
     /// The wheel zoom still gliding (#1648).
     pub zoom_glide: crate::view_motion::ZoomGlide,
     /// Help > Benchmark: the run going on or just finished.
@@ -1786,6 +1892,10 @@ pub struct App {
     /// The drawing at a revision, shared by the other pages' renders on
     /// their threads (one copy a change, not one a page) (#903).
     pub page_snapshot: std::cell::RefCell<Option<(u64, std::sync::Arc<tracedraw_core::Document>)>>,
+    /// Small transparent overlay texture of the text shape currently being
+    /// typed into, so the page beneath stays cached without re-rendering
+    /// on each keystroke (#3904).
+    pub text_edit_overlay: std::cell::RefCell<crate::text_editing::TextEditOverlay>,
     /// What the backdrop covers (see [`Self::backdrop_area`]), with the
     /// revision, page and page box it was worked out for.
     backdrop_area: std::cell::Cell<Option<(u64, PageId, Rect, Rect)>>,
@@ -1797,6 +1907,19 @@ pub struct App {
     /// without the shadow, or the other way round (#1906).
     pub show_page_shadow: bool,
     pub simulate_overprints: bool,
+    /// View > Separations: the ink the drawing window shows alone, an
+    /// index of [`App::separation_names`]; `None` shows every ink.
+    pub view_plate: Option<usize>,
+    /// The drawing as that ink shows it, kept for the drawing's revision
+    /// and page (see [`App::separation_view_doc`]).
+    pub view_plate_doc: std::cell::RefCell<
+        Option<(
+            u64,
+            usize,
+            tracedraw_core::PageId,
+            std::rc::Rc<tracedraw_core::Document>,
+        )>,
+    >,
     pub rasterize_complex_effects: bool,
     pub show_bleed: bool,
     pub show_printable_area: bool,
@@ -1842,6 +1965,9 @@ pub struct App {
     /// handed to programs, with their time stamps when handed over; one
     /// that is saved comes into the drawing.
     pub object_files: Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+    /// Tables' workbooks open in the spreadsheet program (#4145): saved
+    /// there, they give their tables the cells again.
+    pub table_files: Vec<crate::table_external::TableFile>,
     /// Session recovery: this session's marker in the auto-backup folder
     /// (made on the first frame; in a browser once its storage is read).
     pub session: Option<crate::recovery::Session>,
@@ -1955,10 +2081,19 @@ pub struct App {
     /// Objects docker: the pages and the Master Page nodes shown closed.
     pub objects_closed_pages: std::collections::HashSet<tracedraw_core::PageId>,
     pub objects_master_closed: bool,
+    pub objects_ranges_closed: bool,
     /// Objects docker: the cached thumbnails of the objects.
     pub object_thumbs: crate::object_thumbs::ObjectThumbs,
     /// Symbols docker: the cached pictures of the symbols (#3249).
     pub symbol_thumbs: crate::object_thumbs::ObjectThumbs,
+    /// The last Symbolize Similar / Replace Symbol result, shown under
+    /// the Symbols list.
+    pub symbolize_report: Option<String>,
+    /// The Replace Symbol pick: the source symbol whose instances will
+    /// move; the next press on another symbol's Replace button merges.
+    pub symbol_replace_source: Option<usize>,
+    /// The symbol name being edited inline: (index, draft text).
+    pub symbol_rename: Option<(usize, String)>,
     /// When `autosave_settings` last wrote the preferences, and the
     /// preferences as last saved or looked at (JSON), to save them only
     /// when they changed.
@@ -1972,6 +2107,11 @@ pub struct App {
     /// while it is one of the current page's layers or a master layer
     /// showing on it, visible and unlocked (see [`App::active_layer`]).
     pub picked_layer: Option<LayerId>,
+    /// The layers picked in the Objects docker with Ctrl or Shift
+    /// (#3966): the eye, printer, padlock, Delete and the layer menu
+    /// then act on all of them together. Empty means only
+    /// [`App::picked_layer`] is picked.
+    pub selected_layers: Vec<LayerId>,
     pub navigator_tex: Option<egui::TextureHandle>,
     pub options_label_index: usize,
     pub options_current_only: bool,
@@ -1994,6 +2134,10 @@ pub struct App {
     pub text_hyphenation: bool,
     /// Macro recording in progress: the commands run since Record started.
     pub recording: Option<Vec<Command>>,
+    /// Lines of the macro being recorded for steps that are not commands
+    /// of the drawing (Zoom To Fit #4020, a dimension style #4026), each
+    /// after the number of commands recorded before it.
+    pub recorded_lines: Vec<(usize, String)>,
     pub workspace: Workspace,
     pub palettes: Vec<crate::palette::Palette>,
     pub visible_palettes: Vec<usize>,
@@ -2064,6 +2208,10 @@ pub struct App {
     pub envelope_mode: tracedraw_core::envelope::Mode,
     /// The mapping new envelopes take.
     pub envelope_mapping: tracedraw_core::envelope::Mapping,
+    /// The columns and rows a new mesh envelope takes.
+    pub envelope_mesh: (u8, u8),
+    /// Cut into Grid's window and settings.
+    pub grid_cut: crate::cut_tools::GridCut,
     /// An envelope node or handle being dragged.
     pub envelope_drag: Option<crate::envelope_edit::EnvelopeDrag>,
     /// The boxes of selected objects with no envelope yet, for the frame
@@ -2094,6 +2242,19 @@ pub struct App {
     pub glyph_size: f32,
     pub glyph_picked: Option<char>,
     pub table_edit: Option<crate::table::TableEdit>,
+    /// The clip frame whose contents are being edited as it was before
+    /// they came out: its envelope and other effects, shadow, opacity and
+    /// name go back onto it when the editing ends (#4070).
+    pub clip_edit_shell: Option<tracedraw_core::Shape>,
+    /// The clip frames being edited round the one edited now, outermost
+    /// first, when a clip frame inside another is edited (#4110): each
+    /// with what was outside it and its look kept aside. Finishing the
+    /// inner one goes back to editing the one round it.
+    pub clip_edit_outer: Vec<(
+        ShapeId,
+        std::collections::HashSet<ShapeId>,
+        Option<tracedraw_core::Shape>,
+    )>,
     /// The Table tool's drag and bar choices.
     pub table_ui: crate::table_tool::TableUi,
     pub missing_fonts: Vec<String>,
@@ -2190,10 +2351,19 @@ pub struct App {
     pub left_inner_dockers: DockerColumn,
     /// Dockers floating over the window, each in a window of its own.
     pub floating_dockers: Vec<FloatingDocker>,
+    /// Panels whose window of their own was closed: opened again, each
+    /// comes back in that window, where it was (#3950).
+    pub closed_own_windows: Vec<FloatingDocker>,
+    /// The column each panel was last docked in, where Dock Back puts a
+    /// panel in a window of its own (#3950).
+    pub docked_before: Vec<(DockerTab, DockerPlace)>,
     /// A second docker shown under the one in front in each column (by
     /// [`DockerPlace::column_index`]), the two stacked in the column's
     /// height (#2312).
     pub docker_stacks: [DockerStack; 4],
+    /// Dockers locked in front of their column (#3953): a docker opened
+    /// there goes under a locked one instead of taking its place.
+    pub locked_dockers: Vec<DockerTab>,
     /// A docker being moved by its tab or its title (see ui/dockers.rs).
     pub docker_drag: Option<DockerDrag>,
     /// The default column's front tab and whether it was open, as the
@@ -2254,6 +2424,9 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     pub live_handle_cache:
         std::cell::RefCell<Option<((u64, Vec<ShapeId>), Option<crate::fit_live::LiveHandles>)>>,
+    /// The document revision texts following their paths were last
+    /// fitted at (see [`App::refresh_text_follow`]).
+    pub text_follow_checked: u64,
     /// Rounded connectors' corner radius, mm.
     pub connector_radius: f64,
     /// The document revision connectors were last checked at (see
@@ -2310,6 +2483,13 @@ pub struct App {
     /// Smart Fill stops at the edges of the outlines as they are drawn,
     /// their width, not at their middle line (#3321).
     pub area_fill_outline_edges: bool,
+    /// Smart Fill with Live on: a click paints the area the lines of a
+    /// group close off as a live fill of the group, which follows its
+    /// lines when they move ([`tracedraw_core::live_paint`]).
+    pub area_fill_live: bool,
+    /// Smart Fill with Use Guidelines on: the guidelines the page shows
+    /// close off areas too, as in the Shape Builder (#3863).
+    pub area_fill_guides: bool,
     pub mesh_rows: u32,
     pub mesh_cols: u32,
     /// Mesh Fill bar: the colours Shuffle draws from (an index into
@@ -2548,9 +2728,31 @@ pub enum DockerTab {
     Effects,
     Macros,
     PrintMerge,
+    /// The image editing mode's panels (Bitmaps > Edit Inside): kept out
+    /// of [`DockerTab::ALL`], shown only in that mode.
+    PixelLayers,
+    PixelSelection,
+    PixelRetouch,
+    PixelDistort,
+    PixelEffects,
+    PixelImage,
+    PixelHistogram,
+    PixelHints,
 }
 
 impl DockerTab {
+    /// The image editing mode's panels, in Window > Panels order there.
+    pub const PIXEL: [DockerTab; 8] = [
+        DockerTab::PixelHints,
+        DockerTab::PixelLayers,
+        DockerTab::PixelEffects,
+        DockerTab::PixelSelection,
+        DockerTab::PixelRetouch,
+        DockerTab::PixelDistort,
+        DockerTab::PixelImage,
+        DockerTab::PixelHistogram,
+    ];
+
     pub const ALL: [DockerTab; 48] = [
         DockerTab::Properties,
         DockerTab::Objects,
@@ -2721,6 +2923,14 @@ impl DockerTab {
             DockerTab::Macros => "docker.macros",
             DockerTab::Effects => "docker.effects",
             DockerTab::PrintMerge => "docker.print_merge",
+            DockerTab::PixelLayers => "pixel.section.layers",
+            DockerTab::PixelSelection => "pixel.section.selection",
+            DockerTab::PixelRetouch => "pixel.section.retouch",
+            DockerTab::PixelDistort => "pixel.section.distort",
+            DockerTab::PixelEffects => "pixel.section.effects",
+            DockerTab::PixelImage => "pixel.section.picture",
+            DockerTab::PixelHistogram => "pixel.section.histogram",
+            DockerTab::PixelHints => "pixel.section.hints",
         }
     }
 
@@ -2962,6 +3172,11 @@ pub struct FloatingDocker {
     /// The window is put at `pos` on the next frame (it was just dropped
     /// or moved); otherwise it keeps where egui has it.
     pub place: bool,
+    /// In a window of the system of its own, which can go to another
+    /// monitor (#2884), instead of floating inside the main window.
+    pub own_window: bool,
+    /// Where that window was last seen on the desktop.
+    pub desktop: Option<Pos2>,
 }
 
 impl FloatingDocker {
@@ -3046,6 +3261,11 @@ impl App {
         // each time the dialog opened (#3337).
         if !crate::files::WEB && !crate::files::ANDROID {
             app.fetch_printers(crate::printers::system_printers);
+        }
+        // An update whose setup stopped says so, with its log (#3816).
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(note) = crate::updates::unfinished_update_note() {
+            app.status = note;
         }
         app
     }
@@ -3148,6 +3368,7 @@ impl App {
             last_trace: None,
             trace_live: Default::default(),
             trace_job: None,
+            workflow: Default::default(),
             alt_code: String::new(),
             alt_composed: None,
             current_colors: (Color::BLACK, Color::WHITE),
@@ -3170,6 +3391,9 @@ impl App {
             status_opens_options: None,
             fit_pending: true,
             page_views: Default::default(),
+            fx_panel: None,
+            fx_panel_sel: Vec::new(),
+            layer_fx_last: Default::default(),
             open_view_pending: true,
             units: Units::Millimeters,
             nudge_mm: 2.54,
@@ -3240,6 +3464,8 @@ impl App {
             graph_spokes: 8,
             action_lines: Default::default(),
             shape_gen: Default::default(),
+            shape_gen_growth: None,
+            shape_gen_tool_cache: Default::default(),
             balloon_style: Default::default(),
             balloon_width: 30.0,
             balloon_bend: 0.0,
@@ -3251,6 +3477,8 @@ impl App {
             dimension_points: Vec::new(),
             join_pending: None,
             last_formula: None,
+            last_transform_each: Default::default(),
+            last_flare: Default::default(),
             blend_steps: 20,
             blend_options: Default::default(),
             blend_spacing_mm: 5.0,
@@ -3312,6 +3540,7 @@ impl App {
             recolor_preview: false,
             fx_preview: Default::default(),
             selected_cache: std::cell::RefCell::new(None),
+            mesh_grid_cache: Default::default(),
             outline_cache: std::cell::RefCell::new(None),
             view_anchor: None,
             window_layout: Default::default(),
@@ -3356,6 +3585,10 @@ impl App {
             page_numbers: PageNumberSettings::default(),
             show_welcome: false,
             outline_offset_mm: 2.0,
+            outline_offset_join: Default::default(),
+            outline_offset_steps: 1,
+            dialog_preview: true,
+            offset_preview: Default::default(),
             pending_clip_frame: false,
             pending_text_link: None,
             dialog_return: None,
@@ -3371,6 +3604,8 @@ impl App {
             marquee_moved_from: None,
             tab_ruler_menu: None,
             clip_frame_edit: None,
+            symbol_edit: None,
+            draw_behind: false,
             clip_edit_marks: Vec::new(),
             symmetry_edit: None,
             symmetry_step: None,
@@ -3380,6 +3615,7 @@ impl App {
             symmetry_doc: Default::default(),
             pixel_edit: None,
             pixel_opts: Default::default(),
+            pixel_kept: Default::default(),
             show_guides: true,
             selected_guides: Vec::new(),
             edit_master_guides: true,
@@ -3395,10 +3631,18 @@ impl App {
             settings: crate::settings::Settings::default(),
             welcome_tab: WelcomeTab::GetStarted,
             fullscreen_preview: false,
+            preview_session: None,
             print_preview: None,
             printer_fetch: None,
             print_job: None,
+            print_progress: Default::default(),
             opening: None,
+            saving: None,
+            save_on_worker: !crate::files::WEB && !cfg!(test),
+            exporting: None,
+            open_notice: None,
+            open_notice_next: Vec::new(),
+            open_noticed: None,
             opened_read: None,
             duplex_backs: None,
             printers_seen: Vec::new(),
@@ -3406,6 +3650,7 @@ impl App {
             preview_selected_only: false,
             page_sorter: false,
             multipage: false,
+            spread_adopted: Vec::new(),
             zoom_glide: Default::default(),
             benchmark: Default::default(),
             pan_inertia: Default::default(),
@@ -3417,12 +3662,15 @@ impl App {
             vo: Default::default(),
             page_rasters: Default::default(),
             page_snapshot: Default::default(),
+            text_edit_overlay: Default::default(),
             backdrop_area: Default::default(),
             view_mode: ViewMode::Enhanced,
             proof_colors: false,
             show_page_border: true,
             show_page_shadow: true,
             simulate_overprints: false,
+            view_plate: None,
+            view_plate_doc: std::cell::RefCell::new(None),
             rasterize_complex_effects: true,
             show_bleed: false,
             show_printable_area: false,
@@ -3443,6 +3691,7 @@ impl App {
             linked_mtimes: Default::default(),
             linked_checked: None,
             object_files: Vec::new(),
+            table_files: Vec::new(),
             session: None,
             recovery_offer: Vec::new(),
             highlight_whats_new: false,
@@ -3506,8 +3755,13 @@ impl App {
             objects_closed_pages: Default::default(),
             object_thumbs: Default::default(),
             symbol_thumbs: Default::default(),
+            symbolize_report: None,
+            symbol_replace_source: None,
+            symbol_rename: None,
             objects_master_closed: false,
+            objects_ranges_closed: false,
             picked_layer: None,
+            selected_layers: Vec::new(),
             navigator_tex: None,
             options_label_index: 0,
             options_current_only: false,
@@ -3519,6 +3773,7 @@ impl App {
             show_non_printing: false,
             text_hyphenation: false,
             recording: None,
+            recorded_lines: Vec::new(),
             workspace: Workspace::Default,
             palettes: crate::palette::builtin_palettes(),
             visible_palettes: vec![0],
@@ -3559,6 +3814,8 @@ impl App {
             lens: Default::default(),
             envelope_mode: Default::default(),
             envelope_mapping: Default::default(),
+            envelope_mesh: (3, 3),
+            grid_cut: crate::cut_tools::GridCut::default(),
             envelope_drag: None,
             envelope_box_cache: std::cell::RefCell::new((u64::MAX, u64::MAX, Default::default())),
             bevel: Default::default(),
@@ -3574,6 +3831,8 @@ impl App {
             glyph_size: crate::ui::glyphs_docker::CELL,
             glyph_picked: None,
             table_edit: None,
+            clip_edit_shell: None,
+            clip_edit_outer: Vec::new(),
             table_ui: Default::default(),
             missing_fonts: Vec::new(),
             ask_missing_fonts: true,
@@ -3608,7 +3867,10 @@ impl App {
             inner_dockers: DockerColumn::default(),
             left_inner_dockers: DockerColumn::default(),
             floating_dockers: Vec::new(),
+            closed_own_windows: Vec::new(),
+            docked_before: Vec::new(),
             docker_stacks: Default::default(),
+            locked_dockers: Vec::new(),
             docker_drag: None,
             docker_last: (DockerTab::Hints, true),
             free_transform_last: Point::ZERO,
@@ -3631,6 +3893,7 @@ impl App {
             blends_checked: 0,
             live_fits_checked: 0,
             live_handle_cache: Default::default(),
+            text_follow_checked: 0,
             connector_radius: 3.0,
             connectors_checked: u64::MAX,
             connector_radius_step: None,
@@ -3654,6 +3917,8 @@ impl App {
             area_outline_width: 0.2,
             area_outline_color: Color::BLACK,
             area_fill_outline_edges: false,
+            area_fill_live: false,
+            area_fill_guides: false,
             mesh_rows: 2,
             mesh_cols: 2,
             mesh_palette: 0,
@@ -3837,7 +4102,8 @@ impl App {
     }
 
     /// Where auto-backups go unless Options > Save names a folder: a
-    /// `TraceDraw` folder in the temporary folder (none in a browser,
+    /// `TraceDraw` folder in the temporary folder, or in a portable copy's
+    /// own folder (#3908) (none in a browser,
     /// which keeps them in the page's storage, see `auto_backup_dir`).
     pub fn auto_backup_dir_default() -> Option<PathBuf> {
         if crate::files::WEB {
@@ -3845,7 +4111,7 @@ impl App {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            Some(std::env::temp_dir().join("TraceDraw"))
+            Some(crate::settings::work_dir("TraceDraw"))
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -3912,6 +4178,17 @@ impl App {
 
     /// The colour around the page (Options > Customization): the theme's
     /// until one is picked (white included, #530).
+    /// The colour round the page in the full-screen preview (F9): the
+    /// one picked in Options, or, while none is, the drawing window's
+    /// colour round the page, so a dark theme's grey stays (#4027).
+    pub fn preview_background_color(&self) -> egui::Color32 {
+        if !self.settings.preview_background_custom && self.settings.preview_background == [255, 255, 255] {
+            return self.desktop_color();
+        }
+        let [r, g, b] = self.settings.preview_background;
+        egui::Color32::from_rgb(r, g, b)
+    }
+
     pub fn desktop_color(&self) -> egui::Color32 {
         // The default white desktop follows the theme.
         if !self.settings.desktop_custom && self.settings.desktop_rgb == [255, 255, 255] {
@@ -4235,7 +4512,7 @@ impl App {
         // language that came from the installer or the system stays
         // free to follow them (docs/behavior/language.md).
         self.settings.shown_bars = Some(self.shown_bars());
-        self.settings.dockers = Some(self.docker_setup());
+        self.settings.dockers = Some(self.main_docker_setup());
     }
 
     /// The tool settings now (see [`crate::settings::ToolPrefs`]).
@@ -4288,6 +4565,7 @@ impl App {
             smart_outline_width: self.area_outline_width,
             smart_outline_color: self.area_outline_color,
             smart_outline_edges: self.area_fill_outline_edges,
+            smart_fill_live: self.area_fill_live,
             brush_radius: self.brush_radius,
             roughen_amount: self.roughen_amount,
             brush: self.brush,
@@ -4397,6 +4675,7 @@ impl App {
         self.area_outline_width = finite(t.smart_outline_width, 0.0, 1000.0, 0.2);
         self.area_outline_color = t.smart_outline_color;
         self.area_fill_outline_edges = t.smart_outline_edges;
+        self.area_fill_live = t.smart_fill_live;
         self.brush_radius = finite(t.brush_radius, 0.5, 500.0, 10.0);
         self.roughen_amount = finite(t.roughen_amount, 0.05, 50.0, 2.0);
         self.brush = t.brush.clamped();
@@ -4412,6 +4691,7 @@ impl App {
         self.recognize = crate::recognize::RecognizeSettings {
             recognition: t.recognize.recognition.min(5),
             smoothing: t.recognize.smoothing.min(5),
+            scribble_erases: t.recognize.scribble_erases,
         };
         self.knife = crate::knife::KnifeSettings {
             gap: finite(t.knife.gap, 0.0, 1000.0, 0.0),
@@ -4472,6 +4752,7 @@ impl App {
             rasterize_complex_effects: self.rasterize_complex_effects,
             mode: self.view_mode.id().into(),
             grid_frequency: self.grid_frequency,
+            multipage: self.multipage,
         }
     }
 
@@ -4491,6 +4772,10 @@ impl App {
         self.rasterize_complex_effects = v.rasterize_complex_effects;
         self.view_mode = ViewMode::from_id(&v.mode);
         self.grid_frequency = v.grid_frequency;
+        self.multipage = v.multipage;
+        if v.multipage {
+            self.page_sorter = false;
+        }
     }
 
     /// Dockers' own choices now (see [`crate::settings::PanelPrefs`]).
@@ -4637,6 +4922,7 @@ impl App {
                     })
                 })
                 .collect(),
+            locked: keys(&self.locked_dockers),
             floating: self
                 .floating_dockers
                 .iter()
@@ -4644,9 +4930,21 @@ impl App {
                     tab: f.tab.key().to_string(),
                     pos: [f.pos.x, f.pos.y],
                     size: [f.size.x, f.size.y],
+                    own_window: f.own_window,
+                    desktop: f.desktop.map(|p| [p.x, p.y]),
                 })
                 .collect(),
         }
+    }
+
+    /// The drawing's dockers: as they are now, or as they were left when
+    /// the image editing mode put its own in their place.
+    pub fn main_docker_setup(&self) -> crate::settings::DockerSetup {
+        self.pixel_edit
+            .as_ref()
+            .and_then(|pe| pe.main_dockers.as_ref())
+            .map(|m| m.0.clone())
+            .unwrap_or_else(|| self.docker_setup())
     }
 
     /// Put the dockers back as `setup` says; names of no docker are
@@ -4659,7 +4957,11 @@ impl App {
             } else {
                 k
             };
-            DockerTab::ALL.iter().copied().find(|t| t.key() == k)
+            DockerTab::ALL
+                .iter()
+                .chain(DockerTab::PIXEL.iter())
+                .copied()
+                .find(|t| t.key() == k)
         };
         let mut seen: Vec<DockerTab> = Vec::new();
         let mut take = |keys: &[String]| -> Vec<DockerTab> {
@@ -4716,6 +5018,11 @@ impl App {
                     },
                     size,
                     place: true,
+                    own_window: f.own_window,
+                    desktop: f
+                        .desktop
+                        .filter(|p| p.iter().all(|v| v.is_finite()))
+                        .map(|p| Pos2::new(p[0], p[1])),
                 })
             })
             .collect();
@@ -4752,8 +5059,93 @@ impl App {
                 }
             }
         }
+        self.locked_dockers = setup.locked.iter().filter_map(|k| by_key(k)).collect();
+        self.locked_dockers.dedup();
         self.settle_columns();
         self.docker_last = (self.docker_tab, self.show_dockers);
+    }
+
+    /// Whether `tab` is locked in front of its column (#3953).
+    pub fn docker_locked(&self, tab: DockerTab) -> bool {
+        self.locked_dockers.contains(&tab)
+    }
+
+    /// Lock or unlock `tab` (#3953). A locked docker stays where it is
+    /// when another docker opens: that one goes under it.
+    pub fn set_docker_locked(&mut self, tab: DockerTab, locked: bool) {
+        self.locked_dockers.retain(|t| *t != tab);
+        if locked {
+            self.locked_dockers.push(tab);
+        }
+    }
+
+    /// Open `tab` in the column at `place` without moving a locked docker
+    /// (#3953): with a locked docker in front, `tab` goes under it; when
+    /// the docker under it is locked too, `tab` goes to the side's second
+    /// column (floating when that is full of locked dockers as well).
+    /// False when the front docker there is not locked, so `tab` opens
+    /// the usual way.
+    pub fn open_beside_locked(&mut self, tab: DockerTab, place: DockerPlace) -> bool {
+        let Some(i) = place.column_index() else {
+            return false;
+        };
+        let (tabs, front, shown) = self.docker_column(place);
+        if tabs.is_empty() || front == tab || !self.docker_locked(front) {
+            return false;
+        }
+        let below = self.docker_stacks[i].below;
+        if below == Some(tab) {
+            self.set_docker_column(place, true, None);
+            return true;
+        }
+        if below.is_none_or(|b| !self.docker_locked(b)) {
+            if self.docker_place(tab) != Some(place) {
+                self.take_docker(tab);
+                // Taking it may have moved the column (a side's second
+                // column becomes the edge one when that empties).
+                let Some(dest) = self.docker_place(front) else {
+                    return false;
+                };
+                if let Some(tabs) = self.column_tabs_mut(dest) {
+                    let at = tabs
+                        .iter()
+                        .position(|t| *t == front)
+                        .map_or(tabs.len(), |i| i + 1);
+                    tabs.insert(at, tab);
+                }
+                return self.stack_under_front(tab, dest);
+            }
+            if !shown {
+                self.set_docker_column(place, true, None);
+            }
+            return self.stack_under_front(tab, place);
+        }
+        // Both dockers of the column are locked: the side's second column.
+        let inner = match place {
+            DockerPlace::Right => Some(DockerPlace::RightInner),
+            DockerPlace::Left => Some(DockerPlace::LeftInner),
+            _ => None,
+        };
+        match inner {
+            Some(inner) if self.open_beside_locked(tab, inner) => {}
+            Some(inner) if self.docker_place(tab) == Some(inner) => {
+                self.set_docker_column(inner, true, Some(tab));
+            }
+            Some(inner) => self.move_docker(tab, inner, None),
+            None => self.move_docker(tab, DockerPlace::Floating, None),
+        }
+        true
+    }
+
+    /// Show `tab`, one of the column's tabs, under the column's front
+    /// docker, the column open.
+    fn stack_under_front(&mut self, tab: DockerTab, place: DockerPlace) -> bool {
+        let Some(i) = place.column_index() else {
+            return false;
+        };
+        self.docker_stacks[i].below = Some(tab);
+        self.set_docker_column(place, true, None);
+        true
     }
 
     /// The docker shown under the one in front of the column at `place`
@@ -4881,6 +5273,26 @@ impl App {
         }
     }
 
+    /// Give the panel `tab` a window of the system of its own, to put it
+    /// on another monitor (#2884), or bring it back to float inside the
+    /// main window (`on` false). A panel in a column floats first.
+    pub fn set_docker_own_window(&mut self, tab: DockerTab, on: bool) {
+        if on && self.docker_place(tab) != Some(DockerPlace::Floating) {
+            self.move_docker(tab, DockerPlace::Floating, None);
+        }
+        if let Some(f) = self.floating_dockers.iter_mut().find(|f| f.tab == tab) {
+            f.own_window = on;
+            f.place = true;
+        }
+    }
+
+    /// Whether the panel `tab` is in a window of its own.
+    pub fn docker_in_own_window(&self, tab: DockerTab) -> bool {
+        self.floating_dockers
+            .iter()
+            .any(|f| f.tab == tab && f.own_window)
+    }
+
     /// `tab` is open somewhere (in a column, in front or behind, or
     /// floating).
     pub fn docker_open(&self, tab: DockerTab) -> bool {
@@ -4962,6 +5374,16 @@ impl App {
                 return;
             }
         }
+        // A locked docker in front of the column it opens in stays (#3953).
+        let place = match self.docker_place(tab) {
+            Some(DockerPlace::Floating) => None,
+            Some(p) => Some(p),
+            None if self.closed_own_windows.iter().any(|f| f.tab == tab) => None,
+            None => Some(DockerPlace::Right),
+        };
+        if place.is_some_and(|p| self.open_beside_locked(tab, p)) {
+            return;
+        }
         match self.docker_place(tab) {
             Some(DockerPlace::Left) => {
                 self.left_tab = tab;
@@ -4971,6 +5393,14 @@ impl App {
                 self.set_docker_column(p, true, Some(tab));
             }
             Some(DockerPlace::Floating) => {}
+            None if self.closed_own_windows.iter().any(|f| f.tab == tab) => {
+                // Its window was closed: it opens there again.
+                if let Some(i) = self.closed_own_windows.iter().position(|f| f.tab == tab) {
+                    let mut f = self.closed_own_windows.remove(i);
+                    f.place = true;
+                    self.floating_dockers.push(f);
+                }
+            }
             Some(DockerPlace::Right) | None => {
                 if !self.open_dockers.contains(&tab) {
                     self.open_dockers.push(tab);
@@ -4991,6 +5421,17 @@ impl App {
             .iter()
             .find(|f| f.tab == tab)
             .map(|f| (f.pos, f.size));
+        let own = self
+            .floating_dockers
+            .iter()
+            .find(|f| f.tab == tab)
+            .map(|f| (f.own_window, f.desktop))
+            .unwrap_or_default();
+        if let Some(p) = self.docker_place(tab).filter(|p| *p != DockerPlace::Floating) {
+            self.docked_before.retain(|(t, _)| *t != tab);
+            self.docked_before.push((tab, p));
+        }
+        self.closed_own_windows.retain(|f| f.tab != tab);
         self.take_docker(tab);
         match place {
             DockerPlace::Right => {
@@ -5020,6 +5461,8 @@ impl App {
                     pos: Pos2::new(pos.x.max(0.0), pos.y.max(0.0)),
                     size,
                     place: true,
+                    own_window: own.0,
+                    desktop: own.1,
                 });
             }
         }
@@ -5117,7 +5560,30 @@ impl App {
     /// next one comes to the front (with none left the column closes), or
     /// its window closes.
     pub fn close_docker(&mut self, tab: DockerTab) {
+        // A panel in a window of its own is opened there again (#3950).
+        self.closed_own_windows.retain(|f| f.tab != tab);
+        if let Some(f) = self
+            .floating_dockers
+            .iter()
+            .find(|f| f.tab == tab && f.own_window)
+        {
+            self.closed_own_windows.push(*f);
+        }
         self.take_docker(tab);
+    }
+
+    /// Dock the panel `tab` back in the column it was last docked in (the
+    /// right one when it never was), out of its window of its own or from
+    /// floating (#3950).
+    pub fn dock_back(&mut self, tab: DockerTab) {
+        let place = self
+            .docked_before
+            .iter()
+            .find(|(t, _)| *t == tab)
+            .map(|(_, p)| *p)
+            .filter(|p| !p.is_inner() || self.docker_column(*p).0.iter().any(|t| *t != tab))
+            .unwrap_or(DockerPlace::Right);
+        self.move_docker(tab, place, None);
     }
 
     /// Once a frame, before the dockers draw: a docker brought to the
@@ -5126,6 +5592,19 @@ impl App {
     /// default column goes back to how the last frame left it; one open
     /// nowhere joins the default column.
     pub fn reconcile_dockers(&mut self) {
+        // A docker brought to the front of the default column over a
+        // locked one goes under it instead (#3953).
+        let (last, last_shown) = self.docker_last;
+        if self.show_dockers
+            && last_shown
+            && self.docker_tab != last
+            && self.docker_locked(last)
+            && self.open_dockers.contains(&last)
+        {
+            let tab = self.docker_tab;
+            self.docker_tab = last;
+            self.open_docker(tab);
+        }
         if self.show_dockers && !self.open_dockers.contains(&self.docker_tab) {
             let tab = self.docker_tab;
             match self.docker_place(tab) {
@@ -5208,7 +5687,8 @@ impl App {
         // New drawings start with this drawing's grid, rulers and
         // guideline settings.
         if self.has_document() {
-            self.settings.document_defaults = crate::settings::DocumentDefaults::of(self.doc());
+            self.settings.document_defaults =
+                crate::settings::DocumentDefaults::of_page(self.doc(), Some(self.page));
         }
         self.save_settings();
         self.status = crate::i18n::tr("status.settings_saved");
@@ -5328,9 +5808,11 @@ impl App {
             return;
         }
         self.close_active_document();
-        // The last drawing gone: the kept fill pictures go with it.
+        // The last drawing gone: the kept fill pictures and picture
+        // layers go with it.
         if !self.has_document() {
             tracedraw_render::clear_procedural_cache();
+            self.pixel_kept.clear();
         }
     }
 
@@ -5641,7 +6123,7 @@ impl App {
                     .iter()
                     .filter(|l| l.visible && !l.locked)
                     .flat_map(|l| &l.shapes)
-                    .filter(|s| !s.locked && s.visible && pred(s))
+                    .filter(|s| !s.locked && s.visible && !self.outside_clip_edit(s.id) && pred(s))
                     .map(|s| s.id)
                     .collect()
             })
@@ -6057,6 +6539,13 @@ impl App {
         lines
     }
 
+    /// `s` is or holds (in groups and clip frames) a symbol instance;
+    /// what [`App::with_symbols_drawn`] answers for, without building
+    /// the drawn shape. Deepest eight levels, as there.
+    pub(crate) fn holds_symbol_instance(s: &Shape) -> bool {
+        s.holds_symbol_instance()
+    }
+
     /// `s` with every symbol instance it is or holds (in groups and clip
     /// frames) replaced by its symbol's objects, placed as the instance
     /// places them: what the outlines drawn over a selection follow. A
@@ -6064,80 +6553,38 @@ impl App {
     /// selection outline and the Shape tool's frame showed instead of
     /// the symbol (#3437). `None` when `s` holds no instance.
     pub fn with_symbols_drawn(&self, s: &Shape) -> Option<Shape> {
-        const DEEPEST: usize = 8;
-        fn holds(s: &Shape, depth: usize) -> bool {
-            depth <= DEEPEST
-                && match &s.kind {
-                    ShapeKind::SymbolInstance { .. } => true,
-                    ShapeKind::Group { children } => children.iter().any(|c| holds(c, depth + 1)),
-                    ShapeKind::ClipFrame { contents, .. } => {
-                        contents.iter().any(|c| holds(c, depth + 1))
-                    }
-                    _ => false,
-                }
+        s.with_symbols_drawn(&self.doc().symbols)
+    }
+
+    /// The geometric bounds of `s`, a top-level object of the current
+    /// page straight from `page_layers`, measured once per change of the
+    /// drawing (#3559): hit testing and snapping ask for the box of
+    /// every object of the page on every pointer move. `None` when the
+    /// box is not the object's own — live effects and symbol instances
+    /// draw something else (see [`Self::visual_bounds`]) — so callers
+    /// fall back to asking it. Never call with a shape that is not in
+    /// the drawing: an effect's preview part carries its source's id,
+    /// and the cache would answer with the source's box.
+    pub(crate) fn plain_bounds_cached(&self, s: &Shape) -> Option<Rect> {
+        if s.has_live_effects() || Self::holds_symbol_instance(s) {
+            return None;
         }
-        fn drawn(s: &Shape, symbols: &[tracedraw_core::document::Symbol], depth: usize) -> Shape {
-            if depth > DEEPEST {
-                return s.clone();
-            }
-            match &s.kind {
-                ShapeKind::SymbolInstance { index } => match symbols.get(*index) {
-                    Some(def) => {
-                        let mut d = drawn(&def.shape, symbols, depth + 1);
-                        d.absorb(s.transform);
-                        d.id = s.id;
-                        d
-                    }
-                    None => s.clone(),
-                },
-                ShapeKind::Group { children } => {
-                    let mut g = s.clone();
-                    g.kind = ShapeKind::Group {
-                        children: children
-                            .iter()
-                            .map(|c| drawn(c, symbols, depth + 1))
-                            .collect(),
-                    };
-                    g
-                }
-                ShapeKind::ClipFrame { frame, contents } => {
-                    let mut c = s.clone();
-                    c.kind = ShapeKind::ClipFrame {
-                        frame: frame.clone(),
-                        contents: contents
-                            .iter()
-                            .map(|k| drawn(k, symbols, depth + 1))
-                            .collect(),
-                    };
-                    c
-                }
-                _ => s.clone(),
-            }
+        let revision = self.engine.revision();
+        let mut cache = self.visual_cache.try_borrow_mut().ok()?;
+        if cache.0 != revision {
+            cache.0 = revision;
+            cache.1.clear();
         }
-        holds(s, 0).then(|| drawn(s, &self.doc().symbols, 0))
+        Some(*cache.1.entry(s.id).or_insert_with(|| s.bounds()))
     }
 
     /// The bounds of what `s` (in page space) draws, its live effects
     /// included; measured once per change of the drawing.
     pub fn visual_bounds(&self, s: &Shape) -> Rect {
-        // A symbol instance's box is its symbol's, placed by the instance's
-        // transform; the shape alone only knows a unit box, which put the
-        // handles of a new symbol in its corner at 10 x 10 mm (#1939).
-        if let ShapeKind::SymbolInstance { index } = &s.kind {
-            if let Some(def) = self.doc().symbols.get(*index) {
-                return tracedraw_core::geometry::transformed_bounds(
-                    &def.shape.page_path(),
-                    s.transform,
-                );
-            }
-        }
-        // A group or clip frame holding one: the box of what it draws, so
-        // a click or a marquee over the symbol's objects picks the group
-        // (#3437).
-        if !matches!(s.kind, ShapeKind::SymbolInstance { .. }) {
-            if let Some(drawn) = self.with_symbols_drawn(s) {
-                return drawn.bounds();
-            }
+        // A symbol instance, or a group or clip frame holding one: the box
+        // of what it draws, placed by the transforms above it (#1939, #3437).
+        if let Some(drawn) = self.with_symbols_drawn(s) {
+            return drawn.visual_bounds();
         }
         if !s.has_live_effects() {
             return s.bounds();
@@ -6176,6 +6623,28 @@ impl App {
     }
 
     pub fn run(&mut self, cmd: Command) {
+        let range_layer = match &cmd {
+            Command::SetLayerScope { layer, .. } => Some(*layer),
+            Command::SetLayerPageRange { layer, page_range }
+                if page_range.as_ref().is_none_or(|range| !range.is_empty()) =>
+            {
+                Some(*layer)
+            }
+            _ => None,
+        };
+        if let Some(layer) = range_layer {
+            if self
+                .doc()
+                .master
+                .iter()
+                .any(|master| master.id == layer && !master.desktop)
+            {
+                self.prepare_layer_range_change(layer);
+            }
+        }
+        if crate::page_names::changes_page_order(&cmd) {
+            self.prepare_shared_layer_editing();
+        }
         // The box a move, turn or resize starts from, for its Repeat.
         let before = match &cmd {
             Command::TransformShapes { shapes, .. } if *shapes == self.selection => {
@@ -6214,13 +6683,24 @@ impl App {
                 self.status = e.to_string();
             }
         }
+        if let Some(k) = self.drawn_behind(&cmd) {
+            if let Err(e) = self.engine.amend(&k) {
+                self.status = e.to_string();
+            }
+        }
         self.remember_colors_of(std::slice::from_ref(&cmd));
         // Default page names follow the pages' order (#2374).
         if crate::page_names::changes_page_order(&cmd) {
             self.renumber_default_pages();
+            self.sync_layer_ranges(None);
         }
         self.sync_effect_clones_for(&cmd);
         self.sync_object_clones();
+        if let Command::SetLayerScope { layer, .. } | Command::SetLayerPageRange { layer, .. } =
+            &cmd
+        {
+            self.sync_layer_range(*layer);
+        }
         if let (Command::TransformShapes { transform, .. }, Some(before)) = (&cmd, before) {
             self.note_repeatable(Repeatable::Transform {
                 transform: *transform,
@@ -6241,6 +6721,214 @@ impl App {
         self.repeat_refs.clear();
         if let Some(rec) = &mut self.recording {
             rec.push(cmd);
+        }
+    }
+
+    /// Clear editing state for a shared layer excluded from the current page.
+    pub(crate) fn sync_layer_range(&mut self, id: LayerId) {
+        self.sync_layer_ranges(Some(id));
+    }
+
+    /// Finish editor modes before moving their objects into a restricted layer.
+    pub(crate) fn prepare_shapes_for_range_move(&mut self, ids: &[ShapeId]) -> bool {
+        let moving = |id: ShapeId| {
+            ids.contains(&id) || self.doc().ancestors(id).iter().any(|id| ids.contains(id))
+        };
+        let clip = self
+            .clip_frame_edit
+            .as_ref()
+            .is_some_and(|(frame, _)| moving(*frame));
+        let text = self
+            .text_edit
+            .as_ref()
+            .is_some_and(|edit| moving(edit.shape));
+        let table = self
+            .table_edit
+            .as_ref()
+            .is_some_and(|edit| clip || moving(edit.shape));
+        let symmetry = self.symmetry_edit.is_some_and(|id| clip || moving(id));
+        let crop = self.crop_area.is_some() && (clip || self.selection.iter().copied().any(moving));
+        let curve = self.curve.is_some() && (clip || self.selection.iter().copied().any(moving));
+        let focused = (clip && !self.focus.is_empty()) || self.focus.iter().copied().any(moving);
+        if curve {
+            self.finish_curve();
+        }
+        if text || clip {
+            self.finish_text();
+        }
+        if clip {
+            self.finish_clip_frame_edit();
+        }
+        if table {
+            self.table_edit = None;
+            self.ime_preedit.clear();
+        }
+        if symmetry {
+            self.finish_symmetry_edit();
+        }
+        if focused {
+            self.exit_focus();
+        }
+        if crop {
+            self.crop_area = None;
+            self.crop_drag = None;
+        }
+        text || clip || curve || table || symmetry || crop || focused
+    }
+
+    pub(crate) fn prepare_layer_range_change(&mut self, id: LayerId) {
+        if self.curve.is_some() && self.active_layer() == Some(id) {
+            self.finish_curve();
+        }
+        if self.text_edit.is_none()
+            && self.clip_frame_edit.is_none()
+            && self.curve.is_none()
+            && self.table_edit.is_none()
+            && self.symmetry_edit.is_none()
+            && self.crop_area.is_none()
+        {
+            return;
+        }
+        let Ok(layer) = self.doc().layer(id) else {
+            return;
+        };
+        let ids: Vec<_> = layer.shapes.iter().map(|shape| shape.id).collect();
+        self.prepare_shapes_for_range_move(&ids);
+    }
+
+    /// Commit editor modes on range layers before leaving their applicable pages.
+    pub(crate) fn prepare_range_page_change(&mut self, index: usize) -> bool {
+        let layers: Vec<_> = self
+            .doc()
+            .master
+            .iter()
+            .filter(|layer| layer.page_range.is_some() && !layer.applies_to(index))
+            .map(|layer| layer.id)
+            .collect();
+        let restricted = !layers.is_empty();
+        for layer in layers {
+            self.prepare_layer_range_change(layer);
+        }
+        restricted
+    }
+
+    fn prepare_shared_layer_editing(&mut self) {
+        if self.curve.is_some()
+            && self
+                .active_layer()
+                .is_some_and(|id| self.doc().master.iter().any(|layer| layer.id == id))
+        {
+            self.finish_curve();
+        }
+        let text = self.text_edit.as_ref().map(|edit| edit.shape);
+        let clip = self.clip_frame_edit.as_ref().map(|(frame, _)| *frame);
+        let table = self.table_edit.as_ref().map(|edit| edit.shape);
+        let mut layers: Vec<_> = text
+            .into_iter()
+            .chain(clip)
+            .chain(table)
+            .chain(self.symmetry_edit)
+            .chain(
+                self.selection
+                    .iter()
+                    .copied()
+                    .filter(|_| self.curve.is_some() || self.crop_area.is_some()),
+            )
+            .filter_map(|id| self.doc().top_level_of(id))
+            .filter_map(|id| self.doc().locate(id).ok().map(|(layer, _)| layer))
+            .filter(|id| self.doc().master.iter().any(|layer| layer.id == *id))
+            .collect();
+        layers.dedup();
+        for id in layers {
+            self.prepare_layer_range_change(id);
+        }
+    }
+
+    pub(crate) fn sync_layer_ranges(&mut self, only: Option<LayerId>) {
+        fn collect(shape: &Shape, out: &mut std::collections::HashSet<ShapeId>) {
+            out.insert(shape.id);
+            match &shape.kind {
+                ShapeKind::Group { children } => {
+                    for child in children {
+                        collect(child, out);
+                    }
+                }
+                ShapeKind::ClipFrame { frame, contents } => {
+                    collect(frame, out);
+                    for child in contents {
+                        collect(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.selection.is_empty()
+            && self.picked_layer.is_none()
+            && self.text_edit.is_none()
+            && self.table_edit.is_none()
+            && self.symmetry_edit.is_none()
+            && self.focus.is_empty()
+        {
+            return;
+        }
+        let mut layers = std::collections::HashSet::new();
+        let mut shapes = std::collections::HashSet::new();
+        let index = self.page_index();
+        for layer in &self.doc().master {
+            if only.is_none_or(|id| id == layer.id) && !layer.applies_to(index) {
+                layers.insert(layer.id);
+                for shape in &layer.shapes {
+                    collect(shape, &mut shapes);
+                }
+            }
+        }
+        let picked = self
+            .picked_layer
+            .is_some_and(|id| layers.contains(&id) || self.doc().layer(id).is_err());
+        let text = self
+            .text_edit
+            .as_ref()
+            .is_some_and(|edit| shapes.contains(&edit.shape));
+        let table = self
+            .table_edit
+            .as_ref()
+            .is_some_and(|edit| shapes.contains(&edit.shape));
+        let symmetry = self.symmetry_edit.is_some_and(|id| shapes.contains(&id));
+        let focused = self.focus.iter().any(|id| shapes.contains(id));
+        if symmetry {
+            self.finish_symmetry_edit();
+        }
+        let selection = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| !shapes.contains(id))
+            .collect::<Vec<_>>();
+        let changed = selection.len() != self.selection.len();
+        if !(picked || text || table || symmetry || focused || changed) {
+            return;
+        }
+        if changed {
+            self.select(selection);
+        }
+        if picked {
+            self.picked_layer = None;
+        }
+        if text {
+            self.text_edit = None;
+            self.ime_preedit.clear();
+        }
+        if table {
+            self.table_edit = None;
+            self.ime_preedit.clear();
+        }
+        self.crop_area = None;
+        self.crop_drag = None;
+        if focused {
+            self.exit_focus();
+        }
+        if only.is_some() {
+            self.status = crate::i18n::tr("docker.range_no_current_page");
         }
     }
 
@@ -6310,7 +6998,7 @@ impl App {
             // Cancel undoes only what the Shape Builder made since it was
             // chosen (#3220).
             if tool == Tool::ShapeBuilder {
-                self.builder.session_steps = 0;
+                self.builder_forget_session();
             }
             // Another tool ends a pick of Image > Color Mask (#2479).
             if tool != Tool::ColorEyedropper {
@@ -6344,6 +7032,8 @@ impl App {
             if !locked.is_empty() {
                 ids.retain(|id| !locked.contains(id));
             }
+            // Objects picked on the canvas: a layer selection is let go.
+            self.selected_layers.clear();
         }
         self.selection = ids;
         self.shadow_picked = None;
@@ -6488,6 +7178,10 @@ impl App {
             },
             Tool::GraphPaper => {
                 self.create_graph_paper(rect);
+                return;
+            }
+            Tool::ShapeGenerator => {
+                self.create_shape_gen_in(rect);
                 return;
             }
             Tool::ActionLines => {
@@ -6677,7 +7371,12 @@ impl App {
         let angle = base.atan2();
         let dir = base / len;
         let normal = Vec2::new(-dir.y, dir.x);
-        let height = (c - a).dot(normal);
+        let mut height = (c - a).dot(normal);
+        // Ctrl held at the third point of the 3-Point Ellipse: a circle
+        // with the base as its diameter, wherever the point is (#4086).
+        if self.tool == Tool::ThreePointEllipse && arc {
+            height = circle_on_base_height(len, height);
+        }
         match self.tool {
             Tool::ThreePointRectangle | Tool::ThreePointEllipse => {
                 if height.abs() < 0.05 {
@@ -6715,6 +7414,9 @@ impl App {
                         });
                     }
                     self.select(vec![id]);
+                    if joined != Some(id) {
+                        self.add_parallel_lines(id);
+                    }
                 }
             }
             _ => {}
@@ -6795,6 +7497,7 @@ impl App {
                 },
             ) {
                 self.select(vec![id]);
+                self.add_parallel_lines(id);
             }
             return;
         }
@@ -6803,7 +7506,7 @@ impl App {
             let redo_to = c.nodes.last().copied().filter(|_| !closes);
             self.note_pen_curve_step(id, c.nodes.first().copied(), redo_to);
         }
-        if c.bspline {
+        if c.bspline && !c.curvature {
             // A B-spline of its own keeps its control points (one that
             // went on from another curve is a curve like that one).
             if let Some(id) = id {
@@ -6938,11 +7641,22 @@ impl App {
     /// [`Self::pen_curve_steps`]): a curve drawn with the Pen or Bezier
     /// tool goes on being drawn with it, from where it stood then.
     fn resume_pen_step(&mut self, step: Option<u64>, undone: bool) {
+        if !self.pen_step_shown_on_current_page(step) {
+            return;
+        }
         let key = step.map(|s| (self.engine.instance(), s));
         if let Some(&ps) = key.and_then(|k| self.pen_curve_steps.get(&k)) {
             let to = if undone { ps.undo_to } else { ps.redo_to };
             self.resume_curve(ps.shape, ps.tool, to);
         }
+    }
+
+    fn pen_step_shown_on_current_page(&self, step: Option<u64>) -> bool {
+        step.and_then(|step| self.pen_curve_steps.get(&(self.engine.instance(), step)))
+            .and_then(|step| self.doc().top_level_of(step.shape))
+            .and_then(|id| self.doc().locate(id).ok())
+            .and_then(|(id, _)| self.doc().master.iter().find(|layer| layer.id == id))
+            .is_none_or(|layer| layer.applies_to(self.page_index()))
     }
 
     /// The curve `id`, just made with the outline `line` from the B-spline
@@ -6991,6 +7705,7 @@ impl App {
         };
         let mut para = tracedraw_core::ParagraphStyle::default();
         para.hyphenate = self.text_hyphenation;
+        let clean_rev = self.engine.revision();
         let before = self.engine.last_step_id();
         if let Some(id) = self.new_shape(ShapeKind::Text {
             spans: vec![span],
@@ -7010,6 +7725,7 @@ impl App {
                 ..TextEdit::at_end(id, 0)
             });
             self.select(vec![id]);
+            self.note_fresh_text_edit(id, clean_rev);
         }
     }
 
@@ -7041,7 +7757,9 @@ impl App {
 
     /// Property bar defaults follow the text object being edited.
     pub fn sync_text_defaults_from(&mut self, id: ShapeId) {
-        let kind = self.doc().shape(id).map(|(_, s)| s.kind.clone());
+        // Found inside groups too: a text in a group chosen on its own
+        // showed the font of the text read before it (#3896).
+        let kind = self.doc().find_shape(id).map(|s| s.kind.clone()).ok_or(());
         if let Ok(ShapeKind::Text { spans, align, .. }) = &kind {
             // While editing, the style at the caret (of the character
             // before it); with the Shape tool, of the first chosen
@@ -7236,6 +7954,10 @@ impl App {
     }
 
     pub fn select_all(&mut self) {
+        // With facing pages the whole spread shown is taken (#3744).
+        if self.focus_shape_on_page().is_none() {
+            self.adopt_whole_spread();
+        }
         let ids = self.selectable_ids();
         self.select(ids);
     }
@@ -7541,7 +8263,7 @@ impl App {
     /// Copies take the centre of rotation moved for their originals, at
     /// the same place of each copy (or of the copies' box): a copy made
     /// with Duplicate and turned, then repeated, goes on round the point
-    /// the original was turned about, as in CorelDRAW. The copies turned
+    /// the original was turned about. The copies turned
     /// about the middle of their box (#2375, #2376).
     fn carry_pivots(&mut self, pairs: &[(ShapeId, ShapeId)]) {
         for (orig, copy) in pairs {
@@ -7630,8 +8352,44 @@ impl App {
             }
         }
         self.selection.clear();
-        for g in groups {
-            self.run(Command::Ungroup { group: g });
+        // A group's drop shadow stays where it showed (#3831): it was the
+        // group's own, cast by all its objects together, and went with the
+        // group. It comes out as the bitmap Break Drop Shadow Apart makes,
+        // just behind the group's objects, in the same undo step.
+        let mut shadows = Vec::new();
+        for g in &groups {
+            let Some(s) = self
+                .doc()
+                .shape_on_page(*g)
+                .filter(|s| s.shadow.is_some_and(|sh| sh.opacity > 0.0))
+            else {
+                continue;
+            };
+            let Ok((layer, _)) = self.doc().locate(*g) else {
+                continue;
+            };
+            if let Some(bitmap) = self.shadow_bitmap(&s) {
+                let id = bitmap.id;
+                shadows.push(Command::AddShape {
+                    layer,
+                    shape: bitmap,
+                });
+                shadows.push(Command::PlaceBeside {
+                    shapes: vec![id],
+                    reference: *g,
+                    in_front: false,
+                });
+            }
+        }
+        if shadows.is_empty() {
+            for g in groups {
+                self.run(Command::Ungroup { group: g });
+            }
+        } else {
+            shadows.extend(groups.into_iter().map(|group| Command::Ungroup { group }));
+            if let Err(e) = self.engine.run_batch("Ungroup", &shadows) {
+                self.status = e.to_string();
+            }
         }
         let mut have: std::collections::HashSet<ShapeId> = members.iter().copied().collect();
         for id in self.added_top_level_ids(&before) {
@@ -7896,7 +8654,7 @@ impl App {
             if matches!(
                 self.tool,
                 Tool::MeshFill | Tool::Shape | Tool::InteractiveFill
-            ) && self.color_mesh_node(*c)
+            ) && (self.color_mesh_node(*c) || self.color_color_point(*c))
             {
                 return;
             }
@@ -8154,6 +8912,75 @@ impl App {
         self.run(Command::SwapColors { shapes });
     }
 
+    /// Swap Fills (Colour panel, #3770): two selected objects exchange
+    /// the fills they show (a colour, a gradient, a pattern; a mesh is
+    /// fitted to its new object), one undo step. Nothing with another
+    /// number of objects selected.
+    pub fn swap_fills(&mut self) {
+        let shapes = self.selected_shapes();
+        let [a, b] = shapes.as_slice() else {
+            return;
+        };
+        let (sa, sb) = (
+            crate::copy_props::properties_source(a),
+            crate::copy_props::properties_source(b),
+        );
+        let (fa, fb) = (
+            crate::copy_props::shown_fill(&sa),
+            crate::copy_props::shown_fill(&sb),
+        );
+        let mut cmds = crate::copy_props::fill_commands(&fb, &sb, std::slice::from_ref(a));
+        cmds.extend(crate::copy_props::fill_commands(&fa, &sa, std::slice::from_ref(b)));
+        if let Err(e) = self.engine.run_batch("Swap Fills", &cmds) {
+            self.status = e.to_string();
+        }
+    }
+
+    /// Outline From Fill (Colour panel, #3770): each selected object's
+    /// outline takes the colour of its own fill (the first colour of a
+    /// gradient), objects inside groups each on their own, the outline's
+    /// width and style kept; an object without an outline gets the
+    /// default outline in that colour. Objects without a fill are left
+    /// alone. One undo step.
+    pub fn outline_from_fill(&mut self) {
+        fn leaves(s: &Shape, out: &mut Vec<(ShapeId, Color)>) {
+            if let ShapeKind::Group { children } = &s.kind {
+                children.iter().for_each(|c| leaves(c, out));
+                return;
+            }
+            let src = crate::copy_props::properties_source(s);
+            if let Some(c) = crate::copy_props::shown_fill(&src).preview_color() {
+                out.push((s.id, c));
+            }
+        }
+        let mut found = Vec::new();
+        for s in self.selected_shapes() {
+            leaves(&s, &mut found);
+        }
+        let base = self
+            .default_stroke()
+            .unwrap_or_else(|| Stroke::new(Color::BLACK, 0.2));
+        let cmds: Vec<Command> = found
+            .into_iter()
+            .map(|(id, c)| {
+                let mut stroke = base.clone();
+                stroke.color = c;
+                stroke.fill = None;
+                Command::PatchStroke {
+                    shapes: vec![id],
+                    stroke,
+                    fields: vec![tracedraw_core::patch::StrokeField::Paint],
+                }
+            })
+            .collect();
+        if cmds.is_empty() {
+            return;
+        }
+        if let Err(e) = self.engine.run_batch("Outline From Fill", &cmds) {
+            self.status = e.to_string();
+        }
+    }
+
     /// Object > Thicker Outline and Thinner Outline (#2905): the
     /// selection's outline one step up or down the outline width list,
     /// as the wheel over the width box steps it, in the outline's unit.
@@ -8175,6 +9002,14 @@ impl App {
     }
 
     pub fn apply_outline_width(&mut self, width: f64) {
+        if self.text_selection_active() {
+            self.text_apply_outline_width(width);
+            return;
+        }
+        if self.chosen_chars_active() {
+            self.chosen_chars_apply_outline_width(width);
+            return;
+        }
         let shapes = self.selected_shapes();
         if shapes.is_empty() {
             self.request_default_change(crate::defaults::DefaultChange::OutlineWidth(width));
@@ -8333,6 +9168,9 @@ impl App {
             return;
         }
         let step = self.engine.last_step_id();
+        // The creation step may remove the curve, so check its source layer
+        // before swapping the document rather than looking it up afterwards.
+        let resume_pen = self.pen_step_shown_on_current_page(step);
         let at = self.page_index_now();
         let undone = match self.engine.undo() {
             Ok(l) => {
@@ -8354,9 +9192,10 @@ impl App {
             if self.curve.as_ref().is_some_and(|c| c.resumed) {
                 self.curve = None;
             }
-            if self.curve.is_none() {
+            if self.curve.is_none() && resume_pen {
                 self.resume_pen_step(step, true);
             }
+            self.sync_layer_ranges(None);
         }
     }
 
@@ -8373,6 +9212,9 @@ impl App {
         self.curve_steps.clear();
         if self.redo_selection_step() {
             return;
+        }
+        if self.engine.redo_label().is_some() {
+            self.prepare_shared_layer_editing();
         }
         let at = self.page_index_now();
         let redone = match self.engine.redo() {
@@ -8395,6 +9237,7 @@ impl App {
             if self.curve.is_none() {
                 self.resume_pen_step(self.engine.last_step_id(), false);
             }
+            self.sync_layer_ranges(None);
         }
     }
 
@@ -8619,6 +9462,14 @@ impl App {
     }
 
     /// Open `path`; `password` opens a protected PDF (empty: none).
+    /// The file File > Revert reads again: the drawing's own file, else
+    /// the one it was read from in another format. A `.cdr` (or an SVG, a
+    /// PDF...) opens with no file of its own, so that Save asks where, and
+    /// Revert stayed greyed out for it (#3809).
+    pub fn revert_path(&self) -> Option<PathBuf> {
+        self.file.clone().or_else(|| self.opened_from.clone())
+    }
+
     pub fn open_path_with_password(&mut self, path: PathBuf, password: &str) {
         let ext = Self::file_kind(&path);
         // A format kept closed by its maker (#2589): say how to bring the
@@ -8653,6 +9504,24 @@ impl App {
                 ));
                 return;
             }
+        }
+        // A large file of another format is read on the interface's
+        // thread: the window says it is being opened first
+        // ([`App::poll_open_notice`]).
+        if ext != "tdraw"
+            && self.save_on_worker
+            && self.open_noticed.as_ref() != Some(&path)
+            && std::fs::metadata(&path)
+                .is_ok_and(|m| m.len() >= crate::opening::BACKGROUND_FROM)
+        {
+            if self.open_notice.is_some() {
+                self.open_notice_next.push((path, password.to_string()));
+            } else {
+                self.status =
+                    crate::i18n::trf("status.opening", &[("p", &path.display().to_string())]);
+                self.open_notice = Some((path, password.to_string(), 0));
+            }
+            return;
         }
         // A package's fonts, beside the drawing, before its text is laid
         // out (#852).
@@ -8835,12 +9704,12 @@ impl App {
                     (doc, format!("HPGL: {n} stroke(s)"))
                 })
         } else if crate::spreadsheet_import::is_spreadsheet(&ext) {
-            crate::spreadsheet_import::read_rows(&path).map(|rows| {
+            crate::spreadsheet_import::read_sheet(&path).map(|(rows, source)| {
                 let title = path
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(App::untitled_name);
-                let doc = crate::spreadsheet_import::document(&title, &rows);
+                let doc = crate::spreadsheet_import::document_from(&title, &rows, source);
                 let n = rows.len();
                 (doc, format!("{n} row(s)"))
             })
@@ -8973,6 +9842,10 @@ impl App {
                     });
                 }
                 doc2.set_ids(ids);
+                // An RGB drawing opens as an RGB document, as the command
+                // line's does, so a .cdr saved from it keeps its RGB
+                // colours (#4096).
+                tracedraw_io::pdf_import::open_in_colour_mode(&mut doc2);
                 // The paragraph frames the file's text continues in are
                 // linked (#2323).
                 let links = {
@@ -9096,7 +9969,11 @@ impl App {
                 .map(|d| (d, crate::i18n::tr("status.opened")))
         };
         match result {
-            Ok((doc, msg)) => {
+            Ok((mut doc, msg)) => {
+                // Brush strokes of a `.cdr` file open live (#3680).
+                if ext == "cdr" {
+                    crate::fit_live::adopt_imported_strokes(&mut doc);
+                }
                 self.open_document(doc, None);
                 if ext == "pmd" {
                     self.open_limits = Some(crate::i18n::tr("pmd.limits"));
@@ -9178,6 +10055,18 @@ impl App {
     }
 
     pub fn save(&mut self, save_as: bool) {
+        self.save_with(save_as, false);
+    }
+
+    /// File > Save and Save As from the menus, the toolbar and the
+    /// keyboard: as [`App::save`], a large drawing written off the
+    /// interface's thread with a window saying so, so the program does
+    /// not stand still with nothing on screen while it is saved (#4011).
+    pub fn save_showing_progress(&mut self, save_as: bool) {
+        self.save_with(save_as, true);
+    }
+
+    fn save_with(&mut self, save_as: bool, progress: bool) {
         // A drawing from GitHub saves back as a commit (Save As saves a
         // file as usual).
         if !save_as && self.remote.is_some() {
@@ -9197,7 +10086,7 @@ impl App {
         // write back to.
         if !save_as && !crate::files::WEB {
             if let Some(path) = self.file.clone() {
-                self.save_to(path);
+                self.save_to_with(path, progress);
                 return;
             }
         }
@@ -9231,6 +10120,18 @@ impl App {
     }
 
     pub(crate) fn save_to(&mut self, path: PathBuf) {
+        self.save_to_with(path, false);
+    }
+
+    /// As [`App::save_to`], a large `.tdraw` drawing written off the
+    /// interface's thread (see [`App::save_showing_progress`]).
+    pub(crate) fn save_to_showing_progress(&mut self, path: PathBuf) {
+        self.save_to_with(path, true);
+    }
+
+    fn save_to_with(&mut self, path: PathBuf, progress: bool) {
+        // A save still being written ends first: two never write at once.
+        self.wait_for_saving();
         // Time counted for the active task goes into the file too.
         self.flush_tracked_time();
         // Mesh fills a `.cdr` file gets as one colour each: the status
@@ -9289,6 +10190,23 @@ impl App {
             } else {
                 std::borrow::Cow::Borrowed(&*carried)
             };
+            if progress && self.save_on_worker && crate::saving::is_large(&path, &doc) {
+                let state = (self.engine.instance(), self.engine.revision());
+                let copy = doc.into_owned();
+                match crate::saving::Saving::start(path.clone(), copy, version, state) {
+                    Ok(job) => {
+                        self.status = crate::i18n::trf(
+                            "status.saving",
+                            &[("p", &path.display().to_string())],
+                        );
+                        self.saving = Some(job);
+                        return;
+                    }
+                    Err(e) => {
+                        return self.saved_to(path, Err(e));
+                    }
+                }
+            }
             // Written to the file as it is made: the JSON of a large
             // drawing is several times its size.
             let result = crate::files::write_with(&path, |w| {
@@ -9308,6 +10226,103 @@ impl App {
                 self.status,
                 crate::i18n::trf("status.saved_mesh_as_colour", &[("n", &meshes.to_string())])
             );
+        }
+    }
+
+    /// A large file of another format about to be opened: once its
+    /// notice has been on screen for a frame, read it. Whether one is
+    /// waiting.
+    pub fn poll_open_notice(&mut self) -> bool {
+        let Some((_, _, frames)) = &mut self.open_notice else {
+            return false;
+        };
+        if *frames < 2 {
+            *frames += 1;
+            return true;
+        }
+        if let Some((path, password, _)) = self.open_notice.take() {
+            self.open_noticed = Some(path.clone());
+            self.open_path_with_password(path, &password);
+            self.open_noticed = None;
+        }
+        // The next one's notice shows before it is read in its turn.
+        if self.open_notice.is_none() && !self.open_notice_next.is_empty() {
+            let (path, password) = self.open_notice_next.remove(0);
+            self.status =
+                crate::i18n::trf("status.opening", &[("p", &path.display().to_string())]);
+            self.open_notice = Some((path, password, 0));
+        }
+        self.open_notice.is_some()
+    }
+
+    /// The export running off the interface's thread, once it is over:
+    /// the status line, as after any export. Whether it is still running.
+    pub fn poll_exporting(&mut self) -> bool {
+        let Some(job) = &self.exporting else {
+            return false;
+        };
+        let Some(result) = job.poll() else {
+            return true;
+        };
+        if let Some(job) = self.exporting.take() {
+            crate::ui::dialogs::export_done(self, result, job.last_options);
+        }
+        false
+    }
+
+    /// Wait for the export running off the interface's thread, if one is
+    /// (the program closes, or another export starts).
+    pub fn wait_for_exporting(&mut self) {
+        if let Some(job) = self.exporting.take() {
+            let result = job.wait();
+            crate::ui::dialogs::export_done(self, result, job.last_options);
+        }
+    }
+
+    /// The large drawing being written off the interface's thread, once
+    /// its file is written: its state, the status line and the recent
+    /// files, as after any save. Whether it is still being written.
+    pub fn poll_saving(&mut self) -> bool {
+        let Some(job) = &self.saving else {
+            return false;
+        };
+        let Some(result) = job.poll() else {
+            return true;
+        };
+        if let Some(job) = self.saving.take() {
+            self.finish_saving(job, result);
+        }
+        false
+    }
+
+    /// Wait for the drawing being written off the interface's thread, if
+    /// one is (the program closes, or the drawing is saved again).
+    pub fn wait_for_saving(&mut self) {
+        if let Some(job) = self.saving.take() {
+            let result = job.wait();
+            self.finish_saving(job, result);
+        }
+    }
+
+    fn finish_saving(&mut self, job: crate::saving::Saving, result: Result<(), String>) {
+        // Another drawing is the active one now: the file is written,
+        // and that is all there is to say here.
+        if self.engine.instance() != job.state.0 {
+            self.status = match result {
+                Ok(()) => {
+                    crate::i18n::trf("status.saved", &[("p", &job.path.display().to_string())])
+                }
+                Err(e) => crate::i18n::trf("status.save_failed", &[("e", &e)]),
+            };
+            return;
+        }
+        let changed_since = self.engine.revision() != job.state.1;
+        let saved = result.is_ok();
+        self.saved_to(job.path, result);
+        // Changed while it was written (a macro, an agent): the file holds
+        // the drawing as it was, so it still has unsaved changes.
+        if saved && changed_since {
+            self.engine.mark_unsaved();
         }
     }
 
@@ -10008,13 +11023,34 @@ impl App {
         if !matches!(self.dialog, crate::ui::dialogs::Dialog::None) {
             return;
         }
+        // Options > Global > Warnings may take the automatic font for each
+        // missing one without asking (#3725), as OK in the dialog would
+        // with its automatic choices; a family with no font to stand in
+        // for it is still asked about.
+        let mut accepted = false;
+        if self.ask_missing_fonts
+            && self.settings.warnings.accept_missing_fonts
+            && !self.missing_fonts.is_empty()
+        {
+            let mut st =
+                crate::ui::missing_fonts::MissingFontsState::new(name.clone(), 0, &self.missing_fonts);
+            if st.rows.iter().all(|r| r.automatic.is_some()) {
+                st.keep = self.settings.warnings.accept_missing_fonts_keep;
+                self.apply_font_choices(&st);
+                accepted = true;
+            }
+        }
         let w = &self.settings.warnings;
         // The windowed application asks which font draws each missing
         // one (#936), as long as Options > Global > Warnings asks for the
         // dialog itself (its own choice, not the plain note's: a "Do not
         // show again" ticked on the note before the dialog existed left
         // the dialog unseen, #1243); the note about unread objects follows.
-        if self.ask_missing_fonts && w.ask_missing_fonts && !self.missing_fonts.is_empty() {
+        if !accepted
+            && self.ask_missing_fonts
+            && w.ask_missing_fonts
+            && !self.missing_fonts.is_empty()
+        {
             self.dialog = crate::ui::dialogs::Dialog::MissingFonts(
                 crate::ui::missing_fonts::MissingFontsState::new(
                     name,
@@ -10031,7 +11067,7 @@ impl App {
         // when they were checked) opens the Warnings page when clicked,
         // so the dialog can be turned on again from where its absence is
         // noticed.
-        if self.ask_missing_fonts && !self.missing_fonts.is_empty() {
+        if !accepted && self.ask_missing_fonts && !self.missing_fonts.is_empty() {
             self.status_opens_options = Some((
                 self.status.clone(),
                 crate::ui::dialogs::OptionsPage::Warnings,
@@ -10040,7 +11076,7 @@ impl App {
         let notes = crate::ui::dialogs::OpenNotes {
             name,
             unread: if w.unread_objects { unread } else { 0 },
-            fonts: if w.missing_fonts {
+            fonts: if w.missing_fonts && !accepted {
                 self.missing_fonts.clone()
             } else {
                 Vec::new()
@@ -10164,7 +11200,22 @@ impl App {
         };
         let done = match rx.try_recv() {
             Ok(r) => r,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // A long print says how far it is: the sheets drawn,
+                // then the sheets the printer's queue took.
+                if let Some((stage, done, total)) = self.print_progress.get() {
+                    let key = if stage == crate::printers::PrintProgress::DRAWING {
+                        "status.print_drawing"
+                    } else {
+                        "status.print_sending"
+                    };
+                    self.status = crate::i18n::trf(
+                        key,
+                        &[("n", &done.to_string()), ("total", &total.to_string())],
+                    );
+                }
+                return true;
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err(crate::i18n::tr("dialog.print_failed"))
             }
@@ -10257,6 +11308,7 @@ impl App {
             dialog = dialog.add_filter(f.label(), &exts);
         }
         dialog
+            .set_title(crate::files::Dialog::command_title("menu.file.import"))
             .add_filter("HPGL plotter (*.plt, *.hpgl)", &["plt", "hpgl", "hgl"])
             .add_filter("Text (*.txt, *.rtf, *.docx)", &["txt", "rtf", "docx"])
             .add_filter(
@@ -10547,6 +11599,8 @@ impl App {
             tracedraw_cdr::open_bytes(&bytes, &title).map_err(|e| e.to_string())?;
         // Clones saved by TraceDraw follow their masters again (#2879).
         crate::object_clone::rebase_clone_links(&mut doc);
+        // Text that continues in other frames flows on into them (#4104).
+        crate::textflow::link_and_flow_marked_frames(&mut doc);
         Ok((doc, report))
     }
 
@@ -10899,6 +11953,18 @@ impl App {
     // ----- view --------------------------------------------------------------
 
     pub fn zoom_to_page(&mut self) {
+        self.note_view_step(crate::view_steps::ViewStep::FitPage);
+        self.fit_page_view();
+    }
+
+    fn fit_page_view(&mut self) {
+        // In the Multipage View the page in use fills the window, not
+        // every page shown (#3780); a new view still fits them all.
+        if self.multipage && self.canvas_rect.is_positive() {
+            let page = self.page_rect();
+            self.view.fit(page, self.canvas_rect);
+            return;
+        }
         self.fit_pending = true;
     }
 
@@ -11016,8 +12082,10 @@ impl App {
     }
 
     pub fn zoom_to_fit(&mut self) {
-        if self.multipage {
-            self.fit_pending = true;
+        self.note_view_step(crate::view_steps::ViewStep::FitAll);
+        // In the Multipage View, the objects of the page in use (#3780).
+        if self.multipage && self.drawn_bounds().is_none() {
+            self.fit_page_view();
             return;
         }
         let Some(b) = self.drawn_bounds() else {
@@ -11053,6 +12121,7 @@ impl App {
     }
 
     pub fn zoom_to_selection(&mut self) {
+        self.note_view_step(crate::view_steps::ViewStep::FitSelection);
         if let Some(b) = self.selection_bounds() {
             self.view.fit(
                 b.inflate(b.width() * 0.1 + 1.0, b.height() * 0.1 + 1.0),
@@ -11093,6 +12162,7 @@ impl App {
             self.page = p.id;
         }
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11123,6 +12193,7 @@ impl App {
         };
         self.page = new;
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11243,6 +12314,7 @@ impl App {
             self.page = p.id;
         }
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11274,6 +12346,7 @@ impl App {
             self.page = p;
         }
         self.selection.clear();
+        self.selected_layers.clear();
         self.fit_pending = true;
     }
 
@@ -11326,24 +12399,51 @@ impl App {
         {
             if let Some(id) = id {
                 self.multipage_activate(id);
+                // A page gone to that is not on screen comes into view
+                // at the same zoom (#4241): before, the view stayed and
+                // the page gone to could be out of sight.
+                if self.multipage && self.page == id && !self.page_on_screen() {
+                    self.centre_page_at_zoom();
+                }
             }
             return;
         }
         let Some(new) = id else {
             return;
         };
-        // The zoom stays: the page is shown as it was left, else at the
-        // same zoom, centred in the window; it was fitted to the window
-        // each time (#3434).
+        // The zoom stays: the page is shown where it was left, else
+        // centred in the window, always at the zoom in use; it was
+        // fitted to the window each time (#3434), and each page came
+        // back at the zoom it was left at, so the zoom kept changing
+        // from page to page (#4241).
+        let restricted = new != self.page && self.prepare_range_page_change(idx);
         if new != self.page {
             self.page_views.insert(self.page, self.view);
         }
         self.page = new;
         self.selection.clear();
-        match self.page_views.get(&new) {
-            Some(v) => self.view = *v,
+        self.selected_layers.clear();
+        if restricted {
+            self.sync_layer_ranges(None);
+        }
+        match self.page_views.get(&new).copied() {
+            Some(v) if v.zoom == self.view.zoom => self.view = v,
+            Some(v) => {
+                let c = self.canvas_rect.center();
+                let mid = v.to_page(c);
+                let z = self.view.zoom;
+                self.view.origin = egui::pos2(c.x - mid.x as f32 * z, c.y + mid.y as f32 * z);
+            }
             None => self.centre_page_at_zoom(),
         }
+    }
+
+    /// Whether the current page shows in the window at all.
+    pub(crate) fn page_on_screen(&self) -> bool {
+        let r = self.page_rect();
+        let a = self.view.to_screen(tracedraw_core::geometry::Point::new(r.x0, r.y0));
+        let b = self.view.to_screen(tracedraw_core::geometry::Point::new(r.x1, r.y1));
+        egui::Rect::from_two_pos(a, b).intersects(self.canvas_rect)
     }
 
     /// Show the current page in the middle of the window at the zoom it
@@ -11524,6 +12624,7 @@ pub fn fill_description(fill: &Fill) -> String {
             tracedraw_core::FountainKind::Conical => tr("fill.conical_fountain"),
             tracedraw_core::FountainKind::Square => tr("fill.square_fountain"),
             tracedraw_core::FountainKind::Shaped => tr("fill.shaped_fountain"),
+            tracedraw_core::FountainKind::Points => tr("fill.points_fountain"),
         },
         Fill::Pattern(tracedraw_core::Pattern::TwoColor { tile, .. }) => {
             trf(
@@ -11780,6 +12881,17 @@ pub fn three_point_box(tool: Tool, len: f64, height: f64) -> Rect {
         Rect::new(0.0, -height.abs(), len, height.abs())
     } else {
         Rect::new(0.0, height.min(0.0), len, height.max(0.0))
+    }
+}
+
+/// The height (see [`three_point_box`]) of the 3-Point Ellipse that is
+/// the circle with the base of length `len` as its diameter, on the side
+/// of `height` (#4086: Ctrl at the third point).
+pub fn circle_on_base_height(len: f64, height: f64) -> f64 {
+    if height < 0.0 {
+        -len / 2.0
+    } else {
+        len / 2.0
     }
 }
 
@@ -12722,6 +13834,41 @@ mod tests {
         assert!(third.show_dockers && third.inner_dockers.tabs.is_empty());
     }
 
+    /// Two texts in other fonts grouped, each chosen on its own inside
+    /// the group: the bar shows the font of the one chosen, not of the
+    /// one read before it (#3896).
+    #[test]
+    fn a_text_chosen_inside_a_group_shows_its_own_font() {
+        use tracedraw_core::Command;
+        let mut app = App::headless();
+        let mut ids = Vec::new();
+        for (n, family) in ["Selawik", "Quicksand"].into_iter().enumerate() {
+            ids.push(
+                app.new_shape(ShapeKind::Text {
+                    spans: vec![TextSpan::new("Hello", family, 24.0)],
+                    origin: Point::new(10.0, 20.0 + 30.0 * n as f64),
+                    frame: None,
+                    align: tracedraw_core::TextAlign::Left,
+                    para: Default::default(),
+                    on_path: None,
+                })
+                .expect("text"),
+            );
+        }
+        app.run(Command::Group {
+            shapes: ids.clone(),
+        });
+        for (id, family) in [
+            (ids[0], "Selawik"),
+            (ids[1], "Quicksand"),
+            (ids[0], "Selawik"),
+        ] {
+            app.select(vec![id]);
+            app.sync_text_defaults_from(id);
+            assert_eq!(app.text_settings_shown().0, family);
+        }
+    }
+
     /// Many selected objects (Select All) are gathered in one pass and
     /// kept for the frame: the same list while nothing changes, a new one
     /// when the drawing or the selection changes; objects inside groups
@@ -12836,6 +13983,78 @@ mod tests {
         assert_eq!(side.docker_tab, DockerTab::Undo);
         assert_eq!(side.docker_below(DockerPlace::Right), Some(DockerTab::Properties));
         assert_eq!(side.docker_below(DockerPlace::RightInner), None);
+    }
+
+    /// #3953: a locked docker stays in front of its column; a docker
+    /// opened after it goes under it, and with the one under it locked
+    /// too, to the side's second column. Clicking another tab of the
+    /// column stacks it the same way, and the lock is kept with the
+    /// workspace. Unlocked, a new docker takes the front as before.
+    #[test]
+    fn a_locked_docker_keeps_its_place_when_another_opens() {
+        let mut app = App::headless();
+        app.set_docker_setup(&crate::settings::DockerSetup {
+            open: vec!["docker.properties".into(), "docker.hints".into()],
+            front: "docker.properties".into(),
+            ..Default::default()
+        });
+        app.show_dockers = true;
+        app.open_docker(DockerTab::Objects);
+        assert_eq!(app.docker_tab, DockerTab::Objects, "unlocked: replaced");
+        app.open_docker(DockerTab::Properties);
+        app.set_docker_locked(DockerTab::Properties, true);
+        app.open_docker(DockerTab::Undo);
+        assert_eq!(app.docker_tab, DockerTab::Properties, "locked stays");
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Undo));
+        assert!(app.docker_shown(DockerTab::Undo));
+        // Another one replaces the unlocked lower docker.
+        app.open_docker(DockerTab::Objects);
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Objects));
+        // A tab of the column clicked: it goes under too.
+        crate::ui::dockers::click_tab(&mut app, DockerPlace::Right, DockerTab::Hints);
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Hints));
+        // Brought to the front the old way, through docker_tab.
+        app.docker_tab = DockerTab::Objects;
+        app.reconcile_dockers();
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Objects));
+        // Both locked: the next one opens in a new column beside.
+        app.set_docker_locked(DockerTab::Objects, true);
+        app.open_docker(DockerTab::Color);
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Objects));
+        assert_eq!(app.docker_place(DockerTab::Color), Some(DockerPlace::RightInner));
+        assert!(app.docker_shown(DockerTab::Color));
+        // Kept with the workspace.
+        let setup = app.docker_setup();
+        assert_eq!(setup.locked, ["docker.properties", "docker.objects"]);
+        let mut other = App::headless();
+        other.set_docker_setup(&setup);
+        assert!(other.docker_locked(DockerTab::Properties) && other.docker_locked(DockerTab::Objects));
+        assert!(!other.docker_locked(DockerTab::Color));
+    }
+
+    /// #4254: a docker ticked in a column's three-dot list goes under a
+    /// locked docker there, never in its place.
+    #[test]
+    fn a_locked_docker_stays_when_one_opens_from_the_list() {
+        let mut app = App::headless();
+        app.set_docker_setup(&crate::settings::DockerSetup {
+            open: vec!["docker.properties".into()],
+            front: "docker.properties".into(),
+            ..Default::default()
+        });
+        app.show_dockers = true;
+        app.set_docker_locked(DockerTab::Properties, true);
+        crate::ui::dockers::open_from_list(&mut app, DockerTab::Undo, DockerPlace::Right);
+        assert_eq!(app.docker_tab, DockerTab::Properties);
+        assert_eq!(app.docker_below(DockerPlace::Right), Some(DockerTab::Undo));
+        // Unlocked: it takes the front as before.
+        app.set_docker_locked(DockerTab::Properties, false);
+        crate::ui::dockers::open_from_list(&mut app, DockerTab::Objects, DockerPlace::Right);
+        assert_eq!(app.docker_tab, DockerTab::Objects);
     }
 
     #[test]
@@ -13119,6 +14338,8 @@ mod tests {
         use crate::ui::bars::{move_bar, Bar, Dock};
         assert_eq!(app.settings.bars.dock(Bar::Palette), Dock::Bottom);
         move_bar(&mut app, Bar::Palette, Dock::Right, None);
+        // The Multipage View stays on for the drawings opened next (#3724).
+        app.set_multipage(true);
         app.sync_settings();
         let json = serde_json::to_string(&app.settings).expect("json");
         let saved: crate::settings::Settings = serde_json::from_str(&json).expect("read back");
@@ -13131,6 +14352,7 @@ mod tests {
         assert!(next.eraser_square);
         assert!(next.show_grid && !next.show_page_border);
         assert_eq!(next.view_mode, ViewMode::Wireframe);
+        assert!(next.multipage);
         assert!(next.snap.dynamic_guides && next.snap.off);
         assert_eq!(next.settings.snap.dynamic.angles, vec![30.0, 60.0]);
         assert!(next.settings.snap.align.each_object);
@@ -13590,6 +14812,32 @@ mod tests {
         assert_eq!(mask(&app), None);
         app.undo();
         assert!(mask(&app).is_some_and(|m| m.invert));
+    }
+
+    #[test]
+    fn groups_take_a_look_in_one_step_each() {
+        let mut app = App::headless();
+        let r = Shape::new(
+            ShapeId(0),
+            ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        let g = app
+            .new_shape(ShapeKind::Group { children: vec![r] })
+            .expect("group");
+        app.select(vec![g]);
+        let look = |app: &App| app.doc().find_shape(g).and_then(|s| s.group_look);
+        app.set_group_looks(Some(true), None);
+        assert!(look(&app).is_some_and(|l| l.as_one && !l.knockout));
+        app.set_group_looks(None, Some(true));
+        assert!(look(&app).is_some_and(|l| l.as_one && l.knockout));
+        app.set_group_looks(Some(false), Some(false));
+        assert_eq!(look(&app), None);
+        app.undo();
+        assert!(look(&app).is_some_and(|l| l.knockout));
     }
 
     /// The files left in an auto-backup folder.

@@ -1,6 +1,7 @@
 //! Welcome Screen: Get Started (new, open, recent documents), Workspace,
 //! What's New, Learn, Templates.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::{App, WelcomeTab};
 use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
@@ -27,6 +28,48 @@ pub(crate) const HISTORY_LEN: usize = 10;
 /// version being built.
 pub(crate) const RELEASES: &[Release] = &[
     Release {
+        version: "0.52.0",
+        date: "2026-11-24",
+        title: "welcome.news.v0_52_0_title",
+        body: "welcome.news.v0_52_0_body",
+    },
+    Release {
+        version: "0.51.1",
+        date: "2026-11-23",
+        title: "welcome.news.v0_51_1_title",
+        body: "welcome.news.v0_51_1_body",
+    },
+    Release {
+        version: "0.51.0",
+        date: "2026-11-23",
+        title: "welcome.news.v0_51_0_title",
+        body: "welcome.news.v0_51_0_body",
+    },
+    Release {
+        version: "0.50.3",
+        date: "2026-11-22",
+        title: "welcome.news.v0_50_3_title",
+        body: "welcome.news.v0_50_3_body",
+    },
+    Release {
+        version: "0.50.2",
+        date: "2026-11-21",
+        title: "welcome.news.v0_50_2_title",
+        body: "welcome.news.v0_50_2_body",
+    },
+    Release {
+        version: "0.50.1",
+        date: "2026-11-21",
+        title: "welcome.news.v0_50_1_title",
+        body: "welcome.news.v0_50_1_body",
+    },
+    Release {
+        version: "0.50.0",
+        date: "2026-11-21",
+        title: "welcome.news.v0_50_0_title",
+        body: "welcome.news.v0_50_0_body",
+    },
+    Release {
         version: "0.49.0",
         date: "2026-11-19",
         title: "welcome.news.v0_49_0_title",
@@ -43,48 +86,6 @@ pub(crate) const RELEASES: &[Release] = &[
         date: "2026-11-16",
         title: "welcome.news.v0_47_0_title",
         body: "welcome.news.v0_47_0_body",
-    },
-    Release {
-        version: "0.46.0",
-        date: "2026-11-14",
-        title: "welcome.news.v0_46_0_title",
-        body: "welcome.news.v0_46_0_body",
-    },
-    Release {
-        version: "0.45.2",
-        date: "2026-11-13",
-        title: "welcome.news.v0_45_2_title",
-        body: "welcome.news.v0_45_2_body",
-    },
-    Release {
-        version: "0.45.1",
-        date: "2026-11-13",
-        title: "welcome.news.v0_45_1_title",
-        body: "welcome.news.v0_45_1_body",
-    },
-    Release {
-        version: "0.45.0",
-        date: "2026-11-12",
-        title: "welcome.news.v0_45_0_title",
-        body: "welcome.news.v0_45_0_body",
-    },
-    Release {
-        version: "0.44.2",
-        date: "2026-11-12",
-        title: "welcome.news.v0_44_2_title",
-        body: "welcome.news.v0_44_2_body",
-    },
-    Release {
-        version: "0.44.1",
-        date: "2026-11-12",
-        title: "welcome.news.v0_44_1_title",
-        body: "welcome.news.v0_44_1_body",
-    },
-    Release {
-        version: "0.44.0",
-        date: "2026-11-10",
-        title: "welcome.news.v0_44_title",
-        body: "welcome.news.v0_44_body",
     },
 ];
 
@@ -505,10 +506,11 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     // A document the Android picker returned has a URI, not a folder.
+    // Without the `\\?\` prefix of a canonical Windows path (#3812).
     let folder = path
         .parent()
         .filter(|_| !crate::files::is_document_path(path))
-        .map(|d| d.display().to_string())
+        .map(|d| crate::files::plain_path(d).display().to_string())
         .unwrap_or_default();
     let text_x = frame.right() + 10.0;
     let color = if exists {
@@ -606,7 +608,7 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
     }
     resp.context_menu(|ui| {
         if ui
-            .button(tr("welcome.remove_recent"))
+            .ibutton("welcome.remove_recent")
             .rich_tip(crate::ui::tips::keyed("welcome.remove_recent"))
             .clicked()
         {
@@ -614,7 +616,7 @@ fn recent_row(app: &mut App, ui: &mut Ui, path: &std::path::Path, look: &RowLook
             ui.close();
         }
     });
-    let resp = resp.rich_tip(path.display().to_string());
+    let resp = resp.rich_tip(crate::files::plain_path(path).display().to_string());
     if action == RecentAction::None && exists && resp.clicked() {
         action = RecentAction::Open;
     }
@@ -760,12 +762,12 @@ fn templates(app: &mut App, ui: &mut Ui) {
                 }
             }
             ui.add_space(6.0);
-            if ui.button(tr("tpl.more")).clicked() {
+            if ui.ibutton("tpl.more").clicked() {
                 app.open_template_dialog();
             }
             ui.add_space(12.0);
             ui.strong(tr("welcome.my_templates"));
-            if ui.button(tr("welcome.open_template")).clicked() {
+            if ui.ibutton("welcome.open_template").clicked() {
                 crate::files::Dialog::new()
                     .add_filter("TraceDraw template", &["tdt", "tdraw"])
                     .pick_file(app, |app, p| app.open_as_template(p));

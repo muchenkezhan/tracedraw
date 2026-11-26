@@ -159,18 +159,52 @@ a click lower on the tab brings the panel to the front
   the upper panel alone in the column. Bringing the lower panel to the front, closing
   it or moving it away ends the stack (`App::settle_stacks`); opening
   it from a menu keeps both. A second column that empties into the edge
-  column takes its stack with it. On a phone the column shows the front
+  column takes its stack with it. Lock Docker in a panel's tab or
+  title menu (off by default) keeps it in front of its column: a panel
+  opened there afterwards (from a menu, a tab click or a command) is
+  shown under it instead of taking its place, and when the panel under
+  it is locked as well the new one opens in the side's second column
+  (floating when that column's two are locked too). A locked panel's
+  Close is pale and its tab's close button does nothing until it is
+  unlocked; the lock is kept with the workspace (`DockerSetup::locked`,
+  `App::open_beside_locked`, #3953). On a phone the column shows the front
   panel only.
 - A floating panel is a window with a grey border and a shadow: the
   panel's title bar (its name and close; no collapse) over its page,
   resizable at its edges; where it is and how large are kept.
+- Own Window in a panel's tab and title menus (after the places, ticked
+  while it is on) gives the panel a window of the system of its own, to
+  put it on another monitor (#2884, `App::set_docker_own_window`,
+  `dockers::own_window`): a panel in a column floats first. The window is
+  titled "TraceDraw - " and the panel's name and holds the panel's title
+  bar (its menu, close) over its page; it opens where the panel floated
+  (or where its window was last), its place on the desktop and its size
+  are kept with the floating panels (`FloatingSetup::own_window`,
+  `desktop`; preferences without them read as before). Dragging the
+  panel's title there does not start a dock drag; the system's title bar
+  moves the window. Closing the window closes the panel, and opening the
+  panel again (Window menu) brings it back in that window where it was
+  (`App::closed_own_windows`, #3950); unticking Own Window brings it back
+  to float in the main window, choosing a column in its menu docks it,
+  and Dock Back (in the menu while the panel has a window of its own)
+  docks it in the column it was last docked in, the right one when it
+  never was (`App::dock_back`, `App::docked_before`). Where the system cannot open more windows
+  (the web, Android) the item is grey and such a panel floats in the main
+  window
+  (`dockers::tests::a_panel_goes_to_a_window_of_its_own_and_back`,
+  `dockers::tests::a_panel_in_its_own_window_docks_back_and_reopens_there`).
 - A panel brought to the front from a menu, a shortcut or a tool while it
   lies in the other column or floats is put in front where it is, and
   the default column stays as it was; a panel open nowhere joins the
   default column (`App::open_docker`, `App::reconcile_dockers`). Window >
-  Panels and the Help > Hints check show a panel as on when it is in
-  front of an open column or floating (`App::docker_shown`); the plus
-  button of a column opens a ticked panel in front of that column.
+  Dockers (and Object > Properties, Object > Objects and the Effects
+  menu's panels) checks every panel open in an open column, its tab in
+  front or behind another, or floating; choosing a checked one behind
+  another brings it to the front (`menus::effect_docker_open`, #3663:
+  only the panel in front was checked, so the open ones behind looked
+  closed). The Help > Hints check shows Hints as on when it is in front
+  of an open column or floating (`App::docker_shown`); the plus button
+  of a column opens a ticked panel in front of that column.
 - The places are kept in the preferences (`dockers`: `open`, `front`,
   `left`, `left_front`, `left_shown`, `inner`, `inner_front`,
   `inner_shown`, `left_inner`, `left_inner_front`, `left_inner_shown`

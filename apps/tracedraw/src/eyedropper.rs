@@ -48,6 +48,20 @@ fn painted_average(img: &image::RgbaImage, fx: f64, fy: f64, n: u32) -> Option<C
     Some(Color::rgb8(ch(r)?, ch(g)?, ch(b)?))
 }
 
+/// Whether object `s` shows other colours than its fill's one colour:
+/// a gradient or other fill of several colours, a transparency, a merge
+/// mode or a live effect (a lens reads its own colour). Those are read
+/// as shown (#4051); a plain solid fill keeps its own colour, in its own
+/// model (a CMYK colour stays CMYK).
+fn shows_other_than_its_fill(s: &tracedraw_core::Shape) -> bool {
+    let several = !matches!(s.fill, Fill::Solid(_) | Fill::None);
+    let effects = s
+        .effects
+        .iter()
+        .any(|e| !matches!(e, tracedraw_core::live::Effect::Lens(_)));
+    (several && !matches!(s.kind, ShapeKind::Bitmap { .. })) || s.opacity < 1.0 || effects
+}
+
 /// The CMYK inks of the pixels around (`fx`, `fy`) of a `w` x `h` picture
 /// in `planes` (its cyan, magenta, yellow and black channels one under
 /// the other, 255 full ink), averaged over a box of `n` x `n` pixels.
@@ -361,6 +375,32 @@ impl App {
         })
     }
 
+    /// The colour the drawing shows at `p`, all objects and their effects
+    /// drawn over the paper, averaged over the eyedropper's sample size
+    /// in pixels of the window (#4051).
+    pub fn shown_color_at(&self, p: Point) -> Option<Color> {
+        let px_per_mm = f64::from(self.view.zoom);
+        let px_per_mm = if px_per_mm.is_finite() && px_per_mm > 0.0 {
+            px_per_mm
+        } else {
+            96.0 / 25.4
+        };
+        let n = f64::from(self.eyedropper_sample.max(1));
+        let half = n / px_per_mm / 2.0;
+        let area = tracedraw_core::geometry::Rect::new(p.x - half, p.y - half, p.x + half, p.y + half);
+        let pm = tracedraw_render::render_area_image(self.doc(), self.page, area, px_per_mm * 25.4)?;
+        let (mut r, mut g, mut b, mut cnt) = (0u64, 0u64, 0u64, 0u64);
+        for px in pm.pixels() {
+            let c = px.demultiply();
+            r += u64::from(c.red());
+            g += u64::from(c.green());
+            b += u64::from(c.blue());
+            cnt += 1;
+        }
+        let ch = |v: u64| v.checked_div(cnt).map(|v| v.min(255) as u8);
+        Some(Color::rgb8(ch(r)?, ch(g)?, ch(b)?))
+    }
+
     /// [`App::sample_color_at`] with the pictures decoded by `decode`
     /// (the hover readout keeps the last one decoded).
     fn sample_color_with(
@@ -369,11 +409,82 @@ impl App {
         outline: bool,
         decode: &mut dyn FnMut(&tracedraw_core::SharedBytes) -> Option<Picture>,
     ) -> Option<Color> {
-        let s = self.leaf_to_read(p)?;
+        self.sample_color_from(None, p, outline, decode)
+    }
+
+    /// The colour at `p` of the topmost picture there, whatever objects
+    /// lie over it (#4083: Alt+click with the Colour Eyedropper, to read
+    /// the photo being traced from under the shapes drawn on it). `None`
+    /// with no picture at `p`.
+    pub fn sample_picture_beneath(&self, p: Point) -> Option<Color> {
+        fn walk(s: &tracedraw_core::Shape, parent: Affine, p: Point) -> Option<tracedraw_core::Shape> {
+            if !s.visible {
+                return None;
+            }
+            let t = parent * s.transform;
+            match &s.kind {
+                ShapeKind::Bitmap { rect, .. } => {
+                    rect.contains(t.inverse() * p).then(|| {
+                        let mut c = s.clone();
+                        c.transform = t;
+                        c
+                    })
+                }
+                ShapeKind::Group { children } => children.iter().rev().find_map(|c| walk(c, t, p)),
+                ShapeKind::ClipFrame { contents, .. } => {
+                    contents.iter().rev().find_map(|c| walk(c, t, p))
+                }
+                _ => None,
+            }
+        }
+        let leaf = self
+            .page_layers()
+            .into_iter()
+            .rev()
+            .filter(|l| l.visible)
+            .flat_map(|l| l.shapes.iter().rev())
+            .find_map(|s| walk(s, Affine::IDENTITY, p))?;
+        self.sample_color_from(Some(leaf), p, false, &mut |png| {
+            image::load_from_memory(png)
+                .ok()
+                .map(|i| std::sync::Arc::new(i.to_rgba8()))
+        })
+    }
+
+    /// [`App::sample_color_with`] reading `leaf` (page space) when given,
+    /// its own pixels, not what is drawn over it.
+    fn sample_color_from(
+        &self,
+        leaf: Option<tracedraw_core::Shape>,
+        p: Point,
+        outline: bool,
+        decode: &mut dyn FnMut(&tracedraw_core::SharedBytes) -> Option<Picture>,
+    ) -> Option<Color> {
+        let beneath = leaf.is_some();
+        let s = if let Some(s) = leaf {
+            s
+        } else if outline {
+            self.leaf_to_read(p)?
+        } else {
+            match self.leaf_to_read_color(p) {
+                Some(s) => s,
+                // No object here: a drop shadow, a glow, a blend's step
+                // or the paper may still show; its colour is read as
+                // shown (#4051).
+                None => return self.shown_color_at(p).filter(|c| *c != Color::WHITE),
+            }
+        };
         let s = &s;
         if outline {
             if let Some(st) = &s.stroke {
                 return Some(st.color);
+            }
+        } else if !beneath && shows_other_than_its_fill(s) {
+            // A gradient, a transparency, a merge mode or an effect: the
+            // colour is read as the drawing shows it there, with what
+            // shows through, not as the object's first colour (#4051).
+            if let Some(c) = self.shown_color_at(p) {
+                return Some(c);
             }
         }
         if let ShapeKind::Bitmap {
@@ -481,6 +592,17 @@ impl App {
             _ => None,
         }) {
             return Some(c);
+        }
+        // On the outline of a filled object: the outline's colour, as
+        // it shows there (#3784: the fill's colour was read).
+        if let Some(st) = s.stroke.as_ref().filter(|_| !matches!(s.fill, Fill::None)) {
+            let reach = crate::interaction::outline_reach(s, s.transform);
+            let tol = self.object_pick_tol();
+            if reach > 0.0
+                && crate::canvas::distance_to_path(&s.page_path(), p) <= reach.max(tol * 0.5)
+            {
+                return Some(st.color);
+            }
         }
         match &s.fill {
             Fill::Solid(c) => Some(*c),
@@ -710,21 +832,40 @@ impl App {
                     self.eyedropper_apply = false;
                 }
             } else if let Some(c) = self.sample_color_at(p, shift) {
-                self.took_sampled_color(c, shift);
+                // Read from an object of the selection (the picture just
+                // placed, still selected): the colour is kept for Apply,
+                // not put back onto that selection. On a picture it went
+                // in as the picture's fill, the picture itself changed
+                // and nothing was left to apply elsewhere (#4166).
+                let from_selection = self
+                    .hit_test_to_read(p)
+                    .is_some_and(|id| self.selection.contains(&id));
+                if from_selection {
+                    self.keep_sampled_color(c);
+                } else {
+                    self.took_sampled_color(c, shift);
+                }
             }
         }
+    }
+
+    /// The Color Eyedropper's sampled colour kept for Apply and shown in
+    /// the Color docker, without going onto the selection.
+    fn keep_sampled_color(&mut self, c: Color) {
+        self.eyedropper_color = Some(c);
+        self.eyedropper_apply = true;
+        crate::ui::color_docker::take_sampled_color(self, c);
+        self.status = crate::i18n::trf(
+            "status.sampled_color",
+            &[("c", &crate::app::color_description(c))],
+        );
     }
 
     /// A colour the Color Eyedropper sampled, from an object or from the
     /// window's pixels (#3040): it is kept, the tool goes on to Apply, and
     /// with objects selected it goes straight onto them.
     pub fn took_sampled_color(&mut self, c: Color, shift: bool) {
-        self.eyedropper_color = Some(c);
-        self.eyedropper_apply = true;
-        self.status = crate::i18n::trf(
-            "status.sampled_color",
-            &[("c", &crate::app::color_description(c))],
-        );
+        self.keep_sampled_color(c);
         // With objects selected the colour goes straight onto them, as a
         // palette swatch would: the fill, or the outline with Shift, in
         // one undo step (#2551).
@@ -733,6 +874,11 @@ impl App {
                 self.apply_outline_color(Some(c));
             } else {
                 self.apply_fill(Fill::Solid(c));
+            }
+            // Done with the eyedropper where its bar asks for it: the Pick
+            // tool comes back, the objects still selected (#3995).
+            if self.settings.eyedropper_pick_after_apply && !self.eyedropper_screen {
+                self.set_tool(crate::tools::Tool::Pick);
             }
         }
     }
@@ -766,7 +912,7 @@ impl App {
     /// A click of the Color Mask's eyedropper (#2479): the colour under
     /// `p` (a picture's pixel) goes into the chosen slot, which is turned
     /// on, and the tool used before comes back, the picture still
-    /// selected for Apply, as CorelDRAW's Bitmap Color Mask does. Each
+    /// selected for Apply. Each
     /// pick samples: the second one applied the first colour to the
     /// picture as a fill instead, the Colour Eyedropper being in its
     /// Apply mode, so only one colour of an imported picture could be
@@ -807,6 +953,70 @@ mod tests {
         .expect("shape")
     }
 
+    /// #4051: a gradient is read where it is sampled, a half transparent
+    /// object with what shows through it; a plain fill keeps its colour.
+    #[test]
+    fn gradients_and_transparency_are_read_as_shown() {
+        use tracedraw_core::style::{Fountain, FountainKind};
+        let mut app = App::headless();
+        let ramp = rect(&mut app, Rect::new(0.0, 0.0, 100.0, 20.0));
+        app.run(Command::SetFill {
+            shapes: vec![ramp],
+            fill: Fill::Fountain(Fountain::two(
+                FountainKind::Linear,
+                Color::rgb8(0, 0, 0),
+                Color::rgb8(255, 255, 255),
+                0.0,
+            )),
+        });
+        app.select(Vec::new());
+        let grey = |c: Color| c.to_rgb8()[0];
+        let left = app.sample_color_at(Point::new(10.0, 10.0), false).expect("left");
+        let right = app.sample_color_at(Point::new(90.0, 10.0), false).expect("right");
+        assert!(grey(left) < 60 && grey(right) > 195, "{left:?} {right:?}");
+        // Blue at half opacity over red reads as their mix.
+        let red = rect(&mut app, Rect::new(0.0, 30.0, 40.0, 60.0));
+        app.run(Command::SetFill {
+            shapes: vec![red],
+            fill: Fill::Solid(Color::rgb8(255, 0, 0)),
+        });
+        let blue = rect(&mut app, Rect::new(20.0, 30.0, 60.0, 60.0));
+        app.run(Command::SetFill {
+            shapes: vec![blue],
+            fill: Fill::Solid(Color::rgb8(0, 0, 255)),
+        });
+        app.run(Command::SetOpacity {
+            shapes: vec![blue],
+            opacity: 0.5,
+        });
+        app.select(Vec::new());
+        let [r, g, b] = app
+            .sample_color_at(Point::new(30.0, 45.0), false)
+            .expect("mix")
+            .to_rgb8();
+        assert!(r > 90 && r < 170 && b > 90 && b < 170 && g < 40, "{r} {g} {b}");
+        // Over the paper, half blue reads light blue.
+        let [r, _, b] = app
+            .sample_color_at(Point::new(50.0, 45.0), false)
+            .expect("light")
+            .to_rgb8();
+        assert!(r > 90 && b > 240, "{r} {b}");
+        // A plain fill keeps its own colour, in its own model.
+        let cmyk = rect(&mut app, Rect::new(70.0, 30.0, 90.0, 60.0));
+        let c = Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+        };
+        app.run(Command::SetFill {
+            shapes: vec![cmyk],
+            fill: Fill::Solid(c),
+        });
+        app.select(Vec::new());
+        assert_eq!(app.sample_color_at(Point::new(80.0, 45.0), false), Some(c));
+    }
+
     /// An object with a Hue/Saturation/Lightness effect gives the colour
     /// it shows (#2380): a red turned green by the hue reads green, and
     /// paints the next object green; it read the red of its fill.
@@ -835,6 +1045,23 @@ mod tests {
         app.eyedropper_click(Point::new(45.0, 5.0), false, false, false);
         let sb = app.doc().find_shape(b).expect("b");
         assert_eq!(sb.fill, Fill::Solid(Color::rgb8(r, g, b8)));
+    }
+
+    /// A colour the Color Eyedropper samples shows in the Colour panel
+    /// as its new colour too, ready to apply or tweak; the panel kept
+    /// the colour it had before.
+    #[test]
+    fn a_sampled_colour_becomes_the_colour_panels_new_colour() {
+        let mut app = App::headless();
+        let a = rect(&mut app, Rect::new(0.0, 0.0, 20.0, 20.0));
+        app.run(Command::SetFill {
+            shapes: vec![a],
+            fill: Fill::Solid(Color::rgb8(30, 120, 210)),
+        });
+        app.select(Vec::new());
+        app.color_model = 0;
+        app.eyedropper_click(Point::new(10.0, 10.0), false, false, false);
+        assert_eq!(app.mixer_color.to_rgb8(), [30, 120, 210]);
     }
 
     /// #3499: with Treat All Objects as Filled, a click inside an
@@ -868,6 +1095,65 @@ mod tests {
             Some(green)
         );
         assert_eq!(app.sample_color_at(inside, true), Some(green));
+    }
+
+    /// #3856: with Treat All Objects as Filled, an unfilled rectangle
+    /// lying over a filled one kept the eyedropper from reading the
+    /// colour through it; inside, the object beneath is read.
+    #[test]
+    fn an_unfilled_object_lets_the_colour_beneath_be_read() {
+        let mut app = App::headless();
+        app.settings.treat_all_filled = true;
+        let below = rect(&mut app, Rect::new(10.0, 10.0, 30.0, 30.0));
+        app.run(Command::SetFill {
+            shapes: vec![below],
+            fill: Fill::Solid(Color::rgb8(200, 30, 40)),
+        });
+        let above = rect(&mut app, Rect::new(0.0, 0.0, 40.0, 40.0));
+        app.run(Command::SetFill {
+            shapes: vec![above],
+            fill: Fill::None,
+        });
+        assert_eq!(app.hit_test(Point::new(20.0, 20.0)), Some(above));
+        assert_eq!(
+            app.sample_color_at(Point::new(20.0, 20.0), false),
+            Some(Color::rgb8(200, 30, 40))
+        );
+    }
+
+    /// #3784: pointing at the outline of a filled object reads the
+    /// outline's colour; it read the fill's. Inside, the fill is read.
+    #[test]
+    fn a_filled_object_gives_its_outline_colour_on_the_outline() {
+        let mut app = App::headless();
+        let a = rect(&mut app, Rect::new(0.0, 0.0, 40.0, 40.0));
+        let red = Color::rgb8(220, 0, 0);
+        let blue = Color::rgb8(0, 0, 200);
+        app.run(Command::SetFill {
+            shapes: vec![a],
+            fill: Fill::Solid(red),
+        });
+        app.run(Command::SetStroke {
+            shapes: vec![a],
+            stroke: Some(tracedraw_core::Stroke {
+                color: blue,
+                width: 4.0,
+                ..Default::default()
+            }),
+        });
+        assert_eq!(
+            app.sample_color_at(Point::new(20.0, 20.0), false),
+            Some(red)
+        );
+        assert_eq!(
+            app.sample_color_at(Point::new(0.0, 20.0), false),
+            Some(blue)
+        );
+        // Inside the outline's band, just within the edge.
+        assert_eq!(
+            app.sample_color_at(Point::new(1.5, 20.0), false),
+            Some(blue)
+        );
     }
 
     #[test]
@@ -1277,6 +1563,73 @@ mod tests {
         assert!(!app.can_clear_transparency());
     }
 
+    /// A picture covered by a filled shape gives its pixels to the Alt
+    /// reading, the shape's own colour to the usual one (#4083: tracing a
+    /// photo by hand, the photo's colour could not be read from under the
+    /// shapes drawn over it). With no picture there, nothing.
+    #[test]
+    fn a_picture_under_a_shape_gives_its_colour_to_the_alt_reading() {
+        let mut app = App::headless();
+        let img = image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 160, 0, 255]));
+        let id = app.place_image_at(img, None, None).expect("picture");
+        let b = app.doc().find_shape(id).unwrap().bounds();
+        let over = rect(&mut app, b.inflate(1.0, 1.0));
+        app.run(Command::SetFill {
+            shapes: vec![over],
+            fill: Fill::Solid(Color::rgb8(250, 0, 0)),
+        });
+        app.select(Vec::new());
+        let p = b.center();
+        assert_eq!(app.sample_color_at(p, false), Some(Color::rgb8(250, 0, 0)));
+        assert_eq!(app.sample_picture_beneath(p), Some(Color::rgb8(0, 160, 0)));
+        let off = Point::new(b.x1 + 50.0, b.y1 + 50.0);
+        assert_eq!(app.sample_picture_beneath(off), None);
+    }
+
+    /// Tracing a photo: a plain click reads what the drawing shows there.
+    /// Inside an outline drawn over the photo (no fill) it is the photo's
+    /// colour; through a half transparent shape, the mix seen; on an
+    /// opaque shape, the shape's own colour, and Alt reads the photo
+    /// under it (#4083).
+    #[test]
+    fn a_plain_click_reads_what_shows_over_a_traced_photo() {
+        let mut app = App::headless();
+        let green = Color::rgb8(0, 160, 0);
+        let img = image::RgbaImage::from_pixel(40, 40, image::Rgba([0, 160, 0, 255]));
+        let id = app.place_image_at(img, None, None).expect("picture");
+        let b = app.doc().find_shape(id).unwrap().bounds();
+        let p = b.center();
+        // An outline only, over the photo.
+        let outline = rect(&mut app, b.inflate(-b.width() / 4.0, -b.height() / 4.0));
+        app.run(Command::SetFill {
+            shapes: vec![outline],
+            fill: Fill::None,
+        });
+        app.select(Vec::new());
+        assert_eq!(app.sample_color_at(p, false), Some(green));
+        // Filled red, half transparent: the mix shows.
+        app.run(Command::SetFill {
+            shapes: vec![outline],
+            fill: Fill::Solid(Color::rgb8(255, 0, 0)),
+        });
+        app.run(Command::SetOpacity {
+            shapes: vec![outline],
+            opacity: 0.5,
+        });
+        app.select(Vec::new());
+        let mixed = app.sample_color_at(p, false).expect("a colour");
+        assert_ne!(mixed, green);
+        assert_ne!(mixed, Color::rgb8(255, 0, 0));
+        // Opaque: the shape's colour; Alt reads the photo.
+        app.run(Command::SetOpacity {
+            shapes: vec![outline],
+            opacity: 1.0,
+        });
+        app.select(Vec::new());
+        assert_eq!(app.sample_color_at(p, false), Some(Color::rgb8(255, 0, 0)));
+        assert_eq!(app.sample_picture_beneath(p), Some(green));
+    }
+
     /// Pictures give their pixels: placed alone, in a group, inside a clip
     /// frame, and kept as JPEG bytes (#403: pictures gave no colour).
     #[test]
@@ -1562,6 +1915,33 @@ mod tests {
         );
     }
 
+    /// #4166: a colour read from the picture that is selected (just
+    /// placed) is kept for Apply; the picture is left as it is.
+    #[test]
+    fn a_colour_read_from_the_selected_picture_is_kept_for_apply() {
+        let mut app = App::headless();
+        app.settings.autocorrect.enabled = false;
+        let img = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 0, 0, 255]));
+        let pic = app.place_image_at(img, None, None).expect("picture");
+        let b = app.doc().find_shape(pic).unwrap().bounds();
+        let target = rect(&mut app, Rect::new(b.x1 + 10.0, b.y0, b.x1 + 20.0, b.y1));
+        app.select(vec![pic]);
+        let before = app.doc().find_shape(pic).unwrap().clone();
+        app.eyedropper_click(b.center(), false, false, false);
+        let red = Color::rgb8(255, 0, 0);
+        assert_eq!(app.eyedropper_color, Some(red));
+        assert!(app.eyedropper_apply);
+        let after = app.doc().find_shape(pic).unwrap();
+        assert_eq!(after.fill, before.fill, "the picture keeps its fill");
+        // Applied to the other object.
+        let c = app.doc().find_shape(target).unwrap().bounds().center();
+        app.eyedropper_click(c, false, false, false);
+        assert_eq!(
+            app.doc().find_shape(target).unwrap().fill,
+            Fill::Solid(red)
+        );
+    }
+
     /// With objects selected, the colour sampled goes straight onto them
     /// (#2551): the fill, or the outline with Shift, in one undo step.
     #[test]
@@ -1612,5 +1992,34 @@ mod tests {
         let sb = app.doc().find_shape(b).expect("b");
         assert_eq!(sb.stroke.as_ref().map(|s| s.color), Some(green));
         assert_eq!(sb.fill, Fill::Solid(Color::rgb8(0, 0, 200)));
+    }
+
+    /// #3995: with "Pick tool after applying to the selection" on, the
+    /// Color Eyedropper hands over to the Pick tool once the sampled colour
+    /// went onto the selection, which stays selected; off, it stays.
+    #[test]
+    fn the_pick_tool_comes_back_after_colouring_the_selection() {
+        let mut app = App::headless();
+        let a = rect(&mut app, Rect::new(0.0, 0.0, 10.0, 10.0));
+        let b = rect(&mut app, Rect::new(20.0, 0.0, 30.0, 10.0));
+        let red = Color::rgb8(200, 10, 10);
+        app.run(Command::SetFill {
+            shapes: vec![a],
+            fill: Fill::Solid(red),
+        });
+        app.set_tool(crate::tools::Tool::ColorEyedropper);
+        app.select(vec![b]);
+        app.eyedropper_click(Point::new(5.0, 5.0), false, false, false);
+        assert_eq!(app.tool, crate::tools::Tool::ColorEyedropper);
+        app.settings.eyedropper_pick_after_apply = true;
+        app.eyedropper_reset();
+        app.run(Command::SetFill {
+            shapes: vec![b],
+            fill: Fill::Solid(Color::rgb8(0, 0, 200)),
+        });
+        app.eyedropper_click(Point::new(5.0, 5.0), false, false, false);
+        assert_eq!(app.doc().find_shape(b).expect("b").fill, Fill::Solid(red));
+        assert_eq!(app.tool, crate::tools::Tool::Pick);
+        assert_eq!(app.selection, vec![b]);
     }
 }

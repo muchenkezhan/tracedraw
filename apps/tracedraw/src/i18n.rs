@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 
 /// Languages shipped with the app, in display order.
-pub const LANGUAGES: [(&str, &str); 19] = [
+pub const LANGUAGES: [(&str, &str); 21] = [
     ("en", "English"),
     ("zh-CN", "中文（简体）"),
     ("hi", "हिन्दी"),
@@ -31,12 +31,14 @@ pub const LANGUAGES: [(&str, &str); 19] = [
     ("tr", "Türkçe"),
     ("cs", "Čeština"),
     ("lo", "ພາສາລາວ"),
+    ("vi", "Tiếng Việt"),
+    ("eo", "Esperanto"),
 ];
 
 /// The language files built into the program: all of them on the
 /// desktop.
 #[cfg(not(target_arch = "wasm32"))]
-const FILES: [(&str, &str); 19] = [
+const FILES: [(&str, &str); 21] = [
     ("en", include_str!("../lang/en.toml")),
     ("zh-CN", include_str!("../lang/zh-CN.toml")),
     ("hi", include_str!("../lang/hi.toml")),
@@ -56,6 +58,8 @@ const FILES: [(&str, &str); 19] = [
     ("tr", include_str!("../lang/tr.toml")),
     ("cs", include_str!("../lang/cs.toml")),
     ("lo", include_str!("../lang/lo.toml")),
+    ("vi", include_str!("../lang/vi.toml")),
+    ("eo", include_str!("../lang/eo.toml")),
 ];
 
 /// The browser build embeds English only; the other languages are
@@ -409,6 +413,7 @@ pub fn language_for_langid(id: u16) -> Option<&'static str> {
         0x1f => "tr",
         0x05 => "cs",
         0x54 => "lo",
+        0x2a => "vi",
         _ => return None,
     })
 }
@@ -490,6 +495,8 @@ mod tests {
         assert_eq!(language_for_locale("sv_SE"), "en");
         assert_eq!(language_for_locale(""), "en");
         assert_eq!(language_for_locale("lo_LA.UTF-8"), "lo");
+        assert_eq!(language_for_locale("vi_VN.UTF-8"), "vi");
+        assert_eq!(language_for_locale("eo.UTF-8"), "eo");
     }
 
     #[test]
@@ -510,6 +517,10 @@ mod tests {
         assert_eq!(match_locale("zh"), Some("zh-CN"));
         assert_eq!(match_locale("lo"), Some("lo"));
         assert_eq!(match_locale("lo-LA"), Some("lo"));
+        assert_eq!(match_locale("vi"), Some("vi"));
+        assert_eq!(match_locale("vi-VN"), Some("vi"));
+        assert_eq!(match_locale("eo"), Some("eo"));
+        assert_eq!(match_locale("eo-001"), Some("eo"));
         // Codes compared whole, not by their first letters.
         assert_eq!(match_locale("arn-CL"), None);
         assert_eq!(match_locale("ido"), None);
@@ -541,10 +552,12 @@ mod tests {
         assert_eq!(language_for_langid(0x0405), Some("cs"));
         assert_eq!(language_for_langid(0x041d), None); // Swedish
         assert_eq!(language_for_langid(0x0454), Some("lo"));
-        // Every shipped language has an id.
-        for (code, _) in LANGUAGES {
+        assert_eq!(language_for_langid(0x042a), Some("vi"));
+        // Every shipped language has an id, but Esperanto, which Windows
+        // has none for (it is picked in Options instead).
+        for (code, _) in LANGUAGES.iter().filter(|(c, _)| *c != "eo") {
             assert!(
-                (0..0x8000u16).any(|id| language_for_langid(id) == Some(code)),
+                (0..0x8000u16).any(|id| language_for_langid(id) == Some(*code)),
                 "{code}"
             );
         }
@@ -578,8 +591,8 @@ mod tests {
         }
         assert_eq!(
             primaries.len(),
-            LANGUAGES.len() - 1,
-            "one per language, Chinese apart"
+            LANGUAGES.len() - 2,
+            "one per language, Chinese and Esperanto (no Windows id) apart"
         );
         // The choices of the installer's page: every code, in our order.
         let codes: Vec<&str> = iss
