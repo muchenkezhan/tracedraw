@@ -40,6 +40,48 @@ pub fn flatten(path: &BezPath, view: &View) -> Vec<(Vec<Pos2>, bool)> {
     out
 }
 
+/// The point of a flattened path nearest to `p` and its distance (mm);
+/// `None` for a path with no segment.
+pub fn nearest_on_path(path: &BezPath, p: Point) -> Option<(Point, f64)> {
+    let mut best: Option<(Point, f64)> = None;
+    let mut last: Option<Point> = None;
+    let mut start: Option<Point> = None;
+    let take = |a: Point, b: Point, best: &mut Option<(Point, f64)>| {
+        let ab = b - a;
+        let len2 = ab.hypot2();
+        let t = if len2 > 0.0 {
+            ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let q = a + ab * t;
+        let d = (p - q).hypot();
+        if best.is_none_or(|(_, bd)| d < bd) {
+            *best = Some((q, d));
+        }
+    };
+    kurbo::flatten(path.elements().iter().copied(), 0.02, &mut |el| match el {
+        PathEl::MoveTo(q) => {
+            last = Some(q);
+            start = Some(q);
+        }
+        PathEl::LineTo(q) => {
+            if let Some(a) = last {
+                take(a, q, &mut best);
+            }
+            last = Some(q);
+        }
+        PathEl::ClosePath => {
+            if let (Some(a), Some(s)) = (last, start) {
+                take(a, s, &mut best);
+            }
+            last = start;
+        }
+        _ => {}
+    });
+    best
+}
+
 /// Distance from a point to the nearest segment of a flattened path (mm).
 pub fn distance_to_path(path: &BezPath, p: Point) -> f64 {
     let mut best = f64::MAX;
@@ -153,8 +195,14 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
     let doc: &Document = app.doc();
     draw_text_frames(app, painter, preview);
 
+    // The objects drawn where the drag takes them: a dashed frame stays
+    // at the selection's box as it was, to judge the change by (#3949).
+    if live.is_some() {
+        draw_start_frame(app, painter);
+    }
     // Selection.
     match preview {
+        Some(_) if !shows_transform_outline(app, live.is_some()) => {}
         Some(t) => draw_transform_outline(app, painter, t),
         None => draw_selection(app, painter, None),
     }
@@ -226,7 +274,12 @@ pub fn draw_canvas(app: &App, painter: &Painter, rect: ERect) {
             Color32::BLACK,
         );
         let mods = painter.ctx().input(|i| i.modifiers);
-        let arc = app.tool == Tool::ThreePointCurve && app.constrain_held(&mods);
+        let arc = match app.tool {
+            Tool::ThreePointCurve => app.constrain_held(&mods),
+            // Ctrl at the third point: the circle on the base (#4086).
+            Tool::ThreePointEllipse => mods.ctrl || mods.command,
+            _ => false,
+        };
         let preview = three_point_preview(app.tool, a, b, c, arc);
         for (pts, closed) in flatten(&preview, view) {
             if pts.len() > 1 {
@@ -695,7 +748,16 @@ fn draw_page_margins(app: &App, painter: &Painter) {
 /// moves the selection while it is dragged).
 fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>) {
     let view = &app.view;
-    painter.rect_filled(rect, 0.0, app.desktop_color());
+    let clean_sheet = app.symbol_edit_index().is_some();
+    painter.rect_filled(
+        rect,
+        0.0,
+        if clean_sheet {
+            Tokens::PAGE
+        } else {
+            app.desktop_color()
+        },
+    );
     // Objects, rasterized with tiny-skia into a texture; the live drag preview
     // is applied to the selection during the render. Rendered before the
     // other pages of the Multipage View so their renders know the time
@@ -711,15 +773,32 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     let without_picture = app.pixel_edit_doc();
     // View > Separations: the page as one ink prints it.
     let one_ink = app.separation_view_doc();
-    let doc: &Document = without_picture
-        .as_deref()
+    // Text being typed in place (#3904): the page beneath it stays at its
+    // clean revision while the edited text shape draws as a small overlay.
+    let text_bg = if without_picture.is_none()
+        && without_copies.is_none()
+        && one_ink.is_none()
+        && preview.is_none()
+        && app.node_drag_revision().is_none()
+    {
+        app.prepare_edited_text_bg(painter.ctx(), rect)
+    } else {
+        app.text_edit_overlay.borrow_mut().suspend();
+        None
+    };
+    let doc: &Document = text_bg
+        .as_ref()
+        .and_then(|(d, _)| d.as_deref())
+        .or(without_picture.as_deref())
         .or(without_copies.as_deref())
         .or(one_ink.as_deref())
         .unwrap_or(app.doc());
     // Nodes being dragged: the drawing as it was before the drag, its
     // picture already made, until the button is released (#1259).
-    let revision = app
-        .node_drag_revision()
+    let revision = text_bg
+        .as_ref()
+        .map(|(_, r)| *r)
+        .or_else(|| app.node_drag_revision())
         .unwrap_or_else(|| app.engine.revision())
         ^ if without_copies.is_some() {
             1u64 << 62
@@ -767,14 +846,36 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     // The drawing as it stands is shared with the render for nothing:
     // no copy of it on the window's thread at each change (#3440).
     #[cfg(not(target_arch = "wasm32"))]
-    if revision == app.engine.revision() && std::ptr::eq(doc, app.engine.document()) {
+    if let Some((Some(hidden), _)) = &text_bg {
+        app.raster.borrow_mut().snapshot = Some(hidden.clone());
+    } else if revision == app.engine.revision() && std::ptr::eq(doc, app.engine.document()) {
         app.raster.borrow_mut().snapshot = Some(app.engine.shared_document());
     }
     // Shadows blurred on the graphics card when Options asks (the same
     // pixels as on the CPU, so nothing drawn needs drawing again).
     #[cfg(not(target_arch = "wasm32"))]
     crate::gpu_fx::set_enabled(app.settings.gpu_effects);
-    app.raster.borrow_mut().light_zoom = app.settings.light_zoom;
+    {
+        let mut raster = app.raster.borrow_mut();
+        raster.light_zoom = app.settings.light_zoom;
+        // A fill or an outline colour dragged in a colour picker: the
+        // part of the page the selection covers, so each move renders
+        // only it anew, not the whole page (#3559).
+        let was = raster.live_region.is_some();
+        raster.live_region = live_colour_region(app, preview);
+        // The drag is over: the fast path patched only what it could
+        // prove the colour changes. Forget the key, keep the picture,
+        // so the next frame renders the whole page once and nothing the
+        // patch could have missed stays stale (#3559).
+        if was && raster.live_region.is_none() {
+            raster.end_live_colour_drag();
+        }
+        // While the wheel's glide is on its way, the picture is drawn for the
+        // view it lands at: the turn's render is not spent on a zoom the
+        // glide has already passed, and when the glide ends the view is put
+        // at the same view the picture was drawn for.
+        raster.zoom_target = app.zoom_glide.target_view();
+    }
     let main = app.raster.borrow_mut().texture(
         painter.ctx(),
         doc,
@@ -833,12 +934,14 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
     // facing pages): their shadows and paper now, their objects over
     // the current page's paper below, so what they hold across the
     // spine shows on it (#1972).
-    let others = app.shows_other_pages();
+    let others = !clean_sheet && app.shows_other_pages();
 
     // Page: a flat grey shadow offset right and down, the white page, a
     // one-pixel grey border (pixel-aligned so it stays crisp). While
     // Autofit Page's popup is open the page shows at the size it would
-    // take, around the drawing (#594, #604).
+    // take, around the drawing (#594, #604). While a symbol is edited on
+    // its clean sheet, the whole window is paper with a light mark at
+    // the symbol's origin.
     let shown = app
         .autofit_preview_rect(painter.ctx().cumulative_frame_nr())
         .unwrap_or_else(|| app.page_rect());
@@ -846,53 +949,60 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         let r = view.rect_to_screen(shown);
         ERect::from_min_max(r.min.round(), r.max.round())
     };
-    if app.show_page_shadow {
-        paint_page_shadow(app, painter, paper);
-    }
-    if others {
-        crate::multipage::draw_other_papers(app, painter, rect);
-    }
-    painter.rect_filled(paper, 0.0, Tokens::PAGE);
-    if app.show_page_border {
-        painter.rect_stroke(
-            paper,
-            0.0,
-            page_border_stroke(app),
-            epaint::StrokeKind::Outside,
-        );
-    }
-    if app.show_bleed {
-        let b = app.doc().metadata.bleed.max(0.0);
-        if b > 0.0 {
-            // Around the whole spread with facing pages, not at the
-            // spine (#1660).
-            let around = if app.doc().facing().is_some() {
-                app.shown_spread_rect(app.page)
-                    .map(|r| r.union(shown))
-                    .unwrap_or(shown)
-            } else {
-                shown
-            };
-            let r = view.rect_to_screen(around.inflate(b, b));
+    if !clean_sheet {
+        if app.show_page_shadow {
+            paint_page_shadow(app, painter, paper);
+        }
+        if others {
+            crate::multipage::draw_other_papers(app, painter, rect);
+        }
+        painter.rect_filled(paper, 0.0, Tokens::PAGE);
+        if app.show_page_border {
             painter.rect_stroke(
-                r,
+                paper,
                 0.0,
-                EStroke::new(1.0, Tokens::page_border()),
+                page_border_stroke(app),
                 epaint::StrokeKind::Outside,
             );
         }
-    }
-    if app.show_printable_area {
-        // Printable area: the page minus the printer's hard margins, as
-        // the system reports them, else a typical 5 mm (#1924).
-        let r = view.rect_to_screen(printable_rect(app, shown));
-        dashed_rect(painter, r, Tokens::text_dim());
+        if app.show_bleed {
+            let b = app.doc().metadata.bleed.max(0.0);
+            if b > 0.0 {
+                // Around the whole spread with facing pages, not at the
+                // spine (#1660).
+                let around = if app.doc().facing().is_some() {
+                    app.shown_spread_rect(app.page)
+                        .map(|r| r.union(shown))
+                        .unwrap_or(shown)
+                } else {
+                    shown
+                };
+                let r = view.rect_to_screen(around.inflate(b, b));
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    EStroke::new(1.0, Tokens::page_border()),
+                    epaint::StrokeKind::Outside,
+                );
+            }
+        }
+        if app.show_printable_area {
+            // Printable area: the page minus the printer's hard margins, as
+            // the system reports them, else a typical 5 mm (#1924).
+            let r = view.rect_to_screen(printable_rect(app, shown));
+            dashed_rect(painter, r, Tokens::text_dim());
+        }
+    } else if let Some(origin) = app.symbol_edit_origin() {
+        let o = view.to_screen(origin).round();
+        let mark = EStroke::new(1.0, Tokens::page_border());
+        painter.line_segment([o + egui::vec2(-6.0, 0.0), o + egui::vec2(6.0, 0.0)], mark);
+        painter.line_segment([o + egui::vec2(0.0, -6.0), o + egui::vec2(0.0, 6.0)], mark);
     }
 
     if app.show_grid {
         draw_grid(app, painter, rect);
     }
-    if app.show_baseline_grid {
+    if !clean_sheet && app.show_baseline_grid {
         draw_baseline_grid(app, painter, rect, paper);
     }
     if others {
@@ -938,14 +1048,76 @@ fn draw_page(app: &App, painter: &Painter, rect: ERect, preview: Option<Affine>)
         if let Some((bands, bands_at, _)) = incoming {
             painter.image(bands, bands_at, full, Color32::WHITE);
         }
+        app.paint_edited_text_overlay(painter, rect);
     }
 
-    draw_page_margins(app, painter);
-    if app.mask_outside_page {
-        mask_outside_pages(app, painter, rect, paper);
+    if !clean_sheet {
+        draw_page_margins(app, painter);
+        if app.mask_outside_page {
+            mask_outside_pages(app, painter, rect, paper);
+        }
     }
     draw_pixel_grid(app, painter, rect);
     draw_empty_clip_frames(app, painter);
+    crate::cut_tools::paint_grid_preview(app, painter);
+    crate::dialog_preview::paint(app, painter);
+}
+
+/// The part of the page a fill or an outline colour dragged in a colour
+/// picker can change (page mm): the selection's boxes, widened by its
+/// outlines, mitered corners, shadows and a hair for the antialiased
+/// edges. `None` while nothing is dragged so (or a drag preview moves
+/// the selection), and for a selection the fast path cannot bound: one
+/// with live effects (their copies and warped outlines reach far past
+/// the object's box, and a symmetry being edited draws them in the full
+/// preview while its bounds keep the object's own) or holding a symbol
+/// instance (what it draws is its definition, whose effects the
+/// instance's box does not know). The raster renders only this part
+/// anew at every move of the pointer (#3559).
+fn live_colour_region(app: &App, preview: Option<Affine>) -> Option<Rect> {
+    if preview.is_some() || (app.live_fill.is_none() && app.live_stroke.is_none()) {
+        return None;
+    }
+    let shapes = app.selected_rc();
+    if shapes.is_empty() {
+        return None;
+    }
+    // Two pixels against the antialiased edge of the region's box.
+    let mut pad = 2.0 / app.view.zoom.max(0.01) as f64;
+    let mut region: Option<Rect> = None;
+    for s in shapes.iter() {
+        if s.has_live_effects() || s.raster_fx.is_some() || holds_a_symbol(s) {
+            return None;
+        }
+        let b = app.visual_bounds(s);
+        if b.is_finite() {
+            region = Some(region.map_or(b, |r| r.union(b)));
+        }
+        if let Some(st) = &s.stroke {
+            // A mitered corner spikes past the outline by the stroke's
+            // miter ratio times its half width (#3559).
+            pad = pad.max(st.width * st.miter_ratio() / 2.0);
+        }
+        if let Some(sh) = &s.shadow {
+            pad = pad.max(sh.offset.hypot() + 4.0 * sh.blur.max(0.0));
+        }
+    }
+    Some(region?.inflate(pad, pad))
+}
+
+/// The object, or one held in its groups and clip frames, is a symbol
+/// instance (#3559).
+fn holds_a_symbol(s: &tracedraw_core::Shape) -> bool {
+    if matches!(s.kind, ShapeKind::SymbolInstance { .. }) {
+        return true;
+    }
+    match &s.kind {
+        ShapeKind::Group { children } => children.iter().any(holds_a_symbol),
+        ShapeKind::ClipFrame { frame, contents } => {
+            holds_a_symbol(frame) || contents.iter().any(holds_a_symbol)
+        }
+        _ => false,
+    }
 }
 
 /// The colour Mask Outside Page paints when the desktop is white or
@@ -1243,7 +1415,10 @@ fn three_point_preview(
     let len = base.hypot().max(1e-6);
     let dir = base / len;
     let normal = Vec2::new(-dir.y, dir.x);
-    let height = (c - a).dot(normal);
+    let mut height = (c - a).dot(normal);
+    if tool == Tool::ThreePointEllipse && arc {
+        height = crate::app::circle_on_base_height(len, height);
+    }
     match tool {
         Tool::ThreePointCurve => crate::app::three_point_curve(a, b, c, arc),
         _ => {
@@ -2030,6 +2205,13 @@ fn draw_anchors(app: &App, painter: &Painter) {
                 shown.push((to, false));
             }
         }
+        // Before the drag, the anchors of the object under the pointer, so
+        // the connector can start on the one wanted (#3860).
+        (Tool::Connector | Tool::RightAngleConnector | Tool::RoundedConnector, Drag::None) => {
+            if let Some(id) = app.pointer_page.and_then(|p| app.hit_test(p)) {
+                shown.push((id, false));
+            }
+        }
         _ => {}
     }
     for (id, editing) in shown {
@@ -2222,6 +2404,33 @@ fn symmetry_copy_paths(
     }
 }
 
+/// The selection's box where the transform started (the objects stay
+/// there until the release), in dashes: with Show objects while
+/// transforming the objects move and the frame stays (#3949).
+fn draw_start_frame(app: &App, painter: &Painter) {
+    let Some(r) = start_frame(app) else {
+        return;
+    };
+    let r = ERect::from_two_pos(
+        app.view.to_screen(r.origin()),
+        app.view.to_screen(Point::new(r.x1, r.y1)),
+    );
+    dashed_rect(painter, r.expand(0.5), Tokens::DRAG_OUTLINE);
+}
+
+/// The box [`draw_start_frame`] draws, in page space.
+pub(crate) fn start_frame(app: &App) -> Option<Rect> {
+    app.selection_bounds()
+        .filter(|r| r.width().is_finite() && r.height().is_finite())
+}
+
+/// Whether the drag outline shows while the selection is transformed:
+/// always, unless the objects are drawn where they go (`live`) and
+/// Options > Display has the outline over them off (#3704).
+fn shows_transform_outline(app: &App, live: bool) -> bool {
+    !live || app.settings.transform_outline_over_objects
+}
+
 pub fn draw_transform_outline(app: &App, painter: &Painter, t: Affine) {
     let halo = EStroke::new(3.0, Color32::from_white_alpha(220));
     let line = EStroke::new(1.0, Tokens::DRAG_OUTLINE);
@@ -2396,6 +2605,33 @@ fn draw_text_path_preview(app: &App, painter: &Painter, p: Point) {
     );
 }
 
+/// One clip frame selected: the outlines of what it holds, a thin dashed
+/// line out past the frame too, so where the contents sit inside it can
+/// be seen while the frame is placed or its contents edited (#3804).
+fn draw_clip_contents_outline(app: &App, painter: &Painter, preview: Option<Affine>) {
+    let shapes = app.selected_rc();
+    let [s] = shapes.as_slice() else {
+        return;
+    };
+    let ShapeKind::ClipFrame { contents, .. } = &s.kind else {
+        return;
+    };
+    let t = preview.unwrap_or(Affine::IDENTITY) * s.transform;
+    let line = EStroke::new(1.0, Tokens::DRAG_OUTLINE.gamma_multiply(0.8));
+    for c in contents {
+        let mut c = c.clone();
+        c.transform_by(t);
+        for (mut pts, closed) in flatten(&c.page_path(), &app.view) {
+            if closed {
+                if let Some(first) = pts.first().copied() {
+                    pts.push(first);
+                }
+            }
+            painter.extend(egui::Shape::dashed_line(&pts, line, 4.0, 3.0));
+        }
+    }
+}
+
 fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
     let shapes = app.selected_rc();
     if shapes.is_empty() {
@@ -2418,6 +2654,18 @@ fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
     if app.tool == Tool::Shape {
         draw_nodes(app, painter);
         return;
+    }
+    // The Common Shapes tool shows the handles of the selected shapes it
+    // drew, which it drags as the Shape tool does (#4045).
+    if app.tool == Tool::CommonShapes && app.text_edit.is_none() {
+        let prefs = app.settings.nodes;
+        let [r, g, b] = prefs.main_rgb;
+        let main = Color32::from_rgb(r, g, b);
+        for s in app.shape_tool_shapes() {
+            if crate::shape_tool::shows_handles(&s) {
+                draw_adjust_handles(painter, view, &s, prefs.size.px(), main, main);
+            }
+        }
     }
     // The Mesh Fill tool's box or freehand loop over mesh nodes.
     if matches!(app.tool, Tool::MeshFill | Tool::Envelope) {
@@ -2472,6 +2720,9 @@ fn draw_selection(app: &App, painter: &Painter, preview: Option<Affine>) {
             epaint::StrokeKind::Middle,
         );
         return;
+    }
+    if pick {
+        draw_clip_contents_outline(app, painter, preview);
     }
     if app.rotate_mode && pick {
         // Rotation arrows at corners, skew arrows at edges, the centre of
@@ -2847,6 +3098,9 @@ fn draw_empty_clip_frames(app: &App, painter: &Painter) {
         .filter(|l| l.visible)
         .flat_map(|l| &l.shapes)
     {
+        if app.symbol_edit_index().is_some() && app.outside_clip_edit(s.id) {
+            continue;
+        }
         if let ShapeKind::ClipFrame { contents, .. } = &s.kind {
             if contents.is_empty() && s.visible {
                 for (a, b) in
@@ -3357,6 +3611,37 @@ fn spacing_arrow_shapes(c: Pos2, horizontal: bool, color: Color32) -> Vec<epaint
 /// The outline of a rectangle, ellipse or polygon the Shape tool edits,
 /// on screen: one line of points for each of its outlines, a closed one
 /// ending where it starts. Drawn dashed in the node colour (#670).
+/// A common shape's adjustment handles (#4045) over its outline: each a
+/// diamond filled in the node colour, told apart from nodes (squares)
+/// and from a rectangle's edge handles (white diamonds).
+fn draw_adjust_handles(
+    painter: &Painter,
+    view: &View,
+    s: &tracedraw_core::Shape,
+    size: f32,
+    main: Color32,
+    outline: Color32,
+) {
+    for (pts, _) in flatten(&s.page_path(), view) {
+        painter.add(egui::Shape::line(pts, EStroke::new(1.0, outline)));
+    }
+    let h = size / 2.0 + 1.5;
+    for (_, p) in crate::kind_nodes::nodes(s) {
+        let c = view.to_screen(p);
+        let diamond = vec![
+            c + egui::vec2(0.0, -h),
+            c + egui::vec2(h, 0.0),
+            c + egui::vec2(0.0, h),
+            c + egui::vec2(-h, 0.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            diamond,
+            main,
+            EStroke::new(1.0, Color32::WHITE),
+        ));
+    }
+}
+
 pub(crate) fn kind_outline(s: &tracedraw_core::Shape, view: &View) -> Vec<Vec<Pos2>> {
     flatten(&s.page_path(), view)
         .into_iter()
@@ -3498,7 +3783,11 @@ fn draw_nodes(app: &App, painter: &Painter) {
                 }
                 let (h, v) = app.spacing_arrow_spots(&s);
                 draw_spacing_arrow(painter, h, true, main);
-                draw_spacing_arrow(painter, v, false, main);
+                // Text fitted to a path: the horizontal arrow only, which
+                // opens up or closes the letters along the path (#193).
+                if !crate::text_nodes::on_path(&s) {
+                    draw_spacing_arrow(painter, v, false, main);
+                }
                 continue;
             }
             // Text fitted to a path: the horizontal arrow only, which
@@ -3544,6 +3833,12 @@ fn draw_nodes(app: &App, painter: &Painter) {
                     node_marker(painter, p, size + 6.0, prefs.cusp, None, main);
                 }
             }
+            continue;
+        }
+        // A common shape: its outline and its adjustment handles; the
+        // curve's own nodes do not show (#4045).
+        if crate::shape_tool::shows_handles(&s) {
+            draw_adjust_handles(painter, view, &s, size, main, outline_of(s.id));
             continue;
         }
         let ShapeKind::Path { path, .. } = &s.kind else {
@@ -3906,7 +4201,7 @@ fn draw_guide_line(
 /// selected ones red, one being dragged where it would go, the rotation
 /// handles of a guideline in rotate mode.
 pub fn draw_guides(app: &App, painter: &Painter, rect: ERect) {
-    if !app.show_guides {
+    if !app.show_guides || app.symbol_edit_index().is_some() {
         return;
     }
     if app.doc().page(app.page).is_err() {
@@ -4180,8 +4475,12 @@ pub fn draw_snap_mark(app: &App, painter: &Painter) {
         return;
     }
     let c = app.view.to_screen(t.point);
-    // While dragging, the edge snapped to lights up in blue.
-    if let (Some(seg), false) = (t.edge, matches!(app.drag, crate::app::Drag::None)) {
+    // While dragging or measuring with a dimension tool, the edge snapped
+    // to lights up in blue.
+    let highlight_edge = !matches!(app.drag, crate::app::Drag::None)
+        || app.is_dimension_tool()
+        || app.dimension_dragging;
+    if let (Some(seg), true) = (t.edge, highlight_edge) {
         let pts: Vec<Pos2> = (0..=24)
             .map(|i| {
                 app.view
@@ -4618,6 +4917,23 @@ pub fn draw_effect_nodes(app: &App, painter: &Painter) {
                 }
             }
         }
+        // The chosen colour point's spread: a ring as far as its colour
+        // reaches, with a handle on it to drag (#3947).
+        if let Some((_, i)) = app.selected_color_point().filter(|(id, _)| *id == s.id) {
+            if let Some((at, r, h)) = crate::color_points::spread_ring(s, i) {
+                let c = app.view.to_screen(at);
+                let rs = r as f32 * app.view.zoom;
+                painter.circle_stroke(c, rs, egui::Stroke::new(1.0, blue));
+                let k = crate::color_points::SPREAD_HANDLE_BASE + i;
+                let held = app.effect_node_drag == Some((s.id, k));
+                painter.circle(
+                    app.view.to_screen(h),
+                    4.0,
+                    if held { blue } else { egui::Color32::WHITE },
+                    egui::Stroke::new(1.0, blue),
+                );
+            }
+        }
         // Every chosen mesh node shows filled (discussion #2387).
         let chosen: Vec<usize> = app
             .selected_mesh_nodes()
@@ -4695,6 +5011,83 @@ mod node_look_tests {
 mod tests {
     use super::*;
 
+    /// The colour drag fast path only takes what it can bound: a
+    /// selection with a live effect renders as always, a plain one gives
+    /// the selection's box widened by the antialiasing hair (#3559).
+    #[test]
+    fn a_colour_drag_region_leaves_out_what_the_fast_path_cannot_bound() {
+        use tracedraw_core::live::Effect;
+        use tracedraw_core::Command;
+        let mut app = App::headless();
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 50.0, 40.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("rect");
+        app.select(vec![id]);
+        app.live_fill = Some((0, Some(Color::rgb8(0, 0, 0))));
+        app.view.zoom = 4.0;
+        let region = live_colour_region(&app, None).expect("a plain selection is bounded");
+        assert!(
+            (region.x0 - -0.5).abs() < 1e-6
+                && (region.y0 - -0.5).abs() < 1e-6
+                && (region.x1 - 50.5).abs() < 1e-6
+                && (region.y1 - 40.5).abs() < 1e-6,
+            "{region:?}"
+        );
+        app.run(Command::SetEffects {
+            shape: id,
+            effects: vec![Effect::Symmetry {
+                center: Point::new(25.0, 20.0),
+                angle: 45.0,
+                lines: 6,
+                rotate: false,
+            }],
+        });
+        assert!(
+            live_colour_region(&app, None).is_none(),
+            "a symmetry's copies reach past the object's box"
+        );
+    }
+
+    /// A symbol instance, alone or held in a group or a clip frame, is
+    /// out of the fast path: what it draws is its definition, whose
+    /// bounds the instance's box does not carry (#3559).
+    #[test]
+    fn a_symbol_instance_in_the_selection_leaves_the_fast_path() {
+        let sym = tracedraw_core::Shape::new(
+            tracedraw_core::ShapeId(1),
+            ShapeKind::SymbolInstance { index: 0 },
+        );
+        let group = tracedraw_core::Shape::new(
+            tracedraw_core::ShapeId(2),
+            ShapeKind::Group {
+                children: vec![sym.clone()],
+            },
+        );
+        let clip = tracedraw_core::Shape::new(
+            tracedraw_core::ShapeId(3),
+            ShapeKind::ClipFrame {
+                frame: Box::new(sym.clone()),
+                contents: Vec::new(),
+            },
+        );
+        let plain = tracedraw_core::Shape::new(
+            tracedraw_core::ShapeId(4),
+            ShapeKind::Rect {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        assert!(holds_a_symbol(&sym));
+        assert!(holds_a_symbol(&group));
+        assert!(holds_a_symbol(&clip));
+        assert!(!holds_a_symbol(&plain));
+    }
+
     /// The drag outline of an object a perspective (or an envelope)
     /// reshapes shows the reshaped object, not the plain one beneath it
     /// (#3569); without the warp it is the plain outline as before.
@@ -4754,6 +5147,60 @@ mod tests {
                 && !bottom.is_empty(),
             "the bottom drawn in, scaled: {bottom:?}"
         );
+    }
+
+    /// #3704: the drag outline over the objects shown while transforming
+    /// is on by default and can be turned off; without the objects shown
+    /// the outline always shows.
+    #[test]
+    fn the_outline_over_objects_while_transforming_can_be_hidden() {
+        let mut app = App::headless();
+        assert!(app.settings.transform_outline_over_objects);
+        assert!(shows_transform_outline(&app, true));
+        app.settings.transform_outline_over_objects = false;
+        assert!(!shows_transform_outline(&app, true));
+        assert!(shows_transform_outline(&app, false));
+        let old: crate::settings::Settings = serde_json::from_str("{}").expect("old settings");
+        assert!(old.transform_outline_over_objects, "on for settings saved before");
+    }
+
+    /// With Show objects while transforming, a scale drag draws the
+    /// objects at their new size while a dashed frame stays at the box
+    /// they started from (#3949): the frame is the selection's box before
+    /// the drag, which the objects keep until the release.
+    #[test]
+    fn a_frame_stays_where_a_live_transform_started() {
+        let mut app = App::headless();
+        app.settings.live_transform_preview = true;
+        let id = app
+            .new_shape(ShapeKind::Rect {
+                rect: Rect::new(10.0, 10.0, 30.0, 20.0),
+                radius: 0.0,
+                corners: None,
+            })
+            .expect("a rectangle");
+        app.select(vec![id]);
+        let before = app.selection_bounds().expect("a box");
+        app.drag = Drag::Scale {
+            handle: Handle::SE,
+            anchor: Point::new(before.x0, before.y0),
+            start_bounds: before,
+            current: Point::new(before.x1 + 40.0, before.y1 + 30.0),
+            grab: tracedraw_core::geometry::Vec2::ZERO,
+            mods: Default::default(),
+            snapped: (false, false),
+            flat: (false, false),
+            start_geometry: None,
+        };
+        let t = app.preview_transform_of(&app.drag).expect("a preview");
+        // The objects go to the new size...
+        let corner = t * Point::new(before.x1, before.y1);
+        assert!(
+            (corner - Point::new(before.x1, before.y1)).hypot() > 10.0,
+            "{corner:?}"
+        );
+        // ...and the frame stays.
+        assert_eq!(start_frame(&app), Some(before));
     }
 
     /// Show objects while transforming is off by default (#3569).

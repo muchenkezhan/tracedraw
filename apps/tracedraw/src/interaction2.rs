@@ -558,6 +558,25 @@ impl App {
             }
             tracedraw_core::shaping::Enclosed::OnOutline => return,
         };
+        // With Use Guidelines on, the guidelines close the area off too:
+        // only the part on the click's side of each line is kept (#3863).
+        let path = if self.area_fill_guides {
+            let lines = self.shown_guide_lines();
+            if lines.is_empty() {
+                path
+            } else {
+                let bounds = kurbo::Shape::bounding_box(&path).inflate(10.0, 10.0);
+                let Some(cell) = crate::shape_builder::cell_at(bounds, &lines, p) else {
+                    return;
+                };
+                match crate::shape_builder::part_in_cell(&path, &cell, p) {
+                    Some(part) => part,
+                    None => return,
+                }
+            }
+        } else {
+            path
+        };
         if path.elements().is_empty() {
             return;
         }
@@ -632,8 +651,12 @@ impl App {
                 .find(|s| is_group(s) && kurbo::Shape::bounding_box(&s.page_path()).contains(p))
                 .cloned()
         });
-        let Some(group) = group else {
-            return false;
+        let (group, grouped) = match group {
+            Some(g) => (g, None),
+            None => match self.live_group_around(p) {
+                Some((g, mark)) => (g, Some(mark)),
+                None => return false,
+            },
         };
         let color = match self.area_fill_mode {
             1 => Some(self.area_fill_color),
@@ -657,6 +680,11 @@ impl App {
             .unwrap_or(Affine::IDENTITY);
         let local = (parent * group.transform).inverse() * p;
         if !tracedraw_core::live_paint::paint_at(&group, &mut fills, local, color) {
+            if let Some(mark) = grouped {
+                // Nothing painted: the objects are not left grouped.
+                self.engine.end_group(mark, "Area Fill");
+                self.undo();
+            }
             return tracedraw_core::live_paint::region_at(&group, local).is_some();
         }
         match effects
@@ -671,8 +699,62 @@ impl App {
             shape: group.id,
             effects,
         });
+        if let Some(mark) = grouped {
+            self.engine.end_group(mark, "Area Fill");
+        }
         self.select(vec![group.id]);
         true
+    }
+
+    /// Live Area Fill on lines not grouped (#4199): the objects of the
+    /// active layer whose lines close round `p` are grouped, so the live
+    /// fill follows them as they are edited. One Undo takes back the
+    /// grouping with the fill. None when no area closes round `p`.
+    fn live_group_around(&mut self, p: Point) -> Option<(Shape, Option<u64>)> {
+        let layer = self.active_layer()?;
+        let shapes: Vec<Shape> = self
+            .doc()
+            .layers_for_page(self.page)
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.id == layer && l.visible && !l.locked)
+            .flat_map(|l| l.shapes.iter())
+            .filter(|s| !matches!(s.kind, ShapeKind::Group { .. }) && s.effects.is_empty())
+            .cloned()
+            .collect();
+        if shapes.len() < 2 {
+            return None;
+        }
+        let all = Shape::new(ShapeId(u64::MAX), ShapeKind::Group { children: shapes.clone() });
+        let area = tracedraw_core::live_paint::region_at(&all, p)?;
+        let around = kurbo::Shape::bounding_box(&area).inflate(0.5, 0.5);
+        let members: Vec<ShapeId> = shapes
+            .iter()
+            .filter(|s| {
+                let b = kurbo::Shape::bounding_box(&s.page_path());
+                b.x0 <= around.x1 && b.x1 >= around.x0 && b.y0 <= around.y1 && b.y1 >= around.y0
+            })
+            .map(|s| s.id)
+            .collect();
+        if members.len() < 2 {
+            return None;
+        }
+        let mark = self.engine.begin_group();
+        self.select(members);
+        self.group_selection();
+        let group = match self.selection[..] {
+            [id] => self
+                .doc()
+                .find_shape(id)
+                .filter(|s| matches!(s.kind, ShapeKind::Group { .. }))
+                .cloned(),
+            _ => None,
+        };
+        if group.is_none() {
+            self.engine.end_group(mark, "Area Fill");
+        }
+        // The fill joins this step (`live_paint_at` ends the group).
+        group.map(|g| (g, mark))
     }
 
     /// The symmetry object an Area Fill click at `p` falls in, among the
@@ -753,6 +835,16 @@ impl App {
                         .into_iter()
                         .map(|(k, q)| ((id, k), q)),
                 );
+            }
+        }
+        // The chosen colour point's spread handle, on its ring (#3947).
+        if let Some((id, i)) = self.selected_color_point().filter(|_| !envelope_tool) {
+            if let Some((_, _, h)) = self
+                .doc()
+                .find_shape(id)
+                .and_then(|s| crate::color_points::spread_ring(s, i))
+            {
+                points.push(((id, crate::color_points::SPREAD_HANDLE_BASE + i), h));
             }
         }
         nearest(points)
@@ -903,6 +995,28 @@ impl App {
         let Some(s) = self.doc().find_shape(id).cloned() else {
             return;
         };
+        // A colour point's spread handle: the spread follows the
+        // pointer's distance from the point, one undo step (#3947).
+        if let Some(i) = crate::color_points::spread_handle_of(index) {
+            if let Some((at, _, _)) = crate::color_points::spread_ring(&s, i) {
+                use tracedraw_core::geometry::Shape as _;
+                let b = s.page_path().bounding_box();
+                let unit = crate::color_points::spread_radius(b, 1.0).max(1e-9);
+                let spread = ((p + self.effect_node_grab) - at).hypot() / unit;
+                if let Some(cmd) = self.spread_color_point(id, i, spread) {
+                    if self.effect_node_stepped && self.engine.undo_label() == Some("Edit Effect")
+                    {
+                        let _ = self.engine.undo();
+                    }
+                    self.effect_node_stepped = true;
+                    if let Err(e) = self.engine.run_batch("Edit Effect", &[cmd]) {
+                        self.status = e.to_string();
+                    }
+                }
+            }
+            self.drag = Drag::Node { last: p };
+            return;
+        }
         let Some(at) = effect_point(&s, index) else {
             return;
         };
@@ -1094,6 +1208,9 @@ pub fn mesh_handle_points(s: &Shape, i: usize) -> Vec<(usize, Point)> {
 /// Where effect node `index` of `s` is on the page: a perspective
 /// corner, a mesh node or a mesh node's handle.
 pub fn effect_point(s: &Shape, index: usize) -> Option<Point> {
+    if let Some(i) = crate::color_points::spread_handle_of(index) {
+        return crate::color_points::spread_ring(s, i).map(|(_, _, h)| h);
+    }
     if let Some((i, h)) = crate::mesh_tool::mesh_handle_of(index) {
         let Fill::Mesh(m) = &s.fill else {
             return None;

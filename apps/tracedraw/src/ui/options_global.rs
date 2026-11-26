@@ -218,7 +218,11 @@ pub fn file_formats_page(app: &mut App, ui: &mut Ui) {
             ui,
             crate::ui::tips::keyed("dialog.output_condition"),
             |ui| {
-                ui.add(egui::TextEdit::singleline(&mut f.output_condition).desired_width(130.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut f.output_condition)
+                        .hint_text(tr("dialog.output_condition_drawing"))
+                        .desired_width(130.0),
+                );
             },
         );
 
@@ -429,6 +433,11 @@ pub fn warnings_page(app: &mut App, ui: &mut Ui) {
         .rich_tip(crate::ui::tips::pair(
             "options.warn_shelf_remove",
             "options.warn_shelf_remove_tip",
+        ));
+    ui.checkbox(&mut w.pixel_flatten, tr("options.warn_pixel_flatten"))
+        .rich_tip(crate::ui::tips::pair(
+            "options.warn_pixel_flatten",
+            "options.warn_pixel_flatten_tip",
         ));
     if crate::ui::options::DesktopOnly::HardwareAcceleration.shown() {
         ui.checkbox(

@@ -91,6 +91,12 @@ pub enum Effect {
         corners: Vec<usize>,
         #[serde(default)]
         mapping: crate::envelope::Mapping,
+        /// The box the frame maps, in the object's own space, when it is
+        /// not the box of the object's outline: an object that left a
+        /// group keeps the group's envelope over the group's box, so it
+        /// stays bent as it was (#3714). Older files have none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<Rect>,
     },
     /// Perspective: the four corners of the bounding box moved.
     Perspective { corners: [Point; 4] },
@@ -1060,6 +1066,7 @@ pub fn bake_outline_warps(shape: &Shape) -> Option<Shape> {
     out.node_types.clear();
     out.spline = None;
     out.spline_fixed.clear();
+    out.common_shape = None;
     Some(out)
 }
 
@@ -1171,11 +1178,12 @@ fn warp_outline(e: &Effect, p: &BezPath, b: Rect) -> Option<BezPath> {
             handles,
             corners,
             mapping,
+            reference,
         } => {
             let frame = crate::envelope::Frame::from_parts(nodes, handles, corners)?;
             Some(crate::envelope::apply_in(
                 p,
-                b,
+                reference.unwrap_or(b),
                 &frame,
                 *keep_lines,
                 *mapping,
@@ -1401,6 +1409,16 @@ impl Shape {
             .unwrap_or_else(|| self.bounds())
     }
 
+    /// [`Shape::visual_bounds`] with `symbols` resolving any symbol
+    /// instances the object is or holds. Without `symbols`, a bare
+    /// instance only knows its 10 x 10 placeholder at the origin.
+    pub fn visual_bounds_with(&self, symbols: &[crate::document::Symbol]) -> Rect {
+        match self.with_symbols_drawn(symbols) {
+            Some(drawn) => drawn.visual_bounds(),
+            None => self.visual_bounds(),
+        }
+    }
+
     /// The object starts a blend whose end is an object of the drawing
     /// (see [`Shape::own_visual_bounds`]).
     pub fn starts_linked_blend(&self) -> bool {
@@ -1475,6 +1493,7 @@ impl Effect {
             handles: frame.handles.clone(),
             corners: frame.corners.to_vec(),
             mapping,
+            reference: None,
         }
     }
 
@@ -1665,13 +1684,78 @@ pub struct Evaluated {
     pub above: Vec<Shape>,
 }
 
-/// How many evaluations [`evaluate`] remembers.
-const EVALUATION_MEMORY: usize = 8;
+/// How many evaluations [`evaluate`] remembers: enough for a drawing with
+/// dozens of contoured, blended or extruded objects to keep each one's
+/// across frames and the pointer's moves; with 8 they pushed each other
+/// out (#3765), and 32 still left large drawings working every blend out
+/// again each frame (#4193).
+const EVALUATION_MEMORY: usize = 512;
 
-/// The latest evaluations of shapes that draw objects from their outline,
-/// newest last, each with the shape it was made from. Shared by all
-/// threads: the rasteriser works on its own.
-static EVALUATED: std::sync::Mutex<Vec<(Shape, Evaluated)>> = std::sync::Mutex::new(Vec::new());
+/// How many versions of one object are kept: the object and the one being
+/// dragged or edited are both asked for in a frame.
+const VERSIONS_PER_OBJECT: usize = 4;
+
+/// The kept evaluations, by object id, each with the shape it was made
+/// from and when it was last asked for.
+#[derive(Default)]
+struct Evaluations {
+    by_id: std::collections::HashMap<crate::ShapeId, Vec<(Shape, Evaluated, u64)>>,
+    len: usize,
+    tick: u64,
+}
+
+impl Evaluations {
+    fn get(&mut self, shape: &Shape) -> Option<Evaluated> {
+        self.tick += 1;
+        let tick = self.tick;
+        // The id first: a shape of another id never pays the comparison of
+        // whole paths and children. The full comparison still guards the
+        // hit, so a changed shape of the same id is worked out again (#3765).
+        let kept = self.by_id.get_mut(&shape.id)?;
+        let hit = kept.iter_mut().find(|(from, _, _)| from == shape)?;
+        hit.2 = tick;
+        Some(hit.1.clone())
+    }
+
+    fn put(&mut self, shape: &Shape, ev: &Evaluated) {
+        self.tick += 1;
+        let tick = self.tick;
+        let kept = self.by_id.entry(shape.id).or_default();
+        if kept.len() >= VERSIONS_PER_OBJECT {
+            if let Some(i) = (0..kept.len()).min_by_key(|&i| kept[i].2) {
+                kept.remove(i);
+                self.len -= 1;
+            }
+        }
+        kept.push((shape.clone(), ev.clone(), tick));
+        self.len += 1;
+        // Over the limit, the evaluation asked for longest ago goes; this
+        // walks the kept ones, but only when a new one is worked out.
+        while self.len > EVALUATION_MEMORY {
+            let Some((id, i)) = self
+                .by_id
+                .iter()
+                .flat_map(|(id, v)| v.iter().enumerate().map(move |(i, e)| (e.2, *id, i)))
+                .min_by_key(|e| e.0)
+                .map(|(_, id, i)| (id, i))
+            else {
+                break;
+            };
+            if let Some(v) = self.by_id.get_mut(&id) {
+                v.remove(i);
+                if v.is_empty() {
+                    self.by_id.remove(&id);
+                }
+            }
+            self.len -= 1;
+        }
+    }
+}
+
+/// The latest evaluations of shapes that draw objects from their outline.
+/// Shared by all threads: the rasteriser works on its own.
+static EVALUATED: std::sync::LazyLock<std::sync::Mutex<Evaluations>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Evaluate every effect of `shape` in order. Geometry effects replace the
 /// main shape's kind with a path; object effects add shapes.
@@ -1683,20 +1767,12 @@ pub fn evaluate(shape: &Shape) -> Evaluated {
     if !shape.effects.iter().any(Effect::draws_from_outline) {
         return evaluate_now(shape);
     }
-    if let Ok(mut kept) = EVALUATED.lock() {
-        if let Some(i) = kept.iter().position(|(from, _)| from == shape) {
-            let hit = kept.remove(i);
-            let ev = hit.1.clone();
-            kept.push(hit);
-            return ev;
-        }
+    if let Some(ev) = EVALUATED.lock().ok().and_then(|mut k| k.get(shape)) {
+        return ev;
     }
     let ev = evaluate_now(shape);
     if let Ok(mut kept) = EVALUATED.lock() {
-        if kept.len() >= EVALUATION_MEMORY {
-            kept.remove(0);
-        }
-        kept.push((shape.clone(), ev.clone()));
+        kept.put(shape, &ev);
     }
     ev
 }
@@ -1708,6 +1784,13 @@ pub fn evaluate(shape: &Shape) -> Evaluated {
 /// the outline before the body is built (#2214), so the box is the
 /// outline's there too.
 pub fn warp_box(shape: &Shape, at: usize) -> Rect {
+    // An envelope kept from a group maps the group's box (#3714).
+    if let Some(Effect::Envelope {
+        reference: Some(r), ..
+    }) = shape.effects.get(at)
+    {
+        return *r;
+    }
     let mut s = shape.clone();
     s.effects.truncate(at);
     s.effects.retain(Effect::warps_outline);
@@ -1760,11 +1843,12 @@ fn warp_shape(main: &mut Shape, effect: &Effect) {
             handles,
             corners,
             mapping,
+            reference,
         } => {
             if let Some(frame) = crate::envelope::Frame::from_parts(nodes, handles, corners) {
                 // Pictures bend through the same map, their pixels
                 // resampled (#3608); the outlines of the rest bend after.
-                let b = main.local_path().bounding_box();
+                let b = reference.unwrap_or_else(|| main.local_path().bounding_box());
                 if let Some(map) = crate::envelope::point_map(b, &frame, *mapping) {
                     let key = {
                         use std::hash::{Hash, Hasher};
@@ -1781,7 +1865,8 @@ fn warp_shape(main: &mut Shape, effect: &Effect) {
                         crate::bitmap_warp::bend(pic, m, key, &map)
                     });
                 }
-                reshape(main, &|p, b| {
+                reshape(main, &|p, own| {
+                    let b = reference.unwrap_or(own);
                     crate::envelope::apply_in(p, b, &frame, *keep_lines, *mapping)
                 });
             }
@@ -1997,6 +2082,16 @@ fn evaluate_now(shape: &Shape) -> Evaluated {
                 end_id,
                 options,
             } => {
+                // An end copy that keeps its envelope or perspective
+                // (#3969) is blended to as it is drawn.
+                let own_end = end;
+                let bent;
+                let end: &Shape = if end.effects.is_empty() || end_id.is_none() {
+                    end
+                } else {
+                    bent = evaluate(end).main;
+                    &bent
+                };
                 let by_parts = options
                     .by_parts
                     .then(|| {
@@ -2028,14 +2123,14 @@ fn evaluate_now(shape: &Shape) -> Evaluated {
                     // Bottom to top: the end (when the effect draws it),
                     // then the steps from the end's side to the start.
                     if end_id.is_none() {
-                        below.push((**end).clone());
+                        below.push((**own_end).clone());
                     }
                     below.extend(shapes.into_iter().rev());
                 } else {
                     above.extend(shapes);
                     // An end object of the drawing draws itself.
                     if end_id.is_none() {
-                        above.push((**end).clone());
+                        above.push((**own_end).clone());
                     }
                 }
             }
@@ -2408,6 +2503,9 @@ fn combine_group(main: &mut Shape, mode: crate::shaping::CombineMode) {
     let filled = |s: &&(BezPath, Shape)| !matches!(s.1.fill, crate::style::Fill::None);
     let paint = if mode == crate::shaping::CombineMode::BackMinusFront {
         areas.first()
+    } else if mode == crate::shaping::CombineMode::FrontMinusBack {
+        // The object cut is the top one.
+        areas.last()
     } else {
         areas.iter().rev().find(filled).or(areas.last())
     };
@@ -2489,6 +2587,7 @@ fn scribble_shape(
     });
     main.spline = None;
     main.spline_fixed.clear();
+    main.common_shape = None;
     main.node_types.clear();
     if pieces.len() == 1 {
         let (lines, _) = pieces.pop().unwrap_or_default();
@@ -2555,6 +2654,7 @@ fn reshape(shape: &mut Shape, f: &dyn Fn(&BezPath, Rect) -> BezPath) {
         shape.kind = ShapeKind::Group { children };
         shape.spline = None;
         shape.spline_fixed.clear();
+        shape.common_shape = None;
         shape.node_types.clear();
         return;
     }
@@ -2642,6 +2742,7 @@ fn set_path(shape: &mut Shape, path: BezPath) {
     // and its nodes are new (#647).
     shape.spline = None;
     shape.spline_fixed.clear();
+    shape.common_shape = None;
     shape.node_types.clear();
 }
 
@@ -4597,6 +4698,72 @@ pub fn take_group_perspectives(member: &mut Shape, group_path: &BezPath, group: 
     member.parked_effects = parked;
 }
 
+/// The envelopes of a group an object leaves (Ungroup), kept on the
+/// object so it stays bent as it was (#3714). Each maps the group's box
+/// as the envelopes before it left it, seen in the object's own space,
+/// and goes at the front of the object's stack, where the group's warp
+/// reached its outline. Only when the group's other effects bend nothing
+/// and the object is only moved and scaled in the group (the group's box
+/// is still a box in its space); otherwise nothing is carried.
+pub fn take_group_envelopes(member: &mut Shape, group_path: &BezPath, group: &[Effect]) {
+    if !group.iter().any(|e| matches!(e, Effect::Envelope { .. }))
+        || group
+            .iter()
+            .any(|e| e.warps_outline() && !matches!(e, Effect::Envelope { .. }))
+    {
+        return;
+    }
+    let [a, b, c, d, _, _] = member.transform.as_coeffs();
+    if b.abs() > 1e-9 || c.abs() > 1e-9 || a <= 1e-9 || d <= 1e-9 {
+        return;
+    }
+    let inv = member.transform.inverse();
+    let mut path = group_path.clone();
+    let mut taken = Vec::new();
+    for e in group {
+        let Effect::Envelope {
+            nodes,
+            keep_lines,
+            handles,
+            corners,
+            mapping,
+            reference,
+        } = e
+        else {
+            continue;
+        };
+        let Some(frame) = crate::envelope::Frame::from_parts(nodes, handles, corners) else {
+            continue;
+        };
+        let bx = reference.unwrap_or_else(|| path.bounding_box());
+        if bx.width() < 1e-9 || bx.height() < 1e-9 {
+            continue;
+        }
+        taken.push(Effect::Envelope {
+            nodes: nodes.iter().map(|p| inv * *p).collect(),
+            keep_lines: *keep_lines,
+            handles: handles.iter().map(|h| h.map(|p| inv * p)).collect(),
+            corners: corners.clone(),
+            mapping: *mapping,
+            reference: Some(Rect::from_points(
+                inv * Point::new(bx.x0, bx.y0),
+                inv * Point::new(bx.x1, bx.y1),
+            )),
+        });
+        path = crate::envelope::apply_in(&path, bx, &frame, *keep_lines, *mapping);
+    }
+    if taken.is_empty() {
+        return;
+    }
+    let mut stack = member.effect_stack();
+    for (i, e) in taken.into_iter().enumerate() {
+        stack.insert(i, (e, true));
+    }
+    let (effects, parked) = Shape::split_stack(stack);
+    member.effects = effects;
+    member.parked_effects = parked;
+}
+
 /// Solve the 8 parameters of a homography from 4 point pairs.
 pub fn homography(src: &[Point; 4], dst: &[Point; 4]) -> Option<[f64; 8]> {
     let mut m = [[0.0f64; 9]; 8];
@@ -5892,6 +6059,83 @@ mod tests {
         assert!((dx - 10.0).abs() < 1e-6, "{dx}");
     }
 
+    /// The kept evaluations are found by id first and hold more than 8
+    /// shapes: another id with the same content is worked out to the same
+    /// steps, and the first of 20 contoured shapes is still answered right
+    /// after the others (#3765).
+    #[test]
+    fn the_evaluation_cache_keys_by_id_and_content() {
+        let mut first = rect_shape();
+        first.effects.push(Effect::Contour {
+            steps: 1,
+            offset: 2.0,
+            outside: true,
+            to_center: false,
+            both: false,
+            fill_to: Color::WHITE,
+            outline_to: None,
+            fill_end_to: None,
+            color_blend: 0,
+            corners: Some(crate::shaping::Join::Miter),
+            accel_objects: 0.0,
+            accel_colors: 0.0,
+        });
+        let made = evaluate(&first);
+        let mut other = first.clone();
+        other.id = crate::ShapeId(first.id.0 + 1000);
+        assert_eq!(
+            evaluate(&other).below[0].bounds(),
+            made.below[0].bounds()
+        );
+        for k in 0..20u64 {
+            let mut s = first.clone();
+            s.id = crate::ShapeId(first.id.0 + 2000 + k);
+            s.transform = Affine::translate((k as f64, 0.0));
+            evaluate(&s);
+        }
+        assert_eq!(evaluate(&first).below[0].bounds(), made.below[0].bounds());
+    }
+
+    /// #4193: hundreds of objects keep their evaluations; past the limit
+    /// the one asked for longest ago goes, and one object keeps only its
+    /// latest few versions.
+    #[test]
+    fn the_evaluation_cache_holds_hundreds_and_drops_the_oldest() {
+        let ev = |s: &Shape| Evaluated {
+            below: Vec::new(),
+            main: s.clone(),
+            above: Vec::new(),
+        };
+        let mut kept = Evaluations::default();
+        let base = rect_shape();
+        let shape = |k: u64| {
+            let mut s = base.clone();
+            s.id = crate::ShapeId(base.id.0 + 10_000 + k);
+            s
+        };
+        for k in 0..400 {
+            kept.put(&shape(k), &ev(&shape(k)));
+        }
+        assert!((0..400).all(|k| kept.get(&shape(k)).is_some()));
+        // Asked for again, the first is newer than the second.
+        kept.get(&shape(0));
+        for k in 400..(EVALUATION_MEMORY as u64 + 1) {
+            kept.put(&shape(k), &ev(&shape(k)));
+        }
+        assert_eq!(kept.len, EVALUATION_MEMORY);
+        assert!(kept.get(&shape(0)).is_some());
+        assert!(kept.get(&shape(1)).is_none());
+        // Versions of one object.
+        let mut v = shape(0);
+        for x in 0..10 {
+            v.transform = Affine::translate((x as f64, 0.0));
+            kept.put(&v, &ev(&v));
+        }
+        assert_eq!(kept.by_id[&v.id].len(), VERSIONS_PER_OBJECT);
+        assert!(kept.get(&v).is_some());
+        assert_eq!(kept.len, kept.by_id.values().map(Vec::len).sum::<usize>());
+    }
+
     /// #2577: the contour of an open curve is a closed band round both
     /// sides of it, joined across its ends, not the outline of the area
     /// between the curve and the straight line from end to end.
@@ -6476,6 +6720,7 @@ mod tests {
                 handles: Vec::new(),
                 corners: Vec::new(),
                 mapping: crate::envelope::Mapping::Putty,
+                reference: None,
             });
             let main = evaluate(&s).main;
             let pic = match &main.kind {

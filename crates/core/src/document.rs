@@ -4,7 +4,7 @@
 use crate::geometry::{self, Affine, BezPath, Point, Rect, Shape as _, Vec2};
 use crate::id::{IdSource, LayerId, PageId, ShapeId};
 use crate::style::{Fill, Stroke};
-use crate::{Error, Result};
+use crate::{Error, PageRanges, Result};
 use serde::{Deserialize, Serialize};
 
 /// Hook for the text engine. The core cannot depend on fonts, so the app
@@ -191,6 +191,41 @@ pub mod text_outline {
     /// The glyphs of a text object, when a text engine is registered.
     pub fn glyphs(req: &TextRequest) -> Option<GlyphLayout> {
         GLYPHER.get().map(|f| f(req))
+    }
+
+    /// Result of resolving a run of raw glyph indices (`ETO_GLYPH_INDEX` in
+    /// Windows metafiles) against the font face they were shaped for:
+    /// decoded Unicode text when every glyph maps back through `cmap`, else
+    /// the placed glyph outlines in local millimetres (baseline at y = 0,
+    /// y up).
+    #[derive(Clone, Debug)]
+    pub enum ResolvedGlyphRun {
+        Text(String),
+        Path(BezPath),
+    }
+
+    /// Request to resolve a run of raw glyph indices (`ETO_GLYPH_INDEX`).
+    #[derive(Clone, Copy, Debug)]
+    pub struct GlyphRunRequest<'a> {
+        pub family: &'a str,
+        pub bold: bool,
+        pub italic: bool,
+        pub em_mm: f64,
+        pub gids: &'a [u16],
+        pub advances_mm: &'a [f64],
+    }
+
+    type GlyphRunResolver = fn(&GlyphRunRequest<'_>) -> Option<ResolvedGlyphRun>;
+    static GLYPH_RUN_RESOLVER: OnceLock<GlyphRunResolver> = OnceLock::new();
+
+    /// Register the font database's glyph-index resolver.
+    pub fn set_glyph_indices(f: GlyphRunResolver) {
+        let _ = GLYPH_RUN_RESOLVER.set(f);
+    }
+
+    /// Resolve `req.gids` against `(req.family, req.bold, req.italic)`.
+    pub fn resolve_glyph_indices(req: &GlyphRunRequest<'_>) -> Option<ResolvedGlyphRun> {
+        GLYPH_RUN_RESOLVER.get().and_then(|f| f(req))
     }
 }
 
@@ -2069,6 +2104,11 @@ pub struct ParagraphStyle {
     /// the first line's indent going to the right. Not in older files.
     #[serde(default, skip_serializing_if = "TextDirection::is_left_to_right")]
     pub direction: TextDirection,
+    /// How much of a justified line's room Arabic-script words take by
+    /// stretching their joins (kashida, #3827) instead of the spaces
+    /// between them. Off by default; not in older files.
+    #[serde(default, skip_serializing_if = "Kashida::is_off")]
+    pub kashida: Kashida,
     /// The paragraph frame's background; `None` = transparent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_fill: Option<Fill>,
@@ -2077,6 +2117,12 @@ pub struct ParagraphStyle {
     /// [`crate::text_flow`]); not saved.
     #[serde(skip)]
     pub flow: crate::text_flow::FrameFlow,
+    /// The closed shape this frame's text was put into (Text > Text
+    /// Frame > Put Text Inside Shape): its lines stay inside that
+    /// shape's outline, wherever the two stand. `None`, or a shape that
+    /// is gone: the plain rectangular frame. Not in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside: Option<ShapeId>,
     /// Which bullets this text draws when it is one part of a text drawn
     /// in parts ([`Shape::text_parts`], #3682); `None` (a whole text):
     /// every bullet, in its paragraph's first letter's look. Set only on
@@ -2266,6 +2312,14 @@ impl LeadingUnit {
 }
 
 impl ParagraphStyle {
+    /// The room kept between the outline of the shape the text was put
+    /// into ([`ParagraphStyle::inside`]) and its lines, mm.
+    pub fn inside_inset(&self) -> f64 {
+        1.0
+    }
+}
+
+impl ParagraphStyle {
     /// The distance from one baseline to the next, mm, for a line whose
     /// font has `line_height_mm` from ascent to descent plus gap at a size
     /// of `size_mm`.
@@ -2340,6 +2394,42 @@ impl TextDirection {
     }
 }
 
+/// How a justified paragraph in Arabic script fills its lines (see
+/// [`ParagraphStyle::kashida`], #3827): only by widening the spaces
+/// between words (`Off`), or also by stretching the joins between
+/// connected letters (kashida), a little (`Low`), more (`Medium`) or as
+/// far as the line needs (`High`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kashida {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Kashida {
+    /// Every setting, in the order a list shows them.
+    pub const ALL: [Kashida; 4] = [Kashida::Off, Kashida::Low, Kashida::Medium, Kashida::High];
+
+    pub fn is_off(&self) -> bool {
+        *self == Kashida::Off
+    }
+
+    /// The share of a line's room the stretched joins take (the rest
+    /// widens the spaces), and the most one join is stretched by, in ems
+    /// of the font size.
+    pub fn share_and_cap(self) -> (f64, f64) {
+        match self {
+            Kashida::Off => (0.0, 0.0),
+            Kashida::Low => (0.35, 0.5),
+            Kashida::Medium => (0.7, 1.0),
+            Kashida::High => (1.0, 2.5),
+        }
+    }
+}
+
 /// Where paragraph text sits in its frame (the Text docker's Frame
 /// section): at the top, in the middle or at the bottom of the room its
 /// lines leave. Text that overflows the frame starts at the top.
@@ -2385,9 +2475,11 @@ impl Default for ParagraphStyle {
             vertical: false,
             vertical_columns: VerticalColumns::RightToLeft,
             direction: TextDirection::LeftToRight,
+            kashida: Kashida::Off,
             frame_fill: None,
             bullet_part: None,
             flow: crate::text_flow::FrameFlow::default(),
+            inside: None,
         }
     }
 }
@@ -2750,6 +2842,11 @@ pub struct Table {
     /// boxes, mm; `None` = cells share their borders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacing: Option<[f64; 2]>,
+    /// The spreadsheet workbook (`.xlsx` bytes) the table was imported
+    /// from, or last edited in with the spreadsheet app (#4143): saved
+    /// with the drawing so the sheet can be opened again as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_xlsx: Option<crate::SharedBytes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2769,6 +2866,9 @@ pub struct TableCell {
     /// Border of each side; the table's border where unset.
     #[serde(default, skip_serializing_if = "crate::table::CellBorders::is_default")]
     pub borders: crate::table::CellBorders,
+    /// Where the text sits in the cell from top to bottom (#3859).
+    #[serde(default, skip_serializing_if = "crate::table::is_top")]
+    pub valign: VerticalAlign,
 }
 
 fn one_u32() -> u32 {
@@ -2796,6 +2896,7 @@ impl Table {
             padding: 1.0,
             margins: None,
             spacing: None,
+            source_xlsx: None,
         }
     }
 
@@ -3375,6 +3476,14 @@ pub struct Shape {
     /// of [`Shape::spline`] (#1758).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spline_fixed: Vec<bool>,
+    /// The settings of a curve drawn with the Common Shapes tool (#4045):
+    /// which shape it is, the box it was drawn into and its adjustments,
+    /// so the Shape tool shows its handles and dragging one draws the
+    /// shape again ([`Command::SetCommonShape`]). Any other change to the
+    /// curve's outline, and Convert To Curves, drops them and leaves an
+    /// ordinary curve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_shape: Option<Box<CommonShapeParams>>,
     /// The object's identity across saves, undo and moves between
     /// drawings (see [`Uid`]); the engine gives one to every object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3683,6 +3792,20 @@ impl ScaleGrid {
     }
 }
 
+/// The settings of a shape of the Common Shapes tool (see
+/// [`Shape::common_shape`]). The application draws the outline from
+/// them; the document only keeps them with the curve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommonShapeParams {
+    /// The shape, by the key of its name (such as `shape.arrow`).
+    pub shape: String,
+    /// The box it is drawn into, in local space.
+    pub rect: Rect,
+    /// Its adjustments, in the order the shape defines them.
+    #[serde(default)]
+    pub values: Vec<f64>,
+}
+
 /// How a clip frame masks its contents (see `Shape::opacity_mask`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OpacityMask {
@@ -3792,6 +3915,7 @@ impl Shape {
             node_types: std::collections::BTreeMap::new(),
             spline: None,
             spline_fixed: Vec::new(),
+            common_shape: None,
             uid: None,
             opacity_mask: None,
             group_look: None,
@@ -4578,7 +4702,10 @@ impl Shape {
                                     inner.height().max(0.1),
                                 )),
                                 align: cell.align,
-                                para: ParagraphStyle::default(),
+                                para: ParagraphStyle {
+                                    vertical_align: cell.valign,
+                                    ..ParagraphStyle::default()
+                                },
                                 on_path: None,
                             },
                         );
@@ -4626,7 +4753,7 @@ impl Shape {
         match &self.kind {
             // A B-spline becomes an ordinary curve: its nodes instead of
             // its control points.
-            ShapeKind::Path { .. } => self.spline.is_some(),
+            ShapeKind::Path { .. } => self.spline.is_some() || self.common_shape.is_some(),
             ShapeKind::Bitmap { .. } => false,
             ShapeKind::Group { children } => {
                 let warps = !self.outline_stays_live();
@@ -4689,6 +4816,7 @@ impl Shape {
             out.node_types.clear();
             out.spline = None;
             out.spline_fixed.clear();
+            out.common_shape = None;
             changed = true;
         }
         if !container {
@@ -4833,6 +4961,7 @@ impl Shape {
                     self.node_types.clear();
                     self.spline = None;
                     self.spline_fixed.clear();
+                    self.common_shape = None;
                 }
                 if bake && !container {
                     if let Some(b) = crate::live::bake_outline_warps(self) {
@@ -4892,6 +5021,7 @@ impl Shape {
                     self.node_types.clear();
                     self.spline = None;
                     self.spline_fixed.clear();
+                    self.common_shape = None;
                 }
                 if bake && !container {
                     if let Some(b) = crate::live::bake_outline_warps(self) {
@@ -4918,6 +5048,79 @@ impl Shape {
             }
             _ => self.local_path(),
         }
+    }
+
+    /// `self` is or holds (in groups and clip frames, up to eight levels
+    /// deep) a symbol instance.
+    pub fn holds_symbol_instance(&self) -> bool {
+        const DEEPEST: usize = 8;
+        fn holds(s: &Shape, depth: usize) -> bool {
+            depth <= DEEPEST
+                && match &s.kind {
+                    ShapeKind::SymbolInstance { .. } => true,
+                    ShapeKind::Group { children } => children.iter().any(|c| holds(c, depth + 1)),
+                    ShapeKind::ClipFrame { frame, contents } => {
+                        holds(frame, depth + 1) || contents.iter().any(|c| holds(c, depth + 1))
+                    }
+                    _ => false,
+                }
+        }
+        holds(self, 0)
+    }
+
+    /// `self` with every symbol instance it is or holds (in groups, clip
+    /// frames and nested symbol definitions, up to eight levels deep)
+    /// replaced by its symbol's objects placed as the instance places
+    /// them. `None` when `self` holds no instance.
+    pub fn with_symbols_drawn(&self, symbols: &[Symbol]) -> Option<Shape> {
+        fn drawn(s: &Shape, symbols: &[Symbol], depth: usize) -> Shape {
+            const DEEPEST: usize = 8;
+            if depth > DEEPEST {
+                return s.clone();
+            }
+            match &s.kind {
+                ShapeKind::SymbolInstance { .. } => match s.expand(symbols).into_iter().next() {
+                    Some(exp) => {
+                        let mut d = drawn(&exp, symbols, depth + 1);
+                        d.absorb(s.transform);
+                        if !s.effects.is_empty() {
+                            let mut g = s.clone();
+                            g.kind = ShapeKind::Group { children: vec![d] };
+                            g.transform = Affine::IDENTITY;
+                            g
+                        } else {
+                            d.id = s.id;
+                            d
+                        }
+                    }
+                    None => s.clone(),
+                },
+                ShapeKind::Group { children } => {
+                    let mut g = s.clone();
+                    g.kind = ShapeKind::Group {
+                        children: children
+                            .iter()
+                            .map(|c| drawn(c, symbols, depth + 1))
+                            .collect(),
+                    };
+                    g
+                }
+                ShapeKind::ClipFrame { frame, contents } => {
+                    let mut c = s.clone();
+                    c.kind = ShapeKind::ClipFrame {
+                        frame: Box::new(drawn(frame, symbols, depth + 1)),
+                        contents: contents
+                            .iter()
+                            .map(|k| drawn(k, symbols, depth + 1))
+                            .collect(),
+                    };
+                    c
+                }
+                _ => s.clone(),
+            }
+        }
+        self.holds_symbol_instance()
+            .then(|| drawn(self, symbols, 0))
     }
 
     /// Apply `t` to the object (in the space its transform maps to): its
@@ -5081,6 +5284,35 @@ impl Shape {
                     .unwrap_or_else(|| self.local_path().bounding_box())
             }
             ShapeKind::ClipFrame { frame, .. } => frame.bounds(),
+            // A text's box from the engine's cached outline box, moved as
+            // `local_path` moves the outline (a plain shift): copying the
+            // outline of every letter only to measure it cost most of the
+            // time on drawings with thousands of labels (#4192).
+            ShapeKind::Text {
+                spans,
+                origin,
+                frame,
+                align,
+                para,
+                on_path,
+            } => {
+                let req = text_outline::TextRequest {
+                    spans,
+                    frame: *frame,
+                    align: *align,
+                    para,
+                    on_path: on_path.as_ref(),
+                };
+                let shift = if on_path.is_some() {
+                    Affine::translate(origin.to_vec2())
+                } else {
+                    text_layout_shift(*origin, *frame, false, para.columns_from_right())
+                };
+                match text_outline::bounds(&req) {
+                    Some(r) => shift.transform_rect_bbox(r),
+                    None => self.local_path().bounding_box(),
+                }
+            }
             _ => match self.kind.known_box() {
                 Some(r) => r,
                 None => self.local_path().bounding_box(),
@@ -5212,6 +5444,9 @@ pub struct Layer {
     /// For master layers: which pages show this layer.
     #[serde(default)]
     pub scope: MasterScope,
+    /// For master layers: the document positions where the layer appears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_range: Option<PageRanges>,
     /// For master layers: drawn in front of the page's own layers
     /// instead of behind them (#1132).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -5941,26 +6176,83 @@ pub struct PageNumberField {
     pub prefix: String,
     #[serde(default)]
     pub suffix: String,
+    /// The last pages, this many of them, show no number, such as a back
+    /// cover (#3789).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub skip_last: usize,
+    /// Pages left without a number ("5, 9-10", from 1); the numbering
+    /// goes on after them without counting them (#3789).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skip: String,
 }
 
 fn first_numbered_page() -> usize {
     1
 }
 
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+impl Default for PageNumberField {
+    fn default() -> Self {
+        PageNumberField {
+            start_at: 1,
+            first_page: 1,
+            style: 0,
+            prefix: String::new(),
+            suffix: String::new(),
+            skip_last: 0,
+            skip: String::new(),
+        }
+    }
+}
+
 impl PageNumberField {
     /// The page at `index` (0-based) shows a number: it is not one of
     /// the pages before the first numbered page (#2127).
     pub fn numbers(&self, index: usize) -> bool {
+        self.numbers_in(index, usize::MAX)
+    }
+
+    /// The page at `index` (0-based) of a drawing of `pages` pages shows
+    /// a number: it is not before the first numbered page (#2127), nor
+    /// one of the last pages left out or one of the pages listed to skip
+    /// (#3789).
+    pub fn numbers_in(&self, index: usize, pages: usize) -> bool {
         index + 1 >= self.first_page.max(1)
+            && index < pages.saturating_sub(self.skip_last)
+            && !self.skips(index)
+    }
+
+    /// The page at `index` is one of the pages listed to skip.
+    fn skips(&self, index: usize) -> bool {
+        !self.skip.trim().is_empty() && parse_page_range(&self.skip, index + 1).contains(&index)
     }
 
     /// The text for the page at `index` (0-based): empty on the pages
     /// before the first numbered page (#2127).
     pub fn label(&self, index: usize) -> String {
-        if !self.numbers(index) {
+        self.label_in(index, usize::MAX)
+    }
+
+    /// The text for the page at `index` (0-based) of a drawing of `pages`
+    /// pages: empty on a page that shows no number; the pages skipped
+    /// before it are not counted (#3789).
+    pub fn label_in(&self, index: usize, pages: usize) -> String {
+        if !self.numbers_in(index, pages) {
             return String::new();
         }
-        let n = self.start_at + index as i64 - (self.first_page.max(1) as i64 - 1);
+        let first = self.first_page.max(1) - 1;
+        let skipped = if self.skip.trim().is_empty() {
+            0
+        } else {
+            parse_page_range(&self.skip, index + 1)
+                .into_iter()
+                .filter(|i| *i >= first && *i < index)
+                .count()
+        };
+        let n = self.start_at + index as i64 - first as i64 - skipped as i64;
         let body = match self.style {
             1 => roman(n),
             2 => roman(n).to_lowercase(),
@@ -6032,8 +6324,14 @@ impl Shape {
     /// Page number fields in this object show the number of the page at
     /// `index` (0-based).
     pub fn show_page_number(&mut self, index: usize) {
+        self.show_page_number_of(index, usize::MAX);
+    }
+
+    /// Page number fields in this object show the number of the page at
+    /// `index` (0-based) of a drawing of `pages` pages (#3789).
+    pub fn show_page_number_of(&mut self, index: usize, pages: usize) {
         if let (Some(f), ShapeKind::Text { spans, .. }) = (&self.page_number, &mut self.kind) {
-            let label = f.label(index);
+            let label = f.label_in(index, pages);
             spans.truncate(1);
             if let Some(first) = spans.first_mut() {
                 first.text = label;
@@ -6041,13 +6339,22 @@ impl Shape {
         }
         if let ShapeKind::Group { children } = &mut self.kind {
             for c in children {
-                c.show_page_number(index);
+                c.show_page_number_of(index, pages);
             }
         }
     }
 }
 
 impl Layer {
+    /// Whether this master layer appears at the 0-based page position.
+    pub fn applies_to(&self, index: usize) -> bool {
+        self.scope.applies(index)
+            && self
+                .page_range
+                .as_ref()
+                .is_none_or(|range| range.contains(index))
+    }
+
     pub fn master(id: LayerId, name: impl Into<String>, scope: MasterScope) -> Self {
         let mut l = Layer::new(id, name);
         l.scope = scope;
@@ -6063,6 +6370,7 @@ impl Layer {
             locked: false,
             shapes: Vec::new(),
             scope: MasterScope::All,
+            page_range: None,
             in_front: false,
             desktop: false,
         }
@@ -6187,7 +6495,7 @@ impl GuideStyle {
 
 /// A guideline on a page: its line, and how it looks. A guideline
 /// without its own colour uses the document's default guideline colour.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Guide {
     #[serde(flatten)]
     pub line: GuideLine,
@@ -6202,6 +6510,10 @@ pub struct Guide {
     /// or snapped to, while the others of its set show (#1775).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// The name given in the Objects docker (Rename), shown in its row
+    /// instead of where the guideline is (#3574).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl From<GuideLine> for Guide {
@@ -6212,6 +6524,7 @@ impl From<GuideLine> for Guide {
             style: GuideStyle::default(),
             locked: false,
             hidden: false,
+            name: None,
         }
     }
 }
@@ -6239,13 +6552,16 @@ impl Guide {
     pub fn through(&self, p: crate::geometry::Point) -> Guide {
         Guide {
             line: self.line.through(p),
-            ..*self
+            ..self.clone()
         }
     }
 
     /// The same guideline with another line.
     pub fn with_line(&self, line: GuideLine) -> Guide {
-        Guide { line, ..*self }
+        Guide {
+            line,
+            ..self.clone()
+        }
     }
 }
 
@@ -6312,6 +6628,10 @@ pub struct RulerSettings {
     /// or "m"), kept for the dialog; empty for millimetres.
     pub scale_page_units: String,
     pub scale_world_units: String,
+    /// The vertical ruler counts from the top of the page downwards, its
+    /// origin mirrored within the page (#3872); off: from the bottom up.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub vertical_from_top: bool,
 }
 
 impl Default for RulerSettings {
@@ -6324,11 +6644,24 @@ impl Default for RulerSettings {
             scale_world: 1.0,
             scale_page_units: String::new(),
             scale_world_units: String::new(),
+            vertical_from_top: false,
         }
     }
 }
 
 impl RulerSettings {
+    /// The page y (mm) the vertical ruler counts from on a page whose
+    /// bottom and top are `bottom` and `top`: the origin, or with the
+    /// ruler counting from the top the origin mirrored within the page,
+    /// so the default origin lies at the top edge (#3872).
+    pub fn vertical_zero(&self, bottom: f64, top: f64) -> f64 {
+        if self.vertical_from_top {
+            top + bottom - self.origin_y
+        } else {
+            self.origin_y
+        }
+    }
+
     /// World millimetres per page millimetre: 1 for a 1:1 drawing, 100 for
     /// 1:100. Never zero, negative or infinite (1 then).
     pub fn world_per_page(&self) -> f64 {
@@ -6453,6 +6786,10 @@ pub struct Document {
     /// Review comments pinned to the pages (never printed or exported).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    /// Name and value pairs scripts and plugins keep with the drawing
+    /// (`ActiveDocument.Data`, #4137), like an object's own data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<(String, String)>,
     /// Where the object found last by its id lay, so looking up the
     /// objects of a selection one after the other does not walk the
     /// whole drawing for each (never saved, never compared).
@@ -6808,6 +7145,19 @@ fn find_in(s: &Shape, id: ShapeId) -> Option<&Shape> {
     }
 }
 
+fn wraps_along_path(s: &Shape, id: ShapeId) -> Option<bool> {
+    if s.id == id {
+        return Some(s.wrap_text);
+    }
+    let child = match &s.kind {
+        ShapeKind::Group { children } => children.iter().find_map(|c| wraps_along_path(c, id)),
+        ShapeKind::ClipFrame { frame, contents } => wraps_along_path(frame, id)
+            .or_else(|| contents.iter().find_map(|c| wraps_along_path(c, id))),
+        _ => None,
+    }?;
+    Some(s.wrap_text || child)
+}
+
 impl Default for Document {
     fn default() -> Self {
         Document::new("Untitled", paper::A4)
@@ -6851,6 +7201,7 @@ impl Document {
             cmyk_profile: None,
             inks: Vec::new(),
             comments: Vec::new(),
+            data: Vec::new(),
             find_hint: FindHint::default(),
         }
     }
@@ -6888,6 +7239,38 @@ impl Document {
         self.master
             .iter()
             .chain(self.pages.iter().flat_map(|p| &p.layers))
+    }
+
+    /// The layer number `k` of [`Document::all_layers`], without walking
+    /// the layers before it: only the pages are counted (each lookup of
+    /// an object walked every layer of a drawing of thousands of pages,
+    /// which made filling a large print merge slow).
+    fn nth_layer(&self, mut k: usize) -> Option<&Layer> {
+        if k < self.master.len() {
+            return self.master.get(k);
+        }
+        k -= self.master.len();
+        for p in &self.pages {
+            if k < p.layers.len() {
+                return p.layers.get(k);
+            }
+            k -= p.layers.len();
+        }
+        None
+    }
+
+    fn nth_layer_mut(&mut self, mut k: usize) -> Option<&mut Layer> {
+        if k < self.master.len() {
+            return self.master.get_mut(k);
+        }
+        k -= self.master.len();
+        for p in &mut self.pages {
+            if k < p.layers.len() {
+                return p.layers.get_mut(k);
+            }
+            k -= p.layers.len();
+        }
+        None
     }
 
     pub fn all_layers_mut(&mut self) -> impl Iterator<Item = &mut Layer> {
@@ -7010,7 +7393,7 @@ impl Document {
             .iter()
             .chain(own.iter())
             .filter(|g| !g.hidden)
-            .copied()
+            .cloned()
             .collect())
     }
 
@@ -7028,7 +7411,7 @@ impl Document {
         let masters = |front: bool| {
             self.master
                 .iter()
-                .filter(move |l| l.scope.applies(idx) && l.in_front == front)
+                .filter(move |l| l.applies_to(idx) && l.in_front == front)
         };
         let mut out: Vec<&Layer> = masters(false).collect();
         out.extend(self.pages[idx].layers.iter());
@@ -7043,6 +7426,7 @@ impl Document {
     pub fn layers_drawn_for_page(&self, page: PageId) -> Result<Vec<std::borrow::Cow<'_, Layer>>> {
         use std::borrow::Cow;
         let idx = self.page_index(page)?;
+        let count = self.pages.len();
         // The headings, found once for the tables of contents (#1660).
         let entries = std::cell::OnceCell::new();
         Ok(self
@@ -7055,11 +7439,11 @@ impl Document {
                     let mut l = l.clone();
                     if master {
                         l.shapes
-                            .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers(idx)));
+                            .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers_in(idx, count)));
                     }
                     for s in &mut l.shapes {
                         if master {
-                            s.show_page_number(idx);
+                            s.show_page_number_of(idx, count);
                         }
                         s.show_toc(entries);
                     }
@@ -7069,9 +7453,9 @@ impl Document {
                     // A field on a page before the first numbered page
                     // is left out (#2127).
                     l.shapes
-                        .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers(idx)));
+                        .retain(|s| s.page_number.as_ref().is_none_or(|f| f.numbers_in(idx, count)));
                     for s in &mut l.shapes {
-                        s.show_page_number(idx);
+                        s.show_page_number_of(idx, count);
                     }
                     Cow::Owned(l)
                 } else {
@@ -7103,14 +7487,13 @@ impl Document {
     /// Find a top-level shape and the layer holding it.
     pub fn shape(&self, id: ShapeId) -> Result<(&Layer, &Shape)> {
         let (k, i) = self.locate_on_layer(id).ok_or(Error::ShapeNotFound(id))?;
-        let layer = self.all_layers().nth(k).ok_or(Error::ShapeNotFound(id))?;
+        let layer = self.nth_layer(k).ok_or(Error::ShapeNotFound(id))?;
         Ok((layer, &layer.shapes[i]))
     }
 
     pub fn shape_mut(&mut self, id: ShapeId) -> Result<&mut Shape> {
         let (k, i) = self.locate_on_layer(id).ok_or(Error::ShapeNotFound(id))?;
-        self.all_layers_mut()
-            .nth(k)
+        self.nth_layer_mut(k)
             .and_then(|l| l.shapes.get_mut(i))
             .ok_or(Error::ShapeNotFound(id))
     }
@@ -7120,7 +7503,7 @@ impl Document {
     /// and the places next to it, first (see [`FindHint`]).
     fn locate_on_layer(&self, id: ShapeId) -> Option<(usize, usize)> {
         let (k, i) = self.find_hint.get();
-        if let Some(layer) = self.all_layers().nth(k) {
+        if let Some(layer) = self.nth_layer(k) {
             for j in [i, i + 1, i.wrapping_sub(1)] {
                 if layer.shapes.get(j).is_some_and(|s| s.id == id) {
                     self.find_hint.set(k, j);
@@ -7140,15 +7523,26 @@ impl Document {
     /// Position of a shape: (layer id, index inside the layer).
     pub fn locate(&self, id: ShapeId) -> Result<(LayerId, usize)> {
         let (k, i) = self.locate_on_layer(id).ok_or(Error::ShapeNotFound(id))?;
-        let layer = self.all_layers().nth(k).ok_or(Error::ShapeNotFound(id))?;
+        let layer = self.nth_layer(k).ok_or(Error::ShapeNotFound(id))?;
         Ok((layer.id, i))
     }
 
     /// Find any shape, including children of groups and clip frames.
     pub fn find_shape(&self, id: ShapeId) -> Option<&Shape> {
         let (k, i) = self.locate_top(id)?;
-        let top = self.all_layers().nth(k)?.shapes.get(i)?;
+        let top = self.nth_layer(k)?.shapes.get(i)?;
         find_in(top, id)
+    }
+
+    /// True when `id` or an enclosing group or clip frame has `wrap_text` on.
+    pub fn shape_or_ancestor_wraps_text(&self, id: ShapeId) -> bool {
+        let Some((k, i)) = self.locate_top(id) else {
+            return false;
+        };
+        self.nth_layer(k)
+            .and_then(|l| l.shapes.get(i))
+            .and_then(|top| wraps_along_path(top, id))
+            .unwrap_or(false)
     }
 
     /// The layer number and the place on it of the object on a layer
@@ -7158,7 +7552,7 @@ impl Document {
     /// whole drawing to be found, so moving them all took seconds).
     fn locate_top(&self, id: ShapeId) -> Option<(usize, usize)> {
         let (k, i) = self.find_hint.get();
-        if let Some(layer) = self.all_layers().nth(k) {
+        if let Some(layer) = self.nth_layer(k) {
             if layer
                 .shapes
                 .get(i)
@@ -7177,8 +7571,7 @@ impl Document {
         // there.
         if let Some((k, i)) = self.find_hint.top(id) {
             if self
-                .all_layers()
-                .nth(k)
+                .nth_layer(k)
                 .and_then(|l| l.shapes.get(i))
                 .is_some_and(|s| s.id == id)
             {
@@ -7255,7 +7648,7 @@ impl Document {
             }
         }
         let (k, i) = self.locate_top(id)?;
-        let top = self.all_layers_mut().nth(k)?.shapes.get_mut(i)?;
+        let top = self.nth_layer_mut(k)?.shapes.get_mut(i)?;
         walk(top, id)
     }
 
@@ -7277,7 +7670,7 @@ impl Document {
             }
         }
         let (k, i) = self.locate_top(id)?;
-        let top = self.all_layers().nth(k)?.shapes.get(i)?;
+        let top = self.nth_layer(k)?.shapes.get(i)?;
         walk(top, id, Affine::IDENTITY)
     }
 
@@ -7322,7 +7715,7 @@ impl Document {
             return Vec::new();
         };
         let mut path = Vec::new();
-        match self.all_layers().nth(k).and_then(|l| l.shapes.get(i)) {
+        match self.nth_layer(k).and_then(|l| l.shapes.get(i)) {
             Some(top) if walk(top, id, &mut path) => path,
             _ => Vec::new(),
         }
@@ -7337,7 +7730,7 @@ impl Document {
     /// layer).
     pub fn top_level_of(&self, id: ShapeId) -> Option<ShapeId> {
         let (k, i) = self.locate_top(id)?;
-        self.all_layers().nth(k)?.shapes.get(i).map(|s| s.id)
+        self.nth_layer(k)?.shapes.get(i).map(|s| s.id)
     }
 
     /// Union of all shape bounds on a page, or None when the page is empty.
@@ -7654,6 +8047,18 @@ impl Document {
     }
 
     fn from_json_here(s: &str) -> Result<Self> {
+        // Read straight from the text when it can be: every step of
+        // `migrate` keeps the layout, so a file of any version reads as
+        // it is. A drawing's JSON taken in as a value first held several
+        // times the text in memory: a 246 MB file with large drawings
+        // took more than 20 GB to open (#3833). A file that does not read
+        // this way (a number written as null, a wrong table) goes the
+        // long way below, which mends what it can or says what is wrong.
+        if STEPS_KEEP_LAYOUT {
+            if let Some(doc) = Self::from_json_text(s) {
+                return Ok(doc.opened());
+            }
+        }
         let mut v: serde_json::Value = json_value(s)?;
         let from = tdraw_version(&v);
         migrate(&mut v, from);
@@ -7673,15 +8078,44 @@ impl Document {
             }
         }
         let _table = crate::bytes::ReadingTable::start(blobs);
-        let mut doc: Document = match Document::deserialize(&v) {
+        let doc: Document = match Document::deserialize(&v) {
             Ok(doc) => doc,
             Err(e) => numbers_lost_as_zero(v, e)?,
         };
+        Ok(doc.opened())
+    }
+
+    /// The drawing `s` holds, read from the text without a JSON value in
+    /// between (#3833): first the table of pictures and fonts at its end
+    /// (the rest skipped over), then the drawing, its pictures looked up
+    /// in the table. `None` when the text does not read this way.
+    fn from_json_text(s: &str) -> Option<Self> {
+        if json_depth(s) > MAX_JSON_DEPTH {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct Table {
+            #[serde(default)]
+            blobs: Vec<String>,
+        }
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        let table = Table::deserialize(&mut de).ok()?;
+        let _table = crate::bytes::ReadingTable::start(table.blobs);
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        let doc = Document::deserialize(&mut de).ok()?;
+        de.end().ok()?;
+        Some(doc)
+    }
+
+    /// A drawing just read, with what a file does not save worked out.
+    fn opened(mut self) -> Self {
         // What text wraps around is not saved: work it out again.
-        doc.refresh_text_flow();
-        doc.refit_text_meshes();
-        doc.break_symbol_loops();
-        Ok(doc)
+        self.refresh_text_flow();
+        self.refit_text_meshes();
+        self.break_symbol_loops();
+        self
     }
 
     /// Stretch the mesh fill of every text whose grid lies inside the
@@ -7946,8 +8380,38 @@ pub fn tdraw_version(v: &serde_json::Value) -> u32 {
 }
 
 /// The version a `.tdraw` text says it has (0 for unreadable text).
+/// Only that number is read, the rest of the text skipped over: taking
+/// the whole drawing in as a JSON value for it held several times the
+/// text in memory just before the drawing was read (#3833).
 pub fn tdraw_text_version(s: &str) -> u32 {
-    json_value(s).map(|v| tdraw_version(&v)).unwrap_or(0)
+    #[derive(Deserialize)]
+    struct Version {
+        #[serde(default)]
+        format_version: Option<u64>,
+    }
+    let read = || {
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        Version::deserialize(&mut de).ok()
+    };
+    let version = if json_depth(s) > SHALLOW_JSON_DEPTH {
+        on_deep_stack(read)
+    } else {
+        read()
+    };
+    match version {
+        Some(Version {
+            format_version: Some(n),
+        }) => {
+            let n = if n == SAME_AS_ZERO { 0 } else { n };
+            n.min(u64::from(u32::MAX)) as u32
+        }
+        Some(Version {
+            format_version: None,
+        }) => 0,
+        // Not a whole number, or text that is not JSON: as before.
+        None => json_value(s).map(|v| tdraw_version(&v)).unwrap_or(0),
+    }
 }
 
 /// One step of [`migrate`]: the JSON of version `i` to version `i + 1`.
@@ -7963,6 +8427,11 @@ const STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
 const DOWN_STEPS: [Step; TDRAW_FORMAT_VERSION as usize] = [same_layout, same_layout];
 
 fn same_layout(_: &mut serde_json::Value) {}
+
+/// Every one of [`STEPS`] is [`same_layout`], so `Document::from_json`
+/// reads a file of any version straight from its text. A step that
+/// changes the layout must set this to false.
+const STEPS_KEEP_LAYOUT: bool = true;
 
 /// The TraceDraw release that first wrote each `.tdraw` format version
 /// (`TDRAW_RELEASES[v]`), for Save As. Version 1 is not offered: it has
@@ -8603,6 +9072,7 @@ mod tests {
                     padding: 0.0,
                     margins: None,
                     spacing: None,
+                    source_xlsx: None,
                 }),
             ),
         ];
@@ -8660,6 +9130,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn page_numbers_skip_the_last_pages_and_listed_pages_without_counting_them() {
+        let f = PageNumberField {
+            first_page: 2,
+            skip_last: 1,
+            skip: "4-5".into(),
+            ..Default::default()
+        };
+        let labels: Vec<String> = (0..8).map(|i| f.label_in(i, 8)).collect();
+        assert_eq!(labels, ["", "1", "2", "", "", "3", "4", ""]);
+        assert!(!f.numbers_in(7, 8) && f.numbers_in(6, 8));
+        // Saved before: no pages skipped.
+        let old: PageNumberField =
+            serde_json::from_str(r#"{"start_at":1,"first_page":1,"style":0}"#).unwrap();
+        assert_eq!(old, PageNumberField::default());
+        assert_eq!(old.label_in(4, 5), "5");
     }
 
     /// Round numbers map exactly: the quick box is bit-for-bit the
@@ -9644,6 +10132,53 @@ mod tests {
         p
     }
 
+    #[test]
+    fn tdraw_files_read_straight_from_their_text() {
+        // A drawing reads from its text without a JSON value in between,
+        // packed or plain, to the drawing the long way gives; the long way
+        // stays for what only it mends (#3833).
+        let mut doc = Document::new("Straight", crate::geometry::Size::new(100.0, 50.0));
+        let layer = doc.pages[0].layers[0].id;
+        for i in 0..3 {
+            let id = doc.ids_mut().shape();
+            let mut path = BezPath::new();
+            path.move_to((f64::from(i), 1.5));
+            path.curve_to((2.25, 3.0), (4.0, 5.125), (6.0, 7.0));
+            let s = Shape::new(
+                id,
+                ShapeKind::Path {
+                    path,
+                    closed: i % 2 == 0,
+                },
+            );
+            doc.layer_mut(layer).expect("layer").shapes.push(s);
+        }
+        let mut packed = Vec::new();
+        doc.write_tdraw_version(&mut packed, TDRAW_FORMAT_VERSION)
+            .expect("write");
+        for text in [
+            tdraw_text(&packed).expect("text"),
+            doc.to_json_version(0).expect("plain"),
+        ] {
+            let straight = Document::from_json_text(&text).expect("straight");
+            assert_eq!(straight.opened(), doc);
+            assert_eq!(Document::from_json(&text).expect("reads"), doc);
+        }
+        // The version alone is read the short way too, as the long way
+        // reads it.
+        assert_eq!(tdraw_text_version(&tdraw_text(&packed).expect("text")), TDRAW_FORMAT_VERSION);
+        assert_eq!(tdraw_text_version(&doc.to_json_version(0).expect("plain")), 0);
+        assert_eq!(tdraw_text_version("{\"format_version\": 1}"), 0);
+        assert_eq!(tdraw_text_version("{\"format_version\": 2.5}"), 0);
+        assert_eq!(tdraw_text_version("not json"), 0);
+        // A number lost as null reads only the long way, as 0.
+        let text = doc.to_json_version(0).expect("plain");
+        let lost = text.replacen("1.5", "null", 1);
+        assert!(Document::from_json_text(&lost).is_none());
+        let back = Document::from_json(&lost).expect("mended");
+        assert_eq!(back.pages[0].layers[0].shapes.len(), 3);
+    }
+
     /// A saved drawing is packed (#2849): each distinct picture and font
     /// once however many objects hold it, the whole JSON gzip-compressed;
     /// it reads back the same, with the copies sharing one buffer again.
@@ -9700,6 +10235,8 @@ mod tests {
         let table: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(table[BLOBS_KEY].as_array().map(Vec::len), Some(2));
         assert_eq!(tdraw_text_version(&text), TDRAW_FORMAT_VERSION);
+        // Read straight from the text, with the table (#3833).
+        assert!(Document::from_json_text(&text).is_some());
         let back = Document::from_tdraw_bytes(&packed).expect("reads");
         let pictures: Vec<&crate::SharedBytes> = back.pages[0].layers[0]
             .shapes
@@ -9934,6 +10471,7 @@ mod tests {
             style: GuideStyle::Dotted,
             locked: true,
             hidden: true,
+            name: Some("Fold".into()),
         };
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("\"dir\":\"vertical\""));
@@ -10852,6 +11390,30 @@ mod tests {
         assert!(!plain.contains("direction"), "{plain}");
     }
 
+    /// Kashida (#3827): older files read as off, which is not written;
+    /// a setting is saved, read back and carried by a paragraph format.
+    #[test]
+    fn kashida_defaults_to_off_and_round_trips() {
+        let old: ParagraphStyle = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.kashida, Kashida::Off);
+        let json = serde_json::to_string(&old).expect("writes");
+        assert!(!json.contains("kashida"), "{json}");
+        let mut k = old.clone();
+        k.kashida = Kashida::Medium;
+        let json = serde_json::to_string(&k).expect("writes");
+        assert!(json.contains("\"kashida\":\"medium\""), "{json}");
+        let back: ParagraphStyle = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.kashida, Kashida::Medium);
+        let f = crate::ParagraphFormat::of(TextAlign::Justify, &k);
+        let json = serde_json::to_string(&f).expect("writes");
+        let back: crate::ParagraphFormat = serde_json::from_str(&json).expect("parses");
+        let mut p = ParagraphStyle::default();
+        back.apply_to(&mut p);
+        assert_eq!(p.kashida, Kashida::Medium);
+        let plain = serde_json::to_string(&crate::ParagraphFormat::default()).expect("writes");
+        assert!(!plain.contains("kashida"), "{plain}");
+    }
+
     /// The column order of vertical text (#1986): older files read as
     /// right to left, left to right is saved and read back, and such a
     /// frame's text is placed from its top left.
@@ -11004,6 +11566,57 @@ mod tests {
         assert!(bomb.symbols[..19].iter().all(kept));
         assert!(!kept(&bomb.symbols[19]));
         assert!(kept(&bomb.symbols[20]));
+    }
+
+    #[test]
+    fn symbol_visual_bounds_cover_off_origin_and_nested_definitions() {
+        // A definition far from the origin (as .cdr definitions sit around
+        // the page centre), and a second symbol that places two copies of it.
+        let leaf = Shape::new(
+            ShapeId(0),
+            ShapeKind::Rect {
+                rect: Rect::new(120.0, 160.0, 150.0, 180.0),
+                radius: 0.0,
+                corners: None,
+            },
+        );
+        let mut a = Shape::new(ShapeId(1), ShapeKind::SymbolInstance { index: 0 });
+        a.transform = Affine::IDENTITY;
+        let mut b = Shape::new(ShapeId(2), ShapeKind::SymbolInstance { index: 0 });
+        b.transform = Affine::translate((40.0, -10.0));
+        let outer = Shape::new(
+            ShapeId(0),
+            ShapeKind::Group {
+                children: vec![a.clone(), b],
+            },
+        );
+        let symbols = vec![
+            Symbol {
+                name: "Leaf".into(),
+                shape: leaf,
+            },
+            Symbol {
+                name: "Pair".into(),
+                shape: outer,
+            },
+        ];
+        let r0 = a.visual_bounds_with(&symbols);
+        assert!(
+            (r0.x0 - 120.0).abs() < 1e-6
+                && (r0.y0 - 160.0).abs() < 1e-6
+                && (r0.x1 - 150.0).abs() < 1e-6
+                && (r0.y1 - 180.0).abs() < 1e-6,
+            "{r0:?}"
+        );
+        let inst_outer = Shape::new(ShapeId(3), ShapeKind::SymbolInstance { index: 1 });
+        let r1 = inst_outer.visual_bounds_with(&symbols);
+        assert!(
+            (r1.x0 - 120.0).abs() < 1e-6
+                && (r1.y0 - 150.0).abs() < 1e-6
+                && (r1.x1 - 190.0).abs() < 1e-6
+                && (r1.y1 - 180.0).abs() < 1e-6,
+            "{r1:?}"
+        );
     }
 
     #[test]
@@ -11411,5 +12024,53 @@ mod tests {
             on_path: None,
         };
         assert!(s.text_parts().is_none());
+    }
+
+    /// The layer of a number is reached by counting pages, not layers
+    /// (each lookup of an object walked every layer before its own,
+    /// which made filling a print merge of thousands of pages slow): the
+    /// same layer as walking them all, master layers first, on pages
+    /// with any number of layers, and none past the last.
+    #[test]
+    fn a_layer_is_reached_by_its_number_without_walking_the_others() {
+        let mut doc = Document::new("d", crate::geometry::Size::new(100.0, 100.0));
+        for name in ["m1", "m2"] {
+            let id = doc.ids_mut().layer();
+            doc.master.push(Layer::new(id, name));
+        }
+        for extra in [0usize, 3, 0, 1, 2] {
+            let id = doc.ids_mut().page();
+            let mut page = doc.pages[0].clone();
+            page.id = id;
+            page.layers.clear();
+            for _ in 0..extra {
+                let l = doc.ids_mut().layer();
+                page.layers.push(Layer::new(l, "L"));
+            }
+            doc.pages.push(page);
+        }
+        let all: Vec<LayerId> = doc.all_layers().map(|l| l.id).collect();
+        assert_eq!(all.len(), 2 + 1 + 6);
+        for (k, id) in all.iter().enumerate() {
+            assert_eq!(doc.nth_layer(k).map(|l| l.id), Some(*id), "layer {k}");
+            assert_eq!(doc.nth_layer_mut(k).map(|l| l.id), Some(*id), "layer {k}");
+        }
+        assert!(doc.nth_layer(all.len()).is_none());
+        assert!(doc.nth_layer_mut(all.len() + 7).is_none());
+        // An object on the last page's last layer is found, and changed,
+        // where it is.
+        let shape = doc.ids_mut().shape();
+        let last = *all.last().expect("layers");
+        doc.layer_mut(last).expect("layer").shapes.push(Shape::new(
+            shape,
+            ShapeKind::Rect {
+                rect: crate::geometry::Rect::new(0.0, 0.0, 1.0, 1.0),
+                radius: 0.0,
+                corners: None,
+            },
+        ));
+        assert_eq!(doc.locate(shape).expect("found"), (last, 0));
+        doc.shape_mut(shape).expect("found").name = Some("x".into());
+        assert_eq!(doc.find_shape(shape).and_then(|s| s.name.clone()).as_deref(), Some("x"));
     }
 }

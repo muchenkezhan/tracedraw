@@ -188,7 +188,14 @@ pub struct Settings {
     /// system's program for PNG files, #593).
     #[serde(default)]
     pub bitmap_editor: String,
+    /// The program Edit in Spreadsheet opens a table's workbook in (a
+    /// path; empty for the system's program for `.xlsx` files, #4144).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub spreadsheet_editor: String,
     pub last_dir: Option<PathBuf>,
+    /// The folder of pictures the bitmap pattern picker lists as tiles
+    /// (#3323).
+    pub pattern_folder: Option<PathBuf>,
     /// The folder exported to last: File > Export's dialog opens there
     /// (#1817).
     pub last_export_dir: Option<PathBuf>,
@@ -322,6 +329,11 @@ pub struct Settings {
     /// not ("software" or "gl"); cleared when the choice changes.
     #[serde(default)]
     pub working_renderer: String,
+    /// The OpenGL renderer once read back drawn on this computer: later
+    /// starts skip the check of its frames, so a slow first frame (a heavy
+    /// drawing still loading) is never taken for a blind driver (#4236).
+    #[serde(default)]
+    pub gl_drawn: bool,
     /// Options > General, Linux: on a Wayland desktop that leaves the
     /// title bar to the application, open the window through XWayland so
     /// that the desktop draws its own and file drops arrive, from the
@@ -332,7 +344,9 @@ pub struct Settings {
     /// Options > General: File > Save As (and Save of a drawing without a
     /// file) opens the system's save dialog instead of TraceDraw's Save
     /// Drawing dialog, the type chosen there by its filter and the
-    /// versions the Options set (#2965). On by default on macOS.
+    /// versions the Options set (#2965). Off by default everywhere: the
+    /// system's dialog has no version choice, and the macOS one shows no
+    /// type either, so a `.cdr` could not be chosen (#3811).
     #[serde(default = "default_system_save_dialog")]
     pub system_save_dialog: bool,
     /// Customization > Appearance: dialogs open in the middle of the
@@ -406,6 +420,10 @@ pub struct Settings {
     /// only their outline (#3569). Off by default.
     #[serde(default)]
     pub live_transform_preview: bool,
+    /// Options > Display: with Show objects while transforming on, the
+    /// drag outline is drawn over the objects too (#3704: hide it).
+    #[serde(default = "default_true")]
+    pub transform_outline_over_objects: bool,
     /// Options > Display: Shift, Ctrl, Alt and Delete on the drawing,
     /// where there is a touch screen (#1996).
     #[serde(default = "default_true")]
@@ -420,6 +438,24 @@ pub struct Settings {
     pub selection_bar_mouse: bool,
     #[serde(default = "default_true")]
     pub preview_page_border: bool,
+    /// Options > Display > Full-screen preview: the colour round the page
+    /// in the full-screen preview (F9), white at first (#3930).
+    #[serde(default = "default_preview_background")]
+    pub preview_background: [u8; 3],
+    /// Options > Display > Full-screen preview: F9 shows the whole page
+    /// filling the screen instead of the drawing at the zoom it has in
+    /// the window (#4239). Off at first.
+    #[serde(default)]
+    pub preview_fit_page: bool,
+    /// Document Setup > Layout > Margins: the four page margins linked,
+    /// so changing one sets all four to it (#4030).
+    #[serde(default)]
+    pub page_margins_linked: bool,
+    /// The preview's colour was picked: white too is then white, not the
+    /// colour round the page in the drawing window, which the unpicked
+    /// white stands for (a dark theme's grey, #4027).
+    #[serde(default)]
+    pub preview_background_custom: bool,
     /// Options > Document > Page size: how the page's shadow and border
     /// look on screen (#3078).
     #[serde(default, skip_serializing_if = "PageLook::is_default")]
@@ -525,6 +561,11 @@ pub struct Settings {
     /// Options > Tools > Pick: the Pick tool's pointer is a cross hair.
     #[serde(default)]
     pub crosshair_cursor: bool,
+    /// Options > Tools > Pick: the lines of the cross hair pointer (the
+    /// Pick tool's with the option above, and the drawing tools') run to
+    /// the edges of the drawing window. Off by default (#2996).
+    #[serde(default)]
+    pub crosshair_to_edges: bool,
     /// Options > Display > Ruler calibration: pixels per inch of the
     /// screen at the system's scaling, so that zoom 100% shows real sizes
     /// (96 by default; see `screen_points_per_inch`).
@@ -632,6 +673,23 @@ pub struct Settings {
     /// (the default dockers then show).
     #[serde(default)]
     pub dockers: Option<DockerSetup>,
+    /// The image editing mode's panels as they were left (Bitmaps > Edit
+    /// Inside); none until it is first used (its default panels show).
+    #[serde(default)]
+    pub pixel_dockers: Option<DockerSetup>,
+    /// The image editing mode's Hints panel was put with the panels left
+    /// from before it came (once; closed after, it stays closed).
+    #[serde(default)]
+    pub pixel_hints_added: bool,
+    /// The image editing mode's layers stay after Finish while the
+    /// drawing is open: Edit Inside on the picture again opens them
+    /// (#4112). Turned off, they go and their memory is freed.
+    #[serde(default = "default_true")]
+    pub pixel_keep_layers: bool,
+    /// The image editing mode's layers are saved with the picture in the
+    /// drawing's file too (#4112), off by default: the file grows.
+    #[serde(default)]
+    pub pixel_save_layers: bool,
     /// The font lists' fonts used last, newest first.
     #[serde(default)]
     pub recent_fonts: Vec<String>,
@@ -653,6 +711,13 @@ pub struct Settings {
     /// The Properties docker's sections closed ("outline", "fill" ...).
     #[serde(default)]
     pub properties_closed: Vec<String>,
+    /// The Properties docker in its classic layout: one section at a
+    /// time, picked by the tabs at the top, the outline in short rows.
+    #[serde(default)]
+    pub properties_classic: bool,
+    /// The section the classic layout shows ("outline", "fill" ...).
+    #[serde(default)]
+    pub properties_tab: String,
     /// The Properties docker marks a section whose values come from the
     /// object's linked object style (#1439).
     #[serde(default = "default_true")]
@@ -803,6 +868,11 @@ pub struct Settings {
     /// applied to ("Sample again after applying" on their bars, #2380).
     #[serde(default)]
     pub eyedropper_sample_after_apply: bool,
+    /// The Color Eyedropper hands over to the Pick tool once a colour it
+    /// sampled went onto the selected objects ("Pick tool after applying
+    /// to the selection" on its bar, #3995).
+    #[serde(default)]
+    pub eyedropper_pick_after_apply: bool,
     /// Text fitted to a path: a drag off the path moves the text away
     /// from it in steps of `path_tick_mm` (tick snapping).
     #[serde(default)]
@@ -817,6 +887,9 @@ pub struct Settings {
     /// The looks saved in the Effects docker's Presets (#2160).
     #[serde(default)]
     pub style_presets: Vec<crate::style_presets::StylePreset>,
+    /// The outlines saved in the Outline Pen dialog's Presets (#4090).
+    #[serde(default)]
+    pub outline_presets: Vec<crate::outline_presets::OutlinePreset>,
     /// The settings saved in a bitmap effect's dialog, by effect (#1129).
     #[serde(default)]
     pub fx_presets: Vec<crate::ui::effect_dialog::FxPreset>,
@@ -824,6 +897,15 @@ pub struct Settings {
     /// seen on the drawing instead of in Before and After panes (#2799).
     #[serde(default)]
     pub fx_settings_only: bool,
+    /// A bitmap effect's settings open in the Effects docker beside the
+    /// drawing, the effect seen on the drawing, instead of in a dialog
+    /// (#4253). Off: the dialog, as before.
+    #[serde(default)]
+    pub fx_in_panel: bool,
+    /// The Shaping docker's Weld, Intersect and the two Minus operations
+    /// make a live combine that keeps the objects (#4266).
+    #[serde(default)]
+    pub shaping_live: bool,
     /// The programs of Object > Insert > Insert Object, each opened with
     /// one click (#1025).
     pub object_apps: Vec<crate::insert_object::ObjectApp>,
@@ -872,6 +954,9 @@ pub struct DockerSetup {
     /// The dockers shown under the front one of a column (#2312).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stacks: Vec<StackSetup>,
+    /// The dockers locked in front of their column (#3953).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locked: Vec<String>,
     pub floating: Vec<FloatingSetup>,
 }
 
@@ -939,7 +1024,7 @@ fn default_desktop() -> [u8; 3] {
 }
 
 /// How many one-time upgrades `Settings::upgrade` knows.
-const UPGRADES: u32 = 8;
+const UPGRADES: u32 = 10;
 
 fn default_outline_units() -> String {
     "pt".into()
@@ -949,15 +1034,22 @@ fn default_spiral_expansion() -> u32 {
     100
 }
 
-/// The system's save dialog is the default on macOS, where users expect
-/// it (#2965).
+/// TraceDraw's Save Drawing dialog is the default everywhere: it has the
+/// type (TraceDraw or `.cdr`) and the version of either, which the
+/// system's dialog does not offer (the macOS one shows no type list
+/// either), so on a Mac the `.cdr` versions could not be chosen (#3811).
+/// The system's dialog stays in Options > Global > File Formats.
 fn default_system_save_dialog() -> bool {
-    cfg!(target_os = "macos")
+    false
 }
 
 /// Translucent menus start at 85 % opacity.
 fn default_menu_opacity() -> f32 {
     0.85
+}
+
+fn default_preview_background() -> [u8; 3] {
+    [255, 255, 255]
 }
 
 fn default_true() -> bool {
@@ -1297,6 +1389,11 @@ pub struct NodePrefs {
     /// corner. Off: a drag rounds every corner, or the chosen nodes'
     /// corners, as before.
     pub corner_one_at_a_time: bool,
+    /// Rounded corners follow node edits (#3265): moving nodes, or
+    /// bending a segment, beside a rounded corner rounds it again with
+    /// its radius where its sides now run, so it stays a rounded corner
+    /// with its widget. Off: the arc stays as it was drawn, as before.
+    pub corners_follow_edits: bool,
     /// Nodes are outlined in a colour for their type, cusp, smooth or
     /// symmetrical, besides their shape (#3000). Off by default.
     pub color_by_type: bool,
@@ -1321,6 +1418,7 @@ impl Default for NodePrefs {
             object_pick_distance: 3.0,
             corner_widgets: true,
             corner_one_at_a_time: true,
+            corners_follow_edits: true,
             color_by_type: false,
             cusp_rgb: [0xE0, 0x60, 0x00],
             smooth_rgb: [0x10, 0x9A, 0x30],
@@ -1435,6 +1533,10 @@ pub struct PalettePrefs {
     /// title left out): its rows or columns flow from it (see
     /// `ui::palette::floating_flow`).
     pub float_size: [f32; 2],
+    /// The colours' names beside their swatches in the palette opened
+    /// out by a strip's double arrow, a scrolling list (#3512). Off by
+    /// default: the swatches in a grid.
+    pub show_names: bool,
 }
 
 /// The most rows (or columns) a docked palette bar shows.
@@ -1648,6 +1750,7 @@ impl Default for PalettePrefs {
             swatch_size: SWATCH_DEFAULT,
             document_swatch_size: 0,
             float_size: FLOAT_SIZE,
+            show_names: false,
         }
     }
 }
@@ -2112,6 +2215,9 @@ pub struct ViewPrefs {
     pub mode: String,
     /// The grid page shows lines per unit instead of their spacing.
     pub grid_frequency: bool,
+    /// View > Multipage View: kept on, the drawings opened next show
+    /// every page too, instead of only the first (#3724).
+    pub multipage: bool,
 }
 
 impl Default for ViewPrefs {
@@ -2132,6 +2238,7 @@ impl Default for ViewPrefs {
             rasterize_complex_effects: true,
             mode: "enhanced".into(),
             grid_frequency: false,
+            multipage: false,
         }
     }
 }
@@ -2392,7 +2499,9 @@ impl Default for Settings {
             node_shortcuts: Vec::new(),
             command_icons: Vec::new(),
             bitmap_editor: String::new(),
+            spreadsheet_editor: String::new(),
             last_dir: None,
+            pattern_folder: None,
             last_export_dir: None,
             folder_bookmarks: Vec::new(),
             color: ColorPrefs::default(),
@@ -2418,10 +2527,15 @@ impl Default for Settings {
             hide_bbox_curve_tools: false,
             node_tracking: false,
             live_transform_preview: false,
+            transform_outline_over_objects: true,
             touch_keys: true,
             touch_selection_bar: true,
             selection_bar_mouse: false,
             preview_page_border: true,
+            preview_background: default_preview_background(),
+            preview_fit_page: false,
+            preview_background_custom: false,
+            page_margins_linked: false,
             page_look: PageLook::default(),
             constrain_angle: default_constrain_angle(),
             symmetry_show_lines: true,
@@ -2450,6 +2564,7 @@ impl Default for Settings {
             connector_gap: 0.0,
             upgrades: UPGRADES,
             crosshair_cursor: false,
+            crosshair_to_edges: false,
             screen_ppi: default_screen_ppi(),
             zoom_right_click_out: true,
             zoom_relative_1to1: true,
@@ -2491,6 +2606,7 @@ impl Default for Settings {
             gpu_adapter: String::new(),
             gpu_effects: false,
             working_renderer: String::new(),
+            gl_drawn: false,
             system_title_bar: true,
             system_save_dialog: default_system_save_dialog(),
             center_dialogs: true,
@@ -2510,12 +2626,18 @@ impl Default for Settings {
             defaults: crate::defaults::DefaultsPrefs::default(),
             shown_bars: None,
             dockers: None,
+            pixel_dockers: None,
+            pixel_hints_added: false,
+            pixel_keep_layers: true,
+            pixel_save_layers: false,
             recent_fonts: Vec::new(),
             font_filter_open: false,
             font_english_names: true,
             show_recent_fonts: true,
             recent_font_count: default_recent_font_count(),
             properties_closed: Vec::new(),
+            properties_classic: false,
+            properties_tab: String::new(),
             style_indicators: true,
             saved_transparencies: Vec::new(),
             text_sections_closed: Vec::new(),
@@ -2555,12 +2677,16 @@ impl Default for Settings {
             curves: Default::default(),
             show_text_frames: true,
             eyedropper_sample_after_apply: false,
+            eyedropper_pick_after_apply: false,
             path_tick_snap: false,
             path_tick_mm: default_path_tick(),
             screen_margins: crate::ui::screen_margins::ScreenMargins::default(),
             style_presets: Vec::new(),
+            outline_presets: Vec::new(),
             fx_presets: Vec::new(),
             fx_settings_only: false,
+            fx_in_panel: false,
+            shaping_live: false,
             object_apps: Vec::new(),
             object_apps_insert_saved: false,
             picture_captions: Default::default(),
@@ -2578,6 +2704,23 @@ pub const PORTABLE_DIR: &str = "tracedraw-settings";
 pub fn portable_dir(exe: &std::path::Path) -> Option<PathBuf> {
     let dir = exe.parent()?.join(PORTABLE_DIR);
     dir.is_dir().then_some(dir)
+}
+
+/// The folder of TraceDraw's own working files called `name` (bitmaps
+/// out for editing, auto-backups): in a portable copy inside its
+/// `tracedraw-settings` folder, so it leaves nothing on the computer
+/// (#3908); else in the system's temporary folder.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn work_dir(name: &str) -> PathBuf {
+    work_dir_beside(std::env::current_exe().ok().as_deref(), name)
+}
+
+/// [`work_dir`] for the program `exe`.
+#[cfg(not(target_arch = "wasm32"))]
+fn work_dir_beside(exe: Option<&std::path::Path>, name: &str) -> PathBuf {
+    exe.and_then(portable_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(name)
 }
 
 pub fn config_dir() -> Option<PathBuf> {
@@ -2618,6 +2761,7 @@ impl Settings {
         Settings {
             recent_files: self.recent_files.clone(),
             last_dir: self.last_dir.clone(),
+            pattern_folder: self.pattern_folder.clone(),
             last_export_dir: self.last_export_dir.clone(),
             folder_bookmarks: self.folder_bookmarks.clone(),
             window_maximized: self.window_maximized,
@@ -2638,7 +2782,11 @@ impl Settings {
     /// 5. Duplicate's old default offset (6.35 mm) becomes none; 6. the
     ///    Crop tool cuts a picture's pixels; 7. File > Export shows its
     ///    options again; 8. the window goes through XWayland on a
-    ///    Wayland desktop without title bars for programs (#2486).
+    ///    Wayland desktop without title bars for programs (#2486); 9. Save
+    ///    As shows TraceDraw's Save Drawing dialog, with the type and the
+    ///    version, again (#3811); 10. the PDF/X output condition left at
+    ///    "FOGRA39", the old default, follows the drawing's CMYK profile
+    ///    (#3829).
     pub fn upgrade(mut self) -> Settings {
         self.autocorrect.upgrade();
         if self.upgrades < 1 {
@@ -2696,6 +2844,27 @@ impl Settings {
         // switched off afterwards (native Wayland) it stays off.
         if self.upgrades < 8 {
             self.system_title_bar = true;
+        }
+        // The system's save dialog was the default on macOS (#2965), and
+        // there it shows no type list and the system's dialog has no
+        // version: Save As offered no way to save a `.cdr`, nor to choose
+        // its version (#3811). TraceDraw's Save Drawing dialog comes back
+        // once; turned on again afterwards the system's dialog stays.
+        if self.upgrades < 9 {
+            self.system_save_dialog = false;
+        }
+        // The PDF/X output condition was "FOGRA39" by default, kept with
+        // the preferences at the first export, whatever CMYK profile the
+        // drawing had (#3829). Left at it, it follows the drawing now.
+        if self.upgrades < 10 {
+            for c in [
+                &mut self.formats.output_condition,
+                &mut self.publish_pdf.output_condition,
+            ] {
+                if c.trim() == "FOGRA39" {
+                    c.clear();
+                }
+            }
         }
         self.upgrades = self.upgrades.max(UPGRADES);
         self.migrate_ai();
@@ -3541,6 +3710,12 @@ mod tests {
         assert_eq!(portable_dir(&exe), None);
         std::fs::create_dir_all(base.join(PORTABLE_DIR)).expect("dir");
         assert_eq!(portable_dir(&exe), Some(base.join(PORTABLE_DIR)));
+        // Its working files stay in that folder too, not in the system's
+        // temporary folder (#3908).
+        assert_eq!(
+            work_dir_beside(Some(&exe), "tracedraw-edit"),
+            base.join(PORTABLE_DIR).join("tracedraw-edit")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3764,5 +3939,38 @@ mod tests {
         let s = migrated(r#"{"ai_image": {}}"#);
         assert_eq!(s.ai, crate::ai::AiPrefs::default());
         assert!(s.ai_image.is_none());
+    }
+
+    /// #3829: the PDF/X output condition kept at "FOGRA39", the old
+    /// default, follows the drawing's CMYK profile once; another typed
+    /// stays, and so does "FOGRA39" chosen again afterwards.
+    #[test]
+    fn the_old_default_output_condition_follows_the_drawing() {
+        let old = migrated(
+            r#"{"upgrades": 9, "formats": {"output_condition": "FOGRA39"}, "publish_pdf": {"output_condition": "FOGRA39"}}"#,
+        );
+        assert!(old.formats.output_condition.is_empty());
+        assert!(old.publish_pdf.output_condition.is_empty());
+        let typed = migrated(r#"{"upgrades": 9, "formats": {"output_condition": "FOGRA51"}}"#);
+        assert_eq!(typed.formats.output_condition, "FOGRA51");
+        let chosen = migrated(r#"{"upgrades": 10, "formats": {"output_condition": "FOGRA39"}}"#);
+        assert_eq!(chosen.formats.output_condition, "FOGRA39");
+    }
+
+    /// #3811: Save As shows TraceDraw's Save Drawing dialog, with the type
+    /// and the version, by default on every system, and once for
+    /// preferences that had the system's dialog on (the macOS default
+    /// before); chosen again afterwards, the system's dialog stays.
+    #[test]
+    fn save_as_offers_the_type_and_version_by_default() {
+        assert!(!Settings::default().system_save_dialog);
+        let old = migrated(r#"{"upgrades": 8, "system_save_dialog": true}"#);
+        assert!(!old.system_save_dialog);
+        let chosen = migrated(r#"{"upgrades": 9, "system_save_dialog": true}"#);
+        assert!(chosen.system_save_dialog, "a choice made since stays");
+        let mut app = crate::app::App::headless();
+        app.settings = Settings::default();
+        app.save_as_dialog();
+        assert!(matches!(app.dialog, crate::ui::dialogs::Dialog::SaveAs(_)));
     }
 }

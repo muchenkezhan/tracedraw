@@ -1,5 +1,6 @@
 //! Full-screen preview (F9) and the Page Sorter view.
 
+use crate::ui::btn_icons::IconUi;
 use crate::app::App;
 use crate::i18n::tr;
 use crate::theme::Tokens;
@@ -12,6 +13,11 @@ pub struct PreviewSession {
     pub(crate) bounds: tracedraw_core::geometry::Rect,
     pub(crate) zoom: f64,
     was_fullscreen: bool,
+    /// The page fills the screen (Options > Display > Full-screen
+    /// preview, #4239) until the preview is zoomed.
+    fit_page: bool,
+    /// When the preview opened, to wait for the window to fill the screen.
+    started: f64,
     hint_until: f64,
     texture: Option<(PreviewKey, egui::TextureHandle)>,
 }
@@ -37,6 +43,8 @@ pub fn begin(app: &mut App, ctx: &egui::Context, selected_only: bool) {
         bounds: preview_bounds(app),
         zoom: f64::from(app.view.zoom),
         was_fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+        fit_page: app.settings.preview_fit_page && !selected_only,
+        started: ctx.input(|i| i.time),
         hint_until: ctx.input(|i| i.time) + 1.5,
         texture: None,
     });
@@ -203,18 +211,109 @@ fn frame_bounds(app: &App, size: egui::Vec2) -> tracedraw_core::geometry::Rect {
     )
 }
 
+/// How long, in seconds, the preview waits at most for the window to say
+/// it fills the screen before it draws the drawing (#3830).
+const FULL_SCREEN_WAIT: f64 = 0.5;
+
+/// What a key or the wheel asks of the full-screen preview (#3930).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PreviewInput {
+    /// Zoom by this factor about the middle of the screen.
+    Zoom(f64),
+    /// The next page (+1) or the one before (-1), fitted to the screen.
+    Page(i32),
+}
+
+/// The keys and wheel turns of this frame, in the full-screen preview:
+/// the plus and minus keys (and the wheel) zoom, Page Down / Page Up and
+/// the arrows go to the next or previous page (#3930).
+pub(crate) fn preview_keys(i: &egui::InputState) -> Vec<PreviewInput> {
+    use egui::Key;
+    let mut out = Vec::new();
+    if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) {
+        out.push(PreviewInput::Zoom(1.25));
+    }
+    if i.key_pressed(Key::Minus) {
+        out.push(PreviewInput::Zoom(0.8));
+    }
+    let wheel = i.smooth_scroll_delta.y;
+    if wheel != 0.0 {
+        out.push(PreviewInput::Zoom(1.0015_f64.powf(f64::from(wheel))));
+    }
+    for k in [Key::PageDown, Key::ArrowRight, Key::ArrowDown] {
+        if i.key_pressed(k) {
+            out.push(PreviewInput::Page(1));
+        }
+    }
+    for k in [Key::PageUp, Key::ArrowLeft, Key::ArrowUp] {
+        if i.key_pressed(k) {
+            out.push(PreviewInput::Page(-1));
+        }
+    }
+    out
+}
+
+/// Do what [`preview_keys`] found: zoom the preview, or show another
+/// page fitted to a screen of `size` points. Selection preview, which
+/// fits the selection, only changes page.
+pub(crate) fn apply_preview_keys(app: &mut App, keys: &[PreviewInput], size: egui::Vec2) {
+    for k in keys {
+        match *k {
+            PreviewInput::Zoom(f) => {
+                if let Some(session) = &mut app.preview_session {
+                    session.zoom = (session.zoom * f).clamp(0.01, 500.0);
+                    session.fit_page = false;
+                }
+            }
+            PreviewInput::Page(step) => {
+                let n = app.doc().pages.len();
+                let at = app.page_index() as i64 + i64::from(step);
+                if n < 2 || at < 0 || at >= n as i64 {
+                    continue;
+                }
+                app.goto_page(at as usize);
+                let page = app.page_rect();
+                if let Some(session) = &mut app.preview_session {
+                    let fit = (f64::from(size.x) / page.width().max(1e-6))
+                        .min(f64::from(size.y) / page.height().max(1e-6));
+                    session.bounds = page;
+                    session.zoom = (fit * 0.95).max(1e-6);
+                }
+            }
+        }
+    }
+}
+
 pub fn fullscreen(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     if app.preview_session.is_none() {
         begin(app, &ctx, app.preview_selected_only);
     }
+    let keys = ctx.input(preview_keys);
+    if !keys.is_empty() {
+        let size = ctx.content_rect().size();
+        apply_preview_keys(app, &keys, size);
+    }
+    // The page filling the screen, when the option asks for it: the
+    // page's middle in the screen's, as large as the screen lets it.
+    let screen = ctx.content_rect().size();
+    let page = app.page_rect();
+    if let Some(session) = app.preview_session.as_mut().filter(|s| s.fit_page) {
+        let fit = (f64::from(screen.x) / page.width().max(1e-6))
+            .min(f64::from(screen.y) / page.height().max(1e-6));
+        if fit.is_finite() && fit > 0.0 {
+            session.bounds = page;
+            session.zoom = fit;
+        }
+    }
+    let background = app.preview_background_color();
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
                 .fill(if app.preview_selected_only {
                     egui::Color32::from_gray(40)
                 } else {
-                    egui::Color32::WHITE
+                    background
                 })
                 .inner_margin(0.0),
         )
@@ -263,7 +362,28 @@ pub fn fullscreen(app: &mut App, ui: &mut Ui) {
                 .preview_session
                 .as_ref()
                 .is_some_and(|s| s.texture.as_ref().is_some_and(|(k, _)| *k == key));
-            if !cached {
+            // The drawing waits for the window to fill the screen (#3830):
+            // drawn first in the window as it was and again a moment later
+            // in the whole screen, it jumped and flickered as F9 opened.
+            // A system that never says the window is full screen gets the
+            // drawing after a moment anyway.
+            let now = ctx.input(|i| i.time);
+            let waited = app
+                .preview_session
+                .as_ref()
+                .map_or(f64::INFINITY, |s| now - s.started);
+            let ready = app
+                .preview_session
+                .as_ref()
+                .is_none_or(|s| s.was_fullscreen)
+                || ctx.input(|i| i.viewport().fullscreen) == Some(true)
+                || waited >= FULL_SCREEN_WAIT;
+            if !ready {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                    (FULL_SCREEN_WAIT - waited).max(0.0),
+                ));
+            }
+            if !cached && ready {
                 if let Some(pm) = tracedraw_render::render_page(app.doc(), app.page, &opts) {
                     let image = egui::ColorImage::from_rgba_premultiplied(
                         [pm.width() as usize, pm.height() as usize],
@@ -279,13 +399,25 @@ pub fn fullscreen(app: &mut App, ui: &mut Ui) {
             if let Some((_, tex)) = app
                 .preview_session
                 .as_ref()
+                .filter(|_| ready)
                 .and_then(|s| s.texture.as_ref())
             {
                 let pos = rect.center() - size / 2.0;
                 let page_rect = egui::Rect::from_min_size(pos, size);
                 let painter = painter.with_clip_rect(page_rect);
+                let at = |x: f64, y: f64| {
+                    page_rect.min
+                        + egui::vec2(
+                            ((x - bounds.x0) * zoom) as f32,
+                            ((bounds.y1 - y) * zoom) as f32,
+                        )
+                };
+                let sheet = egui::Rect::from_two_pos(at(page.x0, page.y0), at(page.x1, page.y1));
                 if !app.preview_selected_only {
-                    painter.rect_filled(page_rect, 0.0, egui::Color32::WHITE);
+                    // The colour chosen round the page, the page itself
+                    // white as paper (#3930).
+                    painter.rect_filled(page_rect, 0.0, background);
+                    painter.rect_filled(sheet, 0.0, egui::Color32::WHITE);
                 }
                 painter.image(
                     tex.id(),
@@ -296,15 +428,6 @@ pub fn fullscreen(app: &mut App, ui: &mut Ui) {
                 // Options > Display > Full-screen preview > Show page border:
                 // round the page, inside what is shown.
                 if !app.preview_selected_only && app.settings.preview_page_border {
-                    let at = |x: f64, y: f64| {
-                        page_rect.min
-                            + egui::vec2(
-                                ((x - bounds.x0) * zoom) as f32,
-                                ((bounds.y1 - y) * zoom) as f32,
-                            )
-                    };
-                    let sheet =
-                        egui::Rect::from_two_pos(at(page.x0, page.y0), at(page.x1, page.y1));
                     painter.rect_stroke(
                         sheet,
                         0.0,
@@ -313,15 +436,21 @@ pub fn fullscreen(app: &mut App, ui: &mut Ui) {
                     );
                 }
             }
-            let now = ctx.input(|i| i.time);
             let hint_left = app
                 .preview_session
                 .as_ref()
                 .map_or(0.0, |session| session.hint_until - now);
             if hint_left > 0.0 {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(hint_left));
+                // How to leave, and the keys that zoom and turn the pages
+                // (#3930).
+                let text = if app.preview_selected_only {
+                    tr("preview.exit_hint")
+                } else {
+                    format!("{}\n{}", tr("preview.exit_hint"), tr("preview.keys_hint"))
+                };
                 let hint = painter.layout_no_wrap(
-                    tr("preview.exit_hint"),
+                    text,
                     egui::FontId::proportional(12.0),
                     egui::Color32::from_gray(200),
                 );
@@ -352,10 +481,10 @@ mod viewport_tests;
 pub fn page_sorter(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.heading(tr("menu.view.page_sorter"));
-        if ui.button(tr("preview.back_to_page")).clicked() {
+        if ui.ibutton("preview.back_to_page").clicked() {
             app.page_sorter = false;
         }
-        if ui.button(tr("menu.layout.insert_page")).clicked() {
+        if ui.ibutton("menu.layout.insert_page").clicked() {
             app.add_page();
         }
     });

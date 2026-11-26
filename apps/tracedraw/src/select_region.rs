@@ -262,16 +262,18 @@ pub fn takes_how(
         return None;
     }
     if !touching {
+        // A group lies inside when each of its shown objects does, by
+        // either marquee: the rectangle tested the group's whole box,
+        // hidden objects and all (#4136).
+        if matches!(s.kind, ShapeKind::Group { .. }) {
+            let kids = children_on_page(s);
+            return whole(
+                !kids.is_empty() && kids.iter().all(|c| takes(region, c, false, fill_counts)),
+            );
+        }
         return whole(match region {
             Region::Rect(r) => r.contains_rect(b),
             Region::Polygon(_) => {
-                if matches!(s.kind, ShapeKind::Group { .. }) {
-                    let kids = children_on_page(s);
-                    return whole(
-                        !kids.is_empty()
-                            && kids.iter().all(|c| takes(region, c, false, fill_counts)),
-                    );
-                }
                 let outline = if boxed(s) {
                     rect_path(b, 0.0)
                 } else {
@@ -308,8 +310,17 @@ pub fn takes_how(
             }
         }
     }
-    // The whole region lies inside the object.
-    (inside && region.sample().is_some_and(|p| outline.contains(p))).then_some(Take::Within)
+    // The whole region lies inside the object; an open curve's inside is
+    // that of the curve closed across its open ends, as its fill shows
+    // (the raw path took one half of a slanted line's box, #4032). The
+    // raw path stays the outline crossed above: the closing chord is no
+    // drawn edge.
+    let inside_path = if s.kind.is_open_curve() {
+        tracedraw_core::command::close_subpaths(&outline)
+    } else {
+        outline
+    };
+    (inside && region.sample().is_some_and(|p| inside_path.contains(p))).then_some(Take::Within)
 }
 
 #[cfg(test)]
@@ -352,6 +363,38 @@ mod tests {
         assert!(!takes(inside, &s, true, &filled));
         let f = rect_shape(2, Rect::new(10.0, 10.0, 30.0, 30.0), true);
         assert!(takes(inside, &f, true, &filled));
+    }
+
+    /// A slanted open line is taken by a touching marquee that crosses
+    /// it, not by one lying in the empty half of its box (#4032); an
+    /// open zigzag is not taken by a marquee crossing only the chord that
+    /// would close it.
+    #[test]
+    fn an_open_line_is_not_inside_the_empty_half_of_its_box() {
+        let mut path = tracedraw_core::geometry::BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.line_to((100.0, 100.0));
+        let line = Shape::new(ShapeId(1), ShapeKind::Path { path, closed: false });
+        let all = |_: &Shape| true;
+        for empty in [
+            Rect::new(70.0, 10.0, 80.0, 20.0),
+            Rect::new(10.0, 70.0, 20.0, 80.0),
+        ] {
+            assert_eq!(takes_how(Region::Rect(empty), &line, true, &all), None, "{empty:?}");
+        }
+        let across = Region::Rect(Rect::new(40.0, 45.0, 60.0, 55.0));
+        assert_eq!(takes_how(across, &line, true, &all), Some(Take::Outline));
+        // A V open at the top: the chord across the top is not an edge.
+        let mut v = tracedraw_core::geometry::BezPath::new();
+        v.move_to((0.0, 0.0));
+        v.line_to((50.0, 100.0));
+        v.line_to((100.0, 0.0));
+        let v = Shape::new(ShapeId(2), ShapeKind::Path { path: v, closed: false });
+        let on_chord = Region::Rect(Rect::new(40.0, -6.0, 60.0, 4.0));
+        assert_eq!(takes_how(on_chord, &v, true, &all), None);
+        // Inside the V (its fill as shown) it is taken as lying within.
+        let within = Region::Rect(Rect::new(45.0, 20.0, 55.0, 30.0));
+        assert_eq!(takes_how(within, &v, true, &all), Some(Take::Within));
     }
 
     /// A touching frame or lasso drawn round a small object that lies
@@ -449,6 +492,43 @@ mod tests {
         let over_b = Region::Rect(Rect::new(35.0, -5.0, 50.0, 5.0));
         assert!(takes(over_b, &g, true, &filled));
         assert!(!takes(over_b, &g, false, &filled));
+    }
+
+    /// A group of open lines is wholly inside a rectangle marquee when
+    /// each of its shown lines is, as with the lasso; a hidden member
+    /// far away no longer keeps it out (#4136).
+    #[test]
+    fn a_marquee_takes_a_group_of_lines_by_its_shown_lines() {
+        let line = |id: u64, a: (f64, f64), b: (f64, f64)| {
+            let mut path = tracedraw_core::geometry::BezPath::new();
+            path.move_to(a);
+            path.line_to(b);
+            Shape::new(ShapeId(id), ShapeKind::Path { path, closed: false })
+        };
+        let mut hidden = line(3, (200.0, 200.0), (250.0, 260.0));
+        hidden.visible = false;
+        let g = Shape::new(
+            ShapeId(4),
+            ShapeKind::Group {
+                children: vec![
+                    line(1, (0.0, 0.0), (10.0, 20.0)),
+                    line(2, (90.0, 80.0), (100.0, 100.0)),
+                    hidden,
+                ],
+            },
+        );
+        let around = Rect::new(-5.0, -5.0, 105.0, 105.0);
+        assert!(takes(Region::Rect(around), &g, false, &filled));
+        let poly = [
+            Point::new(around.x0, around.y0),
+            Point::new(around.x1, around.y0),
+            Point::new(around.x1, around.y1),
+            Point::new(around.x0, around.y1),
+        ];
+        assert!(takes(Region::Polygon(&poly), &g, false, &filled));
+        // Round one line only: the group is not wholly inside.
+        let one = Region::Rect(Rect::new(-5.0, -5.0, 20.0, 25.0));
+        assert!(!takes(one, &g, false, &filled));
     }
 
     #[test]

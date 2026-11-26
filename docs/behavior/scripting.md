@@ -44,6 +44,17 @@ before the error are kept, as one undo step.
 
 `MsgBox(text)` prints its text to the output; there is no dialog.
 
+### Asking the user for a value
+
+`InputBox(prompt, title, default)` and `prompt(message, default)` show
+the app's input box (the one VBA macros' `InputBox` uses) and wait for
+the answer. `InputBox` gives the typed text, or `""` for Cancel; `prompt`
+gives the typed text, or `null` for Cancel. A script or plugin that uses
+either runs on a thread of its own while the box is up, so the drawing
+keeps the changes it made so far on screen; all of them are still one
+undo step. Where nobody can answer (scripts written by the AI assistant,
+file filters), both give the default at once (`""` without one). (#4139)
+
 ## A first script
 
 A fan of twelve rounded bars, each a little more orange than the one
@@ -88,6 +99,15 @@ below names the call it makes.
 | `Application.Version` | the program's version, as text |
 | `Application.Name` | `'TraceDraw'` |
 | `Application.CreateColor` | the `Color` class |
+| `Application.ZoomToFit()` | View > Zoom To Fit: every object in the window |
+| `Application.ZoomToPage()` | View > Zoom To Page |
+| `Application.ZoomToSelection()` | View > Zoom To Selection |
+| `Application.CopyVisibleArea()` | Edit > Copy Visible Area: what the window shows, as a picture on the clipboard |
+
+The view calls take effect when the script ends, after its objects are in
+the drawing, in the order the script made them (#4020). The macro
+recorder records Zoom To Fit, Zoom To Page, Zoom To Selection and Copy
+Visible Area as these calls, in their place among the other steps.
 
 `ActiveDocument`, `ActivePage`, `ActiveLayer` and `ActiveSelection` are also
 global, so a script can start with either form.
@@ -107,10 +127,21 @@ global, so a script can start with either form.
 | `CreateEllipse(x, y, w, h)` | on the current layer |
 | `CreateArtisticText(x, y, text, font, sizePt)` | on the current layer |
 | `CreatePath(pathData)` | on the current layer |
+| `Data`, `Properties` | the drawing's own name and value pairs (#4137), see below |
 | `Export(path, format)` | writes the drawing to a file; the file name's extension picks the format (`svg`, `pdf`, `eps`, `ps`, `prn`, `dxf`, `emf`, `wmf`, `plt`, `psd`, `html`, `png`, `tdraw`), and `format` is accepted but not used |
 
 `BeginCommandGroup(name)` and `EndCommandGroup()` are accepted and do
 nothing: a script's changes are one undo step already.
+
+`ActiveDocument.Data` keeps text values by name in the drawing itself, so
+a script or plugin can store its settings, presets or calibration with the
+file instead of in hidden objects. `Get(name)` gives the value (`""` when
+there is none), `Set(name, value)` adds or changes it, `Has(name)`,
+`Remove(name)` and `Clear()` do what they say, `Count` and `Names` list
+them, `Item(indexOrName).Value` reads or writes one (1-based index), and
+a `for ... of` loop walks them. Each change is an undo step of the script
+("Document Data"); the pairs are saved in `.tdraw` files. Macros reach
+the same pairs as `ActiveDocument.Data` or `ActiveDocument.Properties`.
 
 ### Pages, layers
 
@@ -261,6 +292,17 @@ points. A recorded macro records a dimension the Dimension tools drew
 (and those Add Dimensions draws) as one of these calls, so playing it back
 makes a live dimension again; they went unrecorded until 0.48 (#2348).
 
+A dimension's style is set with `Shape.SetDimensionStyle(style)` (also on
+a `ShapeRange` and `ActiveSelection`), `style` naming the settings as a
+style is saved: `text_size` (points), `font`, `precision`, `prefix`,
+`suffix`, `line_width`, `text_color` and the others; objects that are not
+dimensions are left alone, a name the style does not have is an error,
+and it answers how many dimensions changed. `Shape.LabelSize` reads and
+sets the label's size in points (`null` for other objects). A change made
+on the Dimension bar while a macro is recorded is recorded as
+`ActiveSelection.SetDimensionStyle({...})` with the settings it changed,
+so it plays back on the dimension the macro just drew (#4026).
+
 ### Symbols
 
 `Document.Symbols` lists the drawing's symbols (`Index`, `Name`).
@@ -306,6 +348,11 @@ what the user sees.
 - `scripting::extra::tests::a_vba_macro_makes_a_linear_dimension`
 - `scripting::extra::tests::a_recorded_dimension_plays_back_as_one`
 - `scripting::extra::tests::dimensions_drawn_while_recording_are_recorded`
+- `view_steps::tests::the_recorder_keeps_the_zoom_steps`
+- `scripting::extra::tests::a_dimension_label_size_change_is_recorded_and_plays_back`
+- `scripting::extra::tests::scripts_and_macros_set_a_dimensions_label_size`
+- `view_steps::tests::a_recorded_zoom_to_fit_plays_back`
+- `view_steps::tests::scripts_and_macros_zoom_to_fit_the_objects`
 - `scripting::extra::tests::a_script_dimension_follows_its_object`
 - `scripting::extra::tests::similar_groups_become_one_symbol_and_keep_their_text`
 - `scripting::extra::tests::a_script_creates_and_places_symbols`

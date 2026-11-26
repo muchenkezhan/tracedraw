@@ -28,7 +28,13 @@ destination picked meanwhile unless it names a printer the system does
 not have (#614).
 The printers come from CUPS (Linux and macOS): `lpstat -l -p -d` lists
 them with their state, description and location (`printers.rs`,
-`parse_lpstat`), and a print on one of them hands the PDF to `lp -d`
+`parse_lpstat`). Each query is limited to five seconds and 1 MiB of
+stdout; stderr is discarded instead of buffered, and an unfinished query
+is killed and reaped. If the verbose query fails or exceeds those
+bounds, the compact `lpstat -p -d` query is tried with the same bounds.
+That fallback retains names, states and the default, but has no
+description or location. Failed or partial output is not offered as a
+printer list. A print on a printer hands the PDF to `lp -d`
 with the number of copies and their collation (`lp_args`) and the
 drawing's name as the job title; the status bar says "Sent to printer
 name", or what `lp` complained about. The dialog starts on the printer
@@ -66,9 +72,25 @@ the printer's paper of its size when the printer has one (either way
 round, within 2 mm), a wide sheet turns the paper, and the sheet is
 drawn at its size from the paper's corner; the copies and their
 collation go to the printer, the drawing's name is the job title. The
-script runs without a window and shows no "Printing page" box, and gives
-up after five minutes; what came of each print (the sheets sent, or the
-error) is written to `tracedraw.log`. A one-sheet print used to fail
+script runs without a window and shows no "Printing page" box. A print
+of any number of sheets goes through (#4053, #4054): each sheet's
+pictures are written to files as it is drawn, up to four sheets at a
+time sharing the 16 million pixels, so only the sheets being drawn are
+in memory (`draw_sheets_to`); the script says a line for each sheet the
+queue takes, read while it runs (`run_watched`), and is given up only
+when it says nothing for five minutes, however long the whole job
+takes. The status bar counts both steps, "Drawing sheet 12 of 2000 for
+the printer…" then "Sending sheet 12 of 2000 to the printer…"
+(`PrintProgress`). Before, all the sheets were drawn into memory first,
+what the script said was read only at its end (so a job of some hundred
+sheets waited for ever to say its next line) and the whole job had five
+minutes, so a print merge of 2000 sheets never printed. What came of
+each print (the last lines the script said, or the error) is written to
+`tracedraw.log`
+(`printers::tests::a_job_that_says_much_is_read_while_it_runs`,
+`printers::tests::only_a_job_gone_silent_is_stopped`,
+`printers::tests::the_print_script_says_each_sheet_sent`,
+`export::tests::many_sheets_are_drawn_into_files_in_their_order`). A one-sheet print used to fail
 before it reached the printer, on every printer: the list of sheet sizes
 flattened in PowerShell when it held one sheet (#614; checked on a
 Windows machine with a printer writing to a file: one and two sheets
@@ -116,7 +138,11 @@ has one.
     at its size, shrunk only when it does not fit and Keep page size is off,
     and the layouts repeat it; #1001, `selection_as_page`,
     `export::tests::the_selection_prints_alone_on_a_page_of_its_size`,
-    `export::tests::keep_size_keeps_the_selection_at_its_size`); and Odd and even pages,
+    `export::tests::keep_size_keeps_the_selection_at_its_size`; with Keep
+    their place on the page ticked under Selection, in the Print dialog
+    and in Print Preview, the selected objects print where they stand on
+    a page the size of the drawing's page instead, #3806,
+    `export::tests::the_selection_can_print_in_its_place_on_the_page`); and Odd and even pages,
     Odd pages or Even pages of the document or the list (#951).
   - Copies: a file gets its copies inside, as whole sets (Collate) or
     each sheet repeated. Reverse order (under Collate) prints the
@@ -255,6 +281,11 @@ File > Print Preview, or Print Preview in the Print dialog (which hands
 over its settings), fills the window with the sheets exactly as Print
 sends them: the imposition, the marks, Mirror and Invert, built by the
 same function (`export::print_sheets`).
+
+- Print sends the job and leaves the preview open, so pages or sheets
+  can be sent one at a time (to collate by hand); Print and Close,
+  beside it, sends the job and closes the preview (#4072). Print This
+  Sheet leaves it open too.
 
 - The printer's unprintable edge (#1924): with a printer chosen (not a
   file), the strip along each side of the sheet that the printer cannot

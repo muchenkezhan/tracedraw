@@ -75,6 +75,10 @@ pub struct Bench {
     pub done: Option<Measured>,
     /// Light zoom was turned on because the score is low.
     pub light_zoom_turned_on: bool,
+    /// The score is low, but the run used another renderer than a normal
+    /// start does (Test Without / With the Graphics Card): Light zoom was
+    /// left as it is (#3664).
+    pub light_zoom_left_alone: bool,
 }
 
 impl Bench {
@@ -123,22 +127,37 @@ fn card_blurs() -> bool {
 /// Everything the measuring thread does: the processor and the memory,
 /// then for the advanced test the tasks on the large drawings and the
 /// shadows with and without the card.
-fn measure(level: Level, card: bool, tell: &mut dyn FnMut(&'static str, usize, usize)) -> Msg {
+/// `tell` stops the run with `false`: no one waits for it any more (the
+/// window was closed or the run cancelled, #3665), so no further test
+/// starts and its drawings are let go.
+fn measure(
+    level: Level,
+    card: bool,
+    tell: &mut dyn FnMut(&'static str, usize, usize) -> bool,
+) -> Msg {
     let total = steps(level, card);
     let mut done = 0;
-    tell("benchmark.measuring_processor", done, total);
-    let (all, one) = bench::time_drawing();
-    let memory = bench::time_memory();
+    let mut go = tell("benchmark.measuring_processor", done, total);
+    let (all, one) = if go {
+        bench::time_drawing()
+    } else {
+        (0.0, 0.0)
+    };
+    let memory = if go { bench::time_memory() } else { 0.0 };
     done += 1;
     let mut tasks = Vec::new();
-    if level == Level::Advanced {
+    if level == Level::Advanced && go {
         for n in bench::ADVANCED_SIZES {
             tasks.extend(bench::time_tasks(n, &mut |key| {
-                tell(key, done, total);
+                go = go && tell(key, done, total);
                 done += 1;
+                go
             }));
+            if !go {
+                break;
+            }
         }
-        if card {
+        if card && go {
             tasks.extend(bench::time_shadows(
                 &mut |on| {
                     #[cfg(not(target_arch = "wasm32"))]
@@ -146,8 +165,9 @@ fn measure(level: Level, card: bool, tell: &mut dyn FnMut(&'static str, usize, u
                     let _ = on;
                 },
                 &mut |key| {
-                    tell(key, done, total);
+                    go = go && tell(key, done, total);
                     done += 1;
+                    go
                 },
             ));
             #[cfg(not(target_arch = "wasm32"))]
@@ -161,6 +181,7 @@ fn measure(level: Level, card: bool, tell: &mut dyn FnMut(&'static str, usize, u
 pub fn start(app: &mut App, level: Level) {
     app.benchmark.done = None;
     app.benchmark.light_zoom_turned_on = false;
+    app.benchmark.light_zoom_left_alone = false;
     let card = level == Level::Advanced && card_blurs();
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -168,7 +189,7 @@ pub fn start(app: &mut App, level: Level) {
         std::thread::spawn(move || {
             let step = tx.clone();
             let done = measure(level, card, &mut |key, done, total| {
-                let _ = step.send(Msg::Step(key, done, total));
+                step.send(Msg::Step(key, done, total)).is_ok()
             });
             let _ = tx.send(done);
         });
@@ -180,7 +201,7 @@ pub fn start(app: &mut App, level: Level) {
     }
     // No threads in the browser: measured in this frame.
     #[cfg(target_arch = "wasm32")]
-    if let Msg::Done(cpu, tasks) = measure(level, card, &mut |_, _, _| {}) {
+    if let Msg::Done(cpu, tasks) = measure(level, card, &mut |_, _, _| true) {
         app.benchmark.phase = graphics(level, cpu, tasks);
     }
 }
@@ -194,6 +215,20 @@ pub fn resume(app: &mut App) {
     app.settings.save();
     app.dialog = crate::ui::dialogs::Dialog::Benchmark;
     start(app, level);
+}
+
+/// Stop a run: the measuring thread starts no further test and lets its
+/// drawings go, and the graphics test's pictures are dropped (#3665).
+pub fn cancel(app: &mut App) {
+    if !app.benchmark.running() {
+        return;
+    }
+    // Dropping the phase drops the thread's receiver: its next step
+    // finds no one listening and stops.
+    app.benchmark.phase = Phase::Idle;
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::gpu_fx::force(None);
+    app.status = tr("benchmark.cancelled");
 }
 
 fn graphics(level: Level, cpu: (f64, f64, f64), tasks: Vec<Task>) -> Phase {
@@ -315,15 +350,28 @@ fn step(app: &mut App, ui: &mut Ui) {
 }
 
 /// A run measured: kept, and Light zoom turned on when the computer is
-/// slow for large drawings.
+/// slow for large drawings. A run made with another renderer than a
+/// normal start uses (Test Without the Graphics Card) only compares: it
+/// changes no option, or the software renderer's low score turned Light
+/// zoom on for everyday use with the card (#3664).
 pub fn finish(app: &mut App, m: Measured) {
+    let usual = usual_renderer(&app.settings);
+    finish_with(app, m, usual);
+}
+
+/// [`finish`] for a run made with the usual renderer or not.
+fn finish_with(app: &mut App, m: Measured, usual: bool) {
     log::info!(
         "benchmark: {}",
         bench::report(&m, env!("CARGO_PKG_VERSION")).replace('\n', "; ")
     );
     if m.slow() && !app.settings.light_zoom {
-        app.settings.light_zoom = true;
-        app.benchmark.light_zoom_turned_on = true;
+        if usual {
+            app.settings.light_zoom = true;
+            app.benchmark.light_zoom_turned_on = true;
+        } else {
+            app.benchmark.light_zoom_left_alone = true;
+        }
     }
     bench::remember(&mut app.settings.benchmarks, m.clone());
     app.settings.save();
@@ -503,6 +551,9 @@ fn results(app: &App, ui: &mut Ui, m: &Measured) {
     if app.benchmark.light_zoom_turned_on {
         ui.label(RichText::new(tr("benchmark.light_zoom_turned_on")).strong());
     }
+    if app.benchmark.light_zoom_left_alone {
+        ui.label(tr("benchmark.light_zoom_left_alone"));
+    }
     tasks(ui, m);
 }
 
@@ -590,7 +641,7 @@ fn card(app: &mut App, ui: &mut Ui, close: &mut bool) {
         };
         let running = app.benchmark.running();
         if ui
-            .add_enabled(!running, egui::Button::new(trf(key, &[("name", name)])))
+            .add_enabled(!running, crate::ui::btn_icons::Ib::with_text(key, trf(key, &[("name", name)])))
             .rich_tip_always(crate::ui::tips::pair(key, "benchmark.restart_tip"))
             .clicked()
         {
@@ -624,7 +675,7 @@ pub fn dialog(app: &mut App, ctx: &Context, close: &mut bool) {
         let running = app.benchmark.running();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!running, egui::Button::new(tr("benchmark.quick")))
+                .add_enabled(!running, crate::ui::btn_icons::Ib::new("benchmark.quick"))
                 .rich_tip_always(crate::ui::tips::pair(
                     "benchmark.quick",
                     "benchmark.quick_tip",
@@ -637,7 +688,7 @@ pub fn dialog(app: &mut App, ctx: &Context, close: &mut bool) {
             // would hold the page for a minute.
             if cfg!(not(target_arch = "wasm32"))
                 && ui
-                    .add_enabled(!running, egui::Button::new(tr("benchmark.advanced")))
+                    .add_enabled(!running, crate::ui::btn_icons::Ib::new("benchmark.advanced"))
                     .rich_tip_always(crate::ui::tips::pair(
                         "benchmark.advanced",
                         "benchmark.advanced_tip",
@@ -676,7 +727,7 @@ pub fn dialog(app: &mut App, ctx: &Context, close: &mut bool) {
                 .as_ref()
                 .map(|m| bench::report(m, env!("CARGO_PKG_VERSION")));
             if ui
-                .add_enabled(report.is_some(), egui::Button::new(tr("benchmark.copy")))
+                .add_enabled(report.is_some(), crate::ui::btn_icons::Ib::new("benchmark.copy"))
                 .rich_tip_always(crate::ui::tips::pair(
                     "benchmark.copy",
                     "benchmark.copy_tip",
@@ -692,7 +743,7 @@ pub fn dialog(app: &mut App, ctx: &Context, close: &mut bool) {
             // one at a time, and a window left open would put itself back
             // over the one it opened (#3351).
             if ui
-                .add_enabled(!running, egui::Button::new(tr("menu.tools.options")))
+                .add_enabled(!running, crate::ui::btn_icons::Ib::new("menu.tools.options"))
                 .rich_tip(crate::ui::tips::pair(
                     "menu.tools.options",
                     "benchmark.options_tip",
@@ -702,8 +753,10 @@ pub fn dialog(app: &mut App, ctx: &Context, close: &mut bool) {
                 app.open_options_page(crate::ui::dialogs::OptionsPage::General);
                 *close = true;
             }
+            // Close stops a run too: a test that takes too long (the
+            // window drawn on the processor) can be left (#3665).
             if ui
-                .add_enabled(!running, egui::Button::new(tr("dialog.close")))
+                .button(tr("dialog.close"))
                 .rich_tip_always(crate::ui::tips::keyed("dialog.close"))
                 .clicked()
             {
@@ -711,6 +764,9 @@ pub fn dialog(app: &mut App, ctx: &Context, close: &mut bool) {
             }
         });
     });
+    if *close {
+        cancel(app);
+    }
 }
 
 /// The adapter that draws the window; the browser build has no wgpu
@@ -723,6 +779,26 @@ fn gpu_in_use() -> Option<&'static str> {
     #[cfg(target_arch = "wasm32")]
     {
         None
+    }
+}
+
+/// Whether this run draws with the renderer a normal start uses (what
+/// Options asks for, or the one that last opened the window when that
+/// could not): false for a run started by Test Without / With the
+/// Graphics Card. Always true in the browser and in tests, which have no
+/// renderer of their own to compare.
+fn usual_renderer(s: &crate::settings::Settings) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match crate::gpu::mode_in_use() {
+            Some(m) => m == crate::gpu::Mode::for_start(&[], s, None),
+            None => true,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = s;
+        true
     }
 }
 
@@ -778,6 +854,43 @@ mod tests {
         finish(&mut app, fast);
         assert!(!app.settings.light_zoom);
         assert!(!app.benchmark.light_zoom_turned_on);
+    }
+
+    /// #3664: a slow run made with another renderer than a normal start
+    /// (Test Without the Graphics Card) is kept but turns no option on,
+    /// and the window says so.
+    #[test]
+    fn a_comparison_run_leaves_light_zoom_alone() {
+        let mut app = App::headless();
+        app.settings.light_zoom = false;
+        finish_with(&mut app, slow_run(), false);
+        assert!(!app.settings.light_zoom);
+        assert!(!app.benchmark.light_zoom_turned_on);
+        assert!(app.benchmark.light_zoom_left_alone);
+        assert_eq!(app.settings.benchmarks.len(), 1);
+    }
+
+    /// Closing the window stops a run: the measuring thread is told no
+    /// one listens and starts no further test (#3665).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn closing_the_window_stops_a_run() {
+        let mut told = 0;
+        let msg = measure(Level::Advanced, false, &mut |_, _, _| {
+            told += 1;
+            false
+        });
+        assert_eq!(told, 1);
+        let Msg::Done(_, tasks) = msg else {
+            panic!("a stopped run still ends");
+        };
+        assert!(tasks.is_empty());
+        let mut app = App::headless();
+        start(&mut app, Level::Quick);
+        assert!(app.benchmark.running());
+        cancel(&mut app);
+        assert!(!app.benchmark.running());
+        assert!(app.benchmark.done.is_none());
     }
 
     fn run(app: &mut App, ctx: &Context, frames: usize) {

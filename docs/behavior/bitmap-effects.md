@@ -142,6 +142,20 @@ later, and removing the last one gives the original back.
   channels draws the other curves thin behind, and Load... and Save keep
   every channel's curve in a JSON file of the settings.
 
+## Blur on the property bar
+
+- Gaussian Blur's dialog opens as the compact settings window (its one
+  value, Reset, presets, OK and Cancel; 360 x 330 at first, at least
+  300 x 260), the blur shown live on the drawing, with no preview panes
+  covering it (#4091, `ui::effect_dialog::compact_effect`).
+- With one object selected that has a Gaussian Blur among its effects,
+  the Pick tool's property bar shows Blur, its radius (0.1 to 250 px, a
+  logarithmic slider). The effect changes when the slider is let go or a
+  value is typed (not at every step of the drag, so a large radius does
+  not make the drag lag), one undo step ("Edit Effect"); the first
+  Gaussian Blur of the list is the one changed (`blur_bar.rs`,
+  `blur_bar::tests::the_bar_changes_the_blur_radius`).
+
 ## Image Adjustments
 
 Effects > Adjust > Image Adjustments opens a larger dialog instead of
@@ -340,8 +354,10 @@ transparent areas.
 |---|---|---|
 | Colorize | Hue 30 (0 to 360); Saturation 50 (0 to 100) | Every pixel takes the hue and saturation, keeping its luminance as the lightness. |
 | Diffuse | Level 20 (1 to 100) | Pixels swapped with neighbours up to `1 + 4 level / 100` pixels away, then softened. |
+| Lens Correction | Distortion 0 (-100 to 100); Fringe 0 (-100 to 100); Corner light 0 (-100 to 100); Scale 100 (50 to 150) | Each pixel samples the picture at `c + v (1 + k r^2) / s` from the centre `c` (`r` the distance over half the diagonal, `k` Distortion / 200, `s` Scale / 100); red samples `1 + Fringe / 10000` farther and blue as much nearer; colours times `1 + Corner light / 100 r^2`. |
 | Photo Filter | Filter color (#EC8A00); Density 25 (1 to 100); Preserve luminosity (on) | `c (1 - d) + 2 c f d` per channel for filter colour `f` and density `d`; Preserve luminosity scales back to the old luminance. |
 | Sepia Toning | Level 50 (0 to 100) | The gray `L` moves toward `(1.07 L + 20 t, 0.87 L + 8 t, 0.6 L)` by Level `t`. |
+| Tilt Shift | Focus position 50 (0 to 100); Focus width 20 (0 to 100); Blur 8 (1 to 50); Angle 0 (0 to 180) | A band across the picture (horizontal at 0 degrees) centred at Focus position, a share of the way across it, Focus width wide, stays sharp; outside it the Gaussian blur of Blur sigma is mixed in, smoothstep over 15 % of the way across. |
 | Vintage Photo | Era: 1839 (daguerreotype), **1876 (albumen print)**, 1925 (sepia), 1945 (black and white), 1955 (cross-process), 1960 (faded print), 1965 (warm color); Intensity 70 (0 to 100) | Each era has its tint, contrast, fading, grain and vignette (1839 the strongest grain and vignette, the 1960s warm and faded), mixed in by Intensity. |
 
 ### Color Transform

@@ -275,13 +275,183 @@ pub fn parse_palette_xml(xml: &str) -> Vec<(String, Color)> {
                 q: *q,
             },
             ("REGISTRATION", _) => Color::Registration,
-            _ => {
-                log::warn!("document palette colour {name:?} in {cs:?} skipped");
-                continue;
-            }
+            // A colour of a named library or ink (#4229): `cs` is then the
+            // ink's name ("PANTONE 443 C") or a written value
+            // ("C:61 M:0 Y:51 K:0", "R:255 G:0 B:0"). The written value
+            // gives the colour; otherwise four tints are CMYK and three RGB.
+            _ => match spec_color(&cs)
+                .or_else(|| spec_color(&name.to_ascii_uppercase()))
+                .or(match tints.as_slice() {
+                    [c, m, y, k] => Some(Color::Cmyk {
+                        c: *c,
+                        m: *m,
+                        y: *y,
+                        k: *k,
+                    }),
+                    [r, g, b] => Some(Color::Rgb {
+                        r: *r,
+                        g: *g,
+                        b: *b,
+                    }),
+                    // A single value is the ink's tint, not its colour.
+                    _ => None,
+                }) {
+                Some(c) => c,
+                None => {
+                    log::warn!("document palette colour {name:?} in {cs:?} skipped");
+                    continue;
+                }
+            },
         };
         out.push((name, color));
     }
+    out
+}
+
+/// A colour written out as its values, `C:61 M:0 Y:51 K:0` (percent) or
+/// `R:255 G:0 B:0` (0 to 255), upper case; `None` for anything else.
+fn spec_color(spec: &str) -> Option<Color> {
+    let mut vals = std::collections::BTreeMap::new();
+    for part in spec.split(|c: char| c.is_whitespace() || c == ',') {
+        let Some((k, v)) = part.split_once(':') else {
+            continue;
+        };
+        let v = v.trim().parse::<f32>().ok().filter(|v| v.is_finite())?;
+        let k = k.trim();
+        if k.len() != 1 {
+            return None;
+        }
+        vals.insert(k.chars().next()?, v);
+    }
+    let get = |k: char, full: f32| vals.get(&k).map(|v| (v / full).clamp(0.0, 1.0));
+    match vals.len() {
+        4 => Some(Color::Cmyk {
+            c: get('C', 100.0)?,
+            m: get('M', 100.0)?,
+            y: get('Y', 100.0)?,
+            k: get('K', 100.0)?,
+        }),
+        3 => Some(Color::Rgb {
+            r: get('R', 255.0)?,
+            g: get('G', 255.0)?,
+            b: get('B', 255.0)?,
+        }),
+        _ => None,
+    }
+}
+
+/// The document information a ZIP file keeps in the XMP packet of
+/// `META-INF/metadata.xml` (#3411): author, subject, keywords, copyright,
+/// notes and rating, under the standard XMP properties TraceDraw writes
+/// there (`dc:creator`, `dc:description`, `dc:subject`, `dc:rights`,
+/// `exif:UserComment`, `xmp:Rating`). Fields the file leaves out stay
+/// empty. `None` for RIFF files and files without the member.
+pub fn document_info(bytes: &[u8], container: &Container) -> Option<DocumentInfo> {
+    if container.kind == ContainerKind::Riff {
+        return None;
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    let f = archive.by_name("META-INF/metadata.xml").ok()?;
+    let mut xml = String::new();
+    f.take(MAX_PROFILE).read_to_string(&mut xml).ok()?;
+    Some(parse_document_info(&xml))
+}
+
+/// The document information of a file, as [`document_info`] reads it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DocumentInfo {
+    pub author: String,
+    pub subject: String,
+    pub keywords: String,
+    pub copyright: String,
+    pub notes: String,
+    pub rating: u8,
+}
+
+/// [`DocumentInfo`] out of an XMP packet.
+pub fn parse_document_info(xml: &str) -> DocumentInfo {
+    DocumentInfo {
+        author: xmp_values(xml, "dc:creator").join("; "),
+        subject: xmp_values(xml, "dc:description").join(" "),
+        keywords: xmp_values(xml, "dc:subject").join(", "),
+        copyright: xmp_values(xml, "dc:rights").join(" "),
+        notes: xmp_values(xml, "exif:UserComment").join(" "),
+        rating: xmp_values(xml, "xmp:Rating")
+            .first()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|r| r.is_finite())
+            .map(|r| r.clamp(0.0, 5.0).round() as u8)
+            .unwrap_or(0),
+    }
+}
+
+/// The values of XMP property `name`: the items of its `rdf:Seq`,
+/// `rdf:Bag` or `rdf:Alt`, or its text, or its value written as an
+/// attribute of `rdf:Description`; entities decoded, blanks left out.
+fn xmp_values(xml: &str, name: &str) -> Vec<String> {
+    let decode = |v: &str| {
+        v.replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .trim()
+            .to_string()
+    };
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(at) = rest.find(&open) {
+        let after = &rest[at + open.len()..];
+        // The whole name, not the start of a longer one.
+        if !after.starts_with(|c: char| c == '>' || c == '/' || c.is_whitespace()) {
+            rest = after;
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        if after[..gt].ends_with('/') {
+            rest = &after[gt + 1..];
+            continue;
+        }
+        let body_start = gt + 1;
+        let Some(len) = after[body_start..].find(&close) else {
+            break;
+        };
+        let body = &after[body_start..body_start + len];
+        if body.contains("<rdf:li") {
+            let mut items = body;
+            while let Some(li) = items.find("<rdf:li") {
+                let tail = &items[li..];
+                let Some(gt) = tail.find('>') else { break };
+                if tail[..gt].ends_with('/') {
+                    items = &tail[gt + 1..];
+                    continue;
+                }
+                let Some(end) = tail[gt + 1..].find("</rdf:li>") else {
+                    break;
+                };
+                out.push(decode(&tail[gt + 1..gt + 1 + end]));
+                items = &tail[gt + 1 + end..];
+            }
+        } else if !body.contains('<') {
+            out.push(decode(body));
+        }
+        rest = &after[body_start + len..];
+    }
+    // `xmp:Rating="3"` on the description itself.
+    if out.is_empty() {
+        let mut rest = xml;
+        while let Some(at) = rest.find("<rdf:Description") {
+            let tail = &rest[at..];
+            let Some(gt) = tail.find('>') else { break };
+            if let Some(v) = attribute(&tail[..gt], name) {
+                out.push(v.trim().to_string());
+            }
+            rest = &tail[gt..];
+        }
+    }
+    out.retain(|v| !v.is_empty());
     out
 }
 
@@ -313,6 +483,43 @@ fn attribute(tag: &str, key: &str) -> Option<String> {
 mod tests {
 
     use super::*;
+
+    /// #3411: author, subject, keywords, copyright, notes and rating go
+    /// into the XMP packet of a saved file and come back when it opens;
+    /// they were neither written nor read.
+    #[test]
+    fn document_information_goes_out_and_comes_back() {
+        let mut doc = tracedraw_core::Document::default();
+        doc.title = "Poster".into();
+        doc.metadata.author = "Ana & Rui".into();
+        doc.metadata.subject = "Spring fair".into();
+        doc.metadata.keywords = "fair, poster; spring".into();
+        doc.metadata.copyright = "(c) 2026 Ana".into();
+        doc.metadata.notes = "Print on <A3>".into();
+        doc.metadata.rating = 4;
+        for v in [17u16, 25] {
+            let bytes = crate::write::document_to_cdr_version(&doc, v);
+            let (back, _) = crate::open_bytes(&bytes, "file").expect("opens");
+            let md = &back.metadata;
+            assert_eq!(md.author, "Ana & Rui", "{v}");
+            assert_eq!(md.subject, "Spring fair");
+            assert_eq!(md.keywords, "fair, poster, spring");
+            assert_eq!(md.copyright, "(c) 2026 Ana");
+            assert_eq!(md.notes, "Print on <A3>");
+            assert_eq!(md.rating, 4);
+        }
+        // A packet of another writer: one creator per list item, the
+        // rating as an attribute, nothing else.
+        let xml = r#"<x:xmpmeta><rdf:RDF><rdf:Description rdf:about="" xmp:Rating="5"><dc:creator><rdf:Seq><rdf:li>A</rdf:li><rdf:li>B</rdf:li></rdf:Seq></dc:creator><dc:creatorTool>x</dc:creatorTool></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        let info = parse_document_info(xml);
+        assert_eq!(info.author, "A; B");
+        assert_eq!(info.rating, 5);
+        assert_eq!(info.keywords, "");
+        // Damaged packets give what they can and never fail.
+        for bad in ["<dc:creator><rdf:li>x", "<dc:subject/>", "<dc:rights>", ""] {
+            let _ = parse_document_info(bad);
+        }
+    }
 
     #[test]
     fn document_palette_xml_reads_names_and_tints() {
@@ -368,6 +575,52 @@ mod tests {
         assert!(matches!(p[4].1, Color::Yiq { .. }));
         assert!(matches!(p[5].1, Color::Gray { .. }));
         assert_eq!(p[6].1, Color::Registration);
+    }
+
+    #[test]
+    fn document_palette_reads_library_and_written_colours() {
+        let xml = r#"<color name="PANTONE 443 C" cs="PANTONE 443 C" tints="0.1,0.2,0.3,0.4"/>
+<color name="C:61 M:0 Y:51 K:0" cs="C:61 M:0 Y:51 K:0" tints=""/>
+<color name="R:255 G:0 B:0" cs="R:255 G:0 B:0"/>
+<color name="Ink" cs="Spot Ink" tints="0.5,0.25,1"/>
+<color name="Odd" cs="Something" tints="0.5,0.5"/>"#;
+        let p = parse_palette_xml(xml);
+        assert_eq!(p.len(), 4);
+        assert_eq!(p[0].0, "PANTONE 443 C");
+        assert_eq!(
+            p[0].1,
+            Color::Cmyk {
+                c: 0.1,
+                m: 0.2,
+                y: 0.3,
+                k: 0.4
+            }
+        );
+        assert_eq!(
+            p[1].1,
+            Color::Cmyk {
+                c: 0.61,
+                m: 0.0,
+                y: 0.51,
+                k: 0.0
+            }
+        );
+        assert_eq!(
+            p[2].1,
+            Color::Rgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0
+            }
+        );
+        assert_eq!(
+            p[3].1,
+            Color::Rgb {
+                r: 0.5,
+                g: 0.25,
+                b: 1.0
+            }
+        );
     }
 
     #[test]

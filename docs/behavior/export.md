@@ -69,6 +69,21 @@ while choosing File > Export or clicking the toolbar button, File >
 Export with Options (Ctrl+Shift+E) show the options
 whatever the setting, with the check box ticked so it can be taken off
 (`pick_drag_tests::with_the_options_set_not_to_show_export_writes_at_once`).
+
+On the desktop the export runs off the interface's thread
+(`exporting::Exporting`): the pages to write and what they need of the
+program are made ready at once (`export::prepare_export`), and a worker
+makes the files and writes them (`ExportWork::run`). The status line
+says "Exporting <file>…" and, when it takes more than 0.4 seconds, a
+window "Exporting <name>" shows a bar: "Writing file 3 of 12" filling
+file by file for a format that writes a file for each page, a moving
+bar for one file. What is typed, clicked or dropped is held back until
+it ends (closing the window waits for it), and the status line then
+says what any export says. Before, the program stood still for the
+whole export with nothing on screen. In the browser, in the tests and
+for exports run by macros, agents and the command line the files are
+written at once (`export::tests::an_export_runs_off_the_interfaces_thread`).
+
 In the browser and on Android the setting goes straight to the file
 with the last options, as before.
 
@@ -328,6 +343,11 @@ dialog's choices, and Export for Web and Office keep their own (#617,
   their outlines included (also those of objects inside a group), so an
   outline is never cut at the file's edge (#2290,
   `export::tests::a_selection_exported_alone_keeps_its_whole_outline`).
+  The objects are moved to the file's corner; a blend's steps keep
+  running to its end object. A blend inside a clip frame or a group
+  moves with it, and its end was moved once more, so its steps came out
+  as a staircase running off to one side (#3832,
+  `export::tests::a_clipped_blend_exported_as_the_selection_keeps_its_steps`).
 - Under the format's settings: Selected only and the export range; at
   the bottom, above OK and Cancel, "Do not show this dialog again" (see
   "Skipping the options").

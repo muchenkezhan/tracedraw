@@ -15,8 +15,12 @@ The panel lists the page with its layers, topmost first, then the
 thumbnail, the object itself drawn small with its fill and outline, and its
 name, or what it is when it has none ("Rectangle", "Curve with 8 nodes").
 
-- Click an object to select it; <kbd>Shift</kbd>+click adds it to the
-  selection. Its layer becomes the active layer.
+- Click an object to select it; <kbd>Shift</kbd>+click selects every object
+  from the one clicked before to this one, and <kbd>Ctrl</kbd>+click adds
+  one object or takes it out. Its layer becomes the active layer. Layer
+  rows take the same clicks: <kbd>Shift</kbd>+click selects the range of
+  layers from the last clicked one, and <kbd>Ctrl</kbd>+click adds or
+  removes a layer.
 - Click the arrow of a group to see the objects inside it.
 - Each layer has three buttons: [[docker.show_hide]], [[docker.print_layer]]
   and [[docker.lock_layer]]. A hidden or locked layer cannot be edited. The
@@ -32,7 +36,10 @@ name, or what it is when it has none ("Rectangle", "Curve with 8 nodes").
 
 A layer is a sheet on which objects lie. The **active layer**, shown in bold
 with a colored bar, is where new objects go when you draw, paste, duplicate
-or import. Click a layer to make it active.
+or import. Click a layer to make it active. <kbd>Shift</kbd>+click selects
+the range of layers from the last clicked one, and <kbd>Ctrl</kbd>+click
+adds or removes a layer; the eye, the printer, the padlock, Delete and the
+layer menu then act on all the selected layers together.
 
 - [[docker.new_layer]], at the bottom of the panel, adds a layer on top and
   makes it active.
@@ -57,6 +64,22 @@ To put a master layer over the page's own objects, tick
 choose [[menu.object > menu.object.order > menu.object.to_front_of_page]]
 (<kbd>Ctrl</kbd>+<kbd>Home</kbd>); [[menu.object.to_back_of_page]]
 (<kbd>Ctrl</kbd>+<kbd>End</kbd>) puts the layer behind the page's objects again.
+
+### Page ranges {#range-pages}
+
+The [[docker.range_pages]] group holds layers shared by selected page
+ranges. Use [[docker.new_range_layer]] in its menu, or the creation button
+in the empty group, to create one. Enter a name and ranges such as
+`1-8, 12, 15-20`, then confirm. **Properties** edits the range later.
+
+The numbers are document page positions, starting at 1. Editing a header
+or logo in a range layer updates each page covered by that layer. The
+dialog shows how many current pages match. Future page positions can be
+included, and the range numbers stay fixed as pages are inserted,
+deleted or reordered.
+
+Save as `.tdraw` to keep editable shared ranges. Other output formats
+place the appropriate shared content on each selected page.
 
 ## Renaming objects and layers {#rename}
 
